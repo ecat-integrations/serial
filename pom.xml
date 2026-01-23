@@ -59,4 +59,12 @@
             </plugin>
         </plugins>
     </build>
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+            <comments>This integration is part of ECAT Project and licensed under Apache 2.0</comments>
+        </license>
+    </licenses>
 </project>
