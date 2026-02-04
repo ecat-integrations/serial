@@ -19,7 +19,7 @@
         <dependency>
             <groupId>com.ecat</groupId>
             <artifactId>ecat-core</artifactId>
-            <version>1.0.0</version>
+            <version>[1.0.0,2.0.0)</version>
             <scope>provided</scope>
         </dependency>
         <dependency>
