@@ -1,4 +1,7 @@
 # 此文件为ecat集成的配置文件，无此文件则下面均为无。
 
+requires_core: ^1.0.0
 dependencies: # 依赖的其他ecat集成的信息。可选项，默认无
   - artifactId: integration-ecat-common
+    groupId: com.ecat
+    version: ^1.0.0
