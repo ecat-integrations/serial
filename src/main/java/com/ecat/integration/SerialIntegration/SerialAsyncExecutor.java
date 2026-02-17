@@ -4,6 +4,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import com.ecat.core.Task.NamedThreadFactory;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 import com.ecat.core.Utils.Mdc.MdcExecutorService;
@@ -21,6 +22,7 @@ public class SerialAsyncExecutor {
 
     /**
      * 原始线程池（用于状态查询和关闭）
+     * 使用 NamedThreadFactory 命名，线程名格式: integration-serial-0, integration-serial-1
      */
     private static final ThreadPoolExecutor RAW_EXECUTOR = new ThreadPoolExecutor(
         4,                                      // 核心线程数
@@ -28,12 +30,7 @@ public class SerialAsyncExecutor {
         60L,                                    // 空闲线程存活时间
         TimeUnit.SECONDS,
         new LinkedBlockingQueue<>(200),         // 队列大小
-        r -> {
-            Thread t = new Thread(r);
-            t.setName("serial-async-" + t.getId());
-            t.setDaemon(true);
-            return t;
-        },
+        new NamedThreadFactory("integration-serial"),  // 线程名前缀
         new ThreadPoolExecutor.CallerRunsPolicy()  // 队列满时在调用线程执行
     );
 
