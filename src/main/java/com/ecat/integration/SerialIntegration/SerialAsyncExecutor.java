@@ -6,10 +6,13 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
+import com.ecat.core.Utils.Mdc.MdcExecutorService;
 
 /**
  * Serial 集成模块统一的异步执行器
  * 为所有串口相关的异步操作提供统一的线程池
+ *
+ * <p>已包装 MDC 上下文传播，确保异步线程中的日志正确路由到对应集成。
  *
  * @author coffee
  */
@@ -17,10 +20,9 @@ public class SerialAsyncExecutor {
     private static final Log log = LogFactory.getLogger(SerialAsyncExecutor.class);
 
     /**
-     * 统一的串口异步操作线程池
-     * 配置：核心4线程，最大8线程，队列容量200
+     * 原始线程池（用于状态查询和关闭）
      */
-    private static final ExecutorService EXECUTOR = new ThreadPoolExecutor(
+    private static final ThreadPoolExecutor RAW_EXECUTOR = new ThreadPoolExecutor(
         4,                                      // 核心线程数
         8,                                      // 最大线程数
         60L,                                    // 空闲线程存活时间
@@ -36,7 +38,13 @@ public class SerialAsyncExecutor {
     );
 
     /**
-     * 获取统一的异步执行器
+     * MDC 包装的统一串口异步操作线程池
+     * 自动传播 MDC 上下文到异步线程
+     */
+    private static final ExecutorService EXECUTOR = MdcExecutorService.wrap(RAW_EXECUTOR);
+
+    /**
+     * 获取统一的异步执行器（已包装 MDC）
      * @return ExecutorService 线程池
      */
     public static ExecutorService getExecutor() {
@@ -48,12 +56,11 @@ public class SerialAsyncExecutor {
      * @return 状态字符串
      */
     public static String getStatus() {
-        ThreadPoolExecutor executor = (ThreadPoolExecutor) EXECUTOR;
         return String.format("SerialAsyncExecutor[queue=%d, active=%d, completed=%d, poolSize=%d]",
-                            executor.getQueue().size(),
-                            executor.getActiveCount(),
-                            executor.getCompletedTaskCount(),
-                            executor.getPoolSize());
+                            RAW_EXECUTOR.getQueue().size(),
+                            RAW_EXECUTOR.getActiveCount(),
+                            RAW_EXECUTOR.getCompletedTaskCount(),
+                            RAW_EXECUTOR.getPoolSize());
     }
 
     /**

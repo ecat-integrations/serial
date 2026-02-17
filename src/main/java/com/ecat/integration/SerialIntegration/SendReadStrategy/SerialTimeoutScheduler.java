@@ -8,6 +8,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
+import com.ecat.core.Utils.Mdc.MdcScheduledExecutorService;
 
 /**
  * SerialTimeoutScheduler 提供端口隔离的线程池管理
@@ -44,12 +45,14 @@ public class SerialTimeoutScheduler {
      */
     public static ScheduledExecutorService getScheduler(String portName) {
         return schedulerCache.computeIfAbsent(portName, k -> {
-            ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            ScheduledExecutorService rawScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "SerialTimeoutScheduler-" + portName);
                 t.setDaemon(true); // 设为守护线程，避免阻止JVM退出
                 t.setPriority(Thread.NORM_PRIORITY - 1); // 稍微降低优先级
                 return t;
             });
+            // Wrap with MDC to preserve trace context
+            ScheduledExecutorService scheduler = MdcScheduledExecutorService.wrap(rawScheduler);
 
             // 记录活动任务计数
             activeTaskCounts.put(portName, 0);
