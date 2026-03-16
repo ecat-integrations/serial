@@ -33,6 +33,7 @@ public class SerialIntegrationFunctionalTest {
         when(mockSerialSource.acquire()).thenReturn("test-key");
         when(mockSerialSource.release(anyString())).thenReturn(true);
         when(mockSerialSource.isTestMode()).thenReturn(true); // 强制测试模式
+        when(mockSerialSource.getTimeout()).thenReturn(500); // 默认超时
     }
 
     @After
@@ -72,6 +73,7 @@ public class SerialIntegrationFunctionalTest {
         when(mockSource.acquire()).thenReturn("mock-key");
         when(mockSource.release(anyString())).thenReturn(true);
         when(mockSource.isTestMode()).thenReturn(true);
+        when(mockSource.getTimeout()).thenReturn(500);
         when(mockSource.asyncReadData())
                 .thenReturn(CompletableFuture.completedFuture("mock-response"));
 
@@ -173,6 +175,7 @@ public class SerialIntegrationFunctionalTest {
         when(mockSource2.acquire()).thenReturn("mock-key");
         when(mockSource2.release(anyString())).thenReturn(true);
         when(mockSource2.isTestMode()).thenReturn(true);
+        when(mockSource2.getTimeout()).thenReturn(500);
         when(mockSource2.asyncReadData()).thenReturn(CompletableFuture.completedFuture("mock-response"));
 
         DefaultResponseHandlerStrategy<String> strategy = new DefaultResponseHandlerStrategy<>(

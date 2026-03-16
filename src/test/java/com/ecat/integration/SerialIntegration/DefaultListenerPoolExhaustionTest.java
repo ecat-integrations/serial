@@ -111,9 +111,6 @@ public class DefaultListenerPoolExhaustionTest {
             serverSource = new SerialSource(serverInfo);
             clientSource = new SerialSource(clientInfo);
 
-            serverSource.registerIntegration("test-server");
-            clientSource.registerIntegration("test-client");
-
             if (!serverSource.isPortOpen() || !clientSource.isPortOpen()) {
                 throw new RuntimeException("串口打开失败");
             }
@@ -169,11 +166,11 @@ public class DefaultListenerPoolExhaustionTest {
             System.out.println(logWithTimestamp("清理资源..."));
             if (serverSource != null) {
                 serverSource.removeAllDataListeners();
-                serverSource.closePort("test-server");
+                serverSource.closePort();
             }
             if (clientSource != null) {
                 clientSource.removeAllDataListeners();
-                clientSource.closePort("test-client");
+                clientSource.closePort();
             }
             SerialTimeoutScheduler.cleanupScheduler(CLIENT_PORT);
             SerialDataListenerPool.cleanup();

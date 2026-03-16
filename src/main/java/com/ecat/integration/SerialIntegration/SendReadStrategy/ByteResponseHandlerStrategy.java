@@ -47,7 +47,7 @@ public class ByteResponseHandlerStrategy<T> {
     /**
      * Constructs a new ByteResponseHandlerStrategy with the specified parameters.
      * The strategy automatically detects whether to use interrupt-driven or polling mode.
-     * Uses default timeout of {@link Const#READ_TIMEOUT_MS}.
+     * Uses default timeout from SerialSource.getTimeout().
      *
      * @param serialSource The SerialSource for communication
      * @param processResponseFunction A function that processes the response context and returns success/failure
@@ -60,7 +60,7 @@ public class ByteResponseHandlerStrategy<T> {
             Function<byte[], byte[]> checkResponseFunction,
             Function<Throwable, Boolean> handleExceptionFunction) {
         this(serialSource, processResponseFunction, checkResponseFunction,
-             handleExceptionFunction, Const.READ_TIMEOUT_MS);
+             handleExceptionFunction, defaultTimeout(serialSource));
     }
 
     /**
@@ -161,19 +161,19 @@ public class ByteResponseHandlerStrategy<T> {
 
         // 使用异步处理链，在独立线程池中执行，不阻塞串口线程
         return responseFuture
-            .handleAsync((result, ex) -> {
-                // 在独立线程中处理响应和异常，不阻塞串口线程
+            .thenApplyAsync(result -> {
+                // 在独立线程中处理响应，不阻塞串口线程
                 long responseDuration = System.currentTimeMillis() - handlerStartTime;
-                if (ex != null) {
-                    log.warn("Response handling for port {} completed exceptionally after {} ms: {}",
-                            portName, responseDuration, ex.getMessage());
-                    return handleExceptionFunction.apply(ex);
-                } else {
-                    log.debug("Response handling for port {} completed successfully after {} ms",
-                            portName, responseDuration);
-                    return processResponseFunction.apply(result);
-                }
+                log.debug("Response handling for port {} completed successfully after {} ms",
+                        portName, responseDuration);
+                return processResponseFunction.apply(result);
             }, SerialAsyncExecutor.getExecutor())
+            .exceptionally(ex -> {
+                long responseDuration = System.currentTimeMillis() - handlerStartTime;
+                log.warn("Response handling for port {} completed exceptionally after {} ms: {}",
+                        portName, responseDuration, ex.getMessage());
+                return handleExceptionFunction.apply(ex);
+            })
             .whenCompleteAsync((res, ex) -> {
                 // 统一清理：只在这里调用一次 removeDataListener 和 release
                 if (timeoutTask != null && !timeoutTask.isDone()) {
@@ -233,14 +233,8 @@ public class ByteResponseHandlerStrategy<T> {
 
         // 使用异步处理链
         return responseFuture
-            .handleAsync((result, ex) -> {
-                if (ex != null) {
-                    serialSource.removeDataListener(listener);
-                    return handleExceptionFunction.apply(ex);
-                } else {
-                    return processResponseFunction.apply(result);
-                }
-            }, SerialAsyncExecutor.getExecutor())
+            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
+            .exceptionally(ex -> handleExceptionFunction.apply(ex))
             .whenCompleteAsync((res, ex) -> {
                 if (timeoutTask != null && !timeoutTask.isDone()) {
                     timeoutTask.cancel(true);
@@ -339,5 +333,10 @@ public class ByteResponseHandlerStrategy<T> {
 
         // 5. 默认使用中断模式（生产环境）
         return false;
+    }
+
+    private static long defaultTimeout(SerialSource serialSource) {
+        return serialSource != null && serialSource.getTimeout() > 0
+                ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
     }
 }

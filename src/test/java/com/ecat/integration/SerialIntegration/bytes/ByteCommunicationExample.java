@@ -92,9 +92,6 @@ public class ByteCommunicationExample {
         senderSerialSource = new SerialSource(senderInfo);
         receiverSerialSource = new SerialSource(receiverInfo);
 
-        senderSerialSource.registerIntegration("test-sender");
-        receiverSerialSource.registerIntegration("test-receiver");
-
         if (!senderSerialSource.isPortOpen()) {
             throw new RuntimeException("发送方串口打开失败");
         }
@@ -536,12 +533,12 @@ public class ByteCommunicationExample {
             }
 
             if (senderSerialSource != null) {
-                senderSerialSource.closePort("test-sender");
+                senderSerialSource.closePort();
                 System.out.println("已关闭发送方串口");
             }
 
             if (receiverSerialSource != null) {
-                receiverSerialSource.closePort("test-receiver");
+                receiverSerialSource.closePort();
                 System.out.println("已关闭接收方串口");
             }
 

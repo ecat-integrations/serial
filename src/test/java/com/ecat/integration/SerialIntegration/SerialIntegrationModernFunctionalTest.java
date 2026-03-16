@@ -33,6 +33,7 @@ public class SerialIntegrationModernFunctionalTest {
         when(mockSerialSource.acquire()).thenReturn("test-key");
         when(mockSerialSource.release(anyString())).thenReturn(true);
         when(mockSerialSource.isTestMode()).thenReturn(true);
+        when(mockSerialSource.getTimeout()).thenReturn(500);
 
         // 只使用现代 API
         when(mockSerialSource.asyncReadDataBytes())

@@ -9,8 +9,8 @@ import java.util.function.Function;
 
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
-import com.ecat.integration.SerialIntegration.Const;
 import com.ecat.integration.SerialIntegration.SerialSource;
+import com.ecat.integration.SerialIntegration.Const;
 import com.ecat.integration.SerialIntegration.SerialAsyncExecutor;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.PooledSerialDataListener;
@@ -78,7 +78,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                                           Function<String, String> checkResponseFunction,
                                           Function<Throwable, Boolean> handleExceptionFunction) {
         this(serialSource, processResponseFunction, checkResponseFunction,
-             handleExceptionFunction, Const.READ_TIMEOUT_MS);
+             handleExceptionFunction, defaultTimeout(serialSource));
     }
 
     /**
@@ -182,13 +182,8 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
 
         // 使用异步处理链，在独立线程池中执行，不阻塞串口线程
         return responseFuture
-            .handleAsync((result, ex) -> {
-                if (ex != null) {
-                    return handleExceptionFunction.apply(ex);
-                } else {
-                    return processResponseFunction.apply(result);
-                }
-            }, SerialAsyncExecutor.getExecutor())
+            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
+            .exceptionally(ex -> handleExceptionFunction.apply(ex))
             .whenCompleteAsync((res, ex) -> {
                 if (timeoutTask != null && !timeoutTask.isDone()) {
                     timeoutTask.cancel(true);
@@ -246,14 +241,8 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
 
         // 使用异步处理链
         return responseFuture
-            .handleAsync((result, ex) -> {
-                if (ex != null) {
-                    serialSource.removeDataListener(listener);
-                    return handleExceptionFunction.apply(ex);
-                } else {
-                    return processResponseFunction.apply(result);
-                }
-            }, SerialAsyncExecutor.getExecutor())
+            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
+            .exceptionally(ex -> handleExceptionFunction.apply(ex))
             .whenCompleteAsync((res, ex) -> {
                 if (timeoutTask != null && !timeoutTask.isDone()) {
                     timeoutTask.cancel(true);
@@ -355,5 +344,10 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
 
         // 5. 默认使用中断模式（生产环境）
         return false;
+    }
+
+    private static long defaultTimeout(SerialSource serialSource) {
+        return serialSource != null && serialSource.getTimeout() > 0
+                ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
     }
 }

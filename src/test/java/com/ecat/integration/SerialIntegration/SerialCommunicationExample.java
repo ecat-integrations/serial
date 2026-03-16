@@ -95,10 +95,6 @@ public class SerialCommunicationExample {
         senderSerialSource = new SerialSource(senderInfo);
         receiverSerialSource = new SerialSource(receiverInfo);
 
-        // 注册身份以便正确关闭串口
-        senderSerialSource.registerIntegration("test-sender");
-        receiverSerialSource.registerIntegration("test-receiver");
-
         // 检查串口是否成功打开
         if (!senderSerialSource.isPortOpen()) {
             throw new RuntimeException("发送方串口打开失败");
@@ -601,12 +597,12 @@ public class SerialCommunicationExample {
 
             // 关闭串口
             if (senderSerialSource != null) {
-                senderSerialSource.closePort("test-sender");
+                senderSerialSource.closePort();
                 System.out.println("已关闭发送方串口");
             }
 
             if (receiverSerialSource != null) {
-                receiverSerialSource.closePort("test-receiver");
+                receiverSerialSource.closePort();
                 System.out.println("已关闭接收方串口");
             }
 

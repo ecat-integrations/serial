@@ -34,6 +34,7 @@ public class SerialIntegrationByteFunctionalTest {
         when(mockSerialSource.acquire()).thenReturn("test-key");
         when(mockSerialSource.release(anyString())).thenReturn(true);
         when(mockSerialSource.isTestMode()).thenReturn(true); // 强制测试模式
+        when(mockSerialSource.getTimeout()).thenReturn(500); // 默认超时
     }
 
     @After
@@ -73,6 +74,7 @@ public class SerialIntegrationByteFunctionalTest {
         when(mockSource.acquire()).thenReturn("mock-key");
         when(mockSource.release(anyString())).thenReturn(true);
         when(mockSource.isTestMode()).thenReturn(true);
+        when(mockSource.getTimeout()).thenReturn(500);
         when(mockSource.asyncReadDataBytes())
                 .thenReturn(CompletableFuture.completedFuture("mock-response".getBytes()));
 
@@ -174,6 +176,7 @@ public class SerialIntegrationByteFunctionalTest {
         when(mockSource2.acquire()).thenReturn("mock-key");
         when(mockSource2.release(anyString())).thenReturn(true);
         when(mockSource2.isTestMode()).thenReturn(true);
+        when(mockSource2.getTimeout()).thenReturn(500);
         when(mockSource2.asyncReadDataBytes()).thenReturn(CompletableFuture.completedFuture("mock-response".getBytes()));
 
         ByteResponseHandlerStrategy<String> strategy = new ByteResponseHandlerStrategy<>(

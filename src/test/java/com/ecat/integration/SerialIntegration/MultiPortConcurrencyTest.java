@@ -481,8 +481,8 @@ public class MultiPortConcurrencyTest {
         System.out.println("\n清理串口资源...");
         for (SerialPortPair pair : portPairs) {
             try {
-                pair.sender.close();
-                pair.receiver.close();
+                pair.sender.closePort();
+                pair.receiver.closePort();
                 SerialTimeoutScheduler.cleanupScheduler(pair.sender.getPortName());
             } catch (Exception e) {
                 // 忽略清理错误

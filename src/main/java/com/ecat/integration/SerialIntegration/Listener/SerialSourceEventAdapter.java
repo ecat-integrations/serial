@@ -20,18 +20,18 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
     private static final Log log = LogFactory.getLogger(SerialSourceEventAdapter.class);
 
     private final List<SerialDataListener> listeners = new CopyOnWriteArrayList<>();
-    private final com.ecat.integration.SerialIntegration.SerialSource serialSource;
+    private final com.ecat.integration.SerialIntegration.SerialSourcePort sourcePort;
 
     /**
      * 创建事件适配器
      *
-     * @param serialSource SerialSource 对象
+     * @param sourcePort SerialSourcePort 对象
      */
-    public SerialSourceEventAdapter(com.ecat.integration.SerialIntegration.SerialSource serialSource) {
-        if (serialSource == null) {
-            throw new IllegalArgumentException("SerialSource cannot be null");
+    public SerialSourceEventAdapter(com.ecat.integration.SerialIntegration.SerialSourcePort sourcePort) {
+        if (sourcePort == null) {
+            throw new IllegalArgumentException("SerialSourcePort cannot be null");
         }
-        this.serialSource = serialSource;
+        this.sourcePort = sourcePort;
     }
 
     /**
@@ -42,7 +42,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
     public void addListener(SerialDataListener listener) {
         if (listener != null && !listeners.contains(listener)) {
             listeners.add(listener);
-            log.debug(this.serialSource.getPortName() + " added listener, total listeners: " + listeners.size());
+            log.debug(this.sourcePort.getPortName() + " added listener, total listeners: " + listeners.size());
         }
     }
 
@@ -53,7 +53,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
      */
     public void removeListener(SerialDataListener listener) {
         if (listener != null && listeners.remove(listener)) {
-            log.debug(this.serialSource.getPortName() + " removed listener, total listeners: " + listeners.size());
+            log.debug(this.sourcePort.getPortName() + " removed listener, total listeners: " + listeners.size());
         }
     }
 
@@ -63,7 +63,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
     public void removeAllListeners() {
         int count = listeners.size();
         listeners.clear();
-        log.info(this.serialSource.getPortName() + " removed all listeners, count: " + count);
+        log.info(this.sourcePort.getPortName() + " removed all listeners, count: " + count);
     }
 
     /**
@@ -93,18 +93,18 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
 
             if (eventType == SerialPort.LISTENING_EVENT_DATA_AVAILABLE) {
                 // 读取可用数据
-                SerialPort serialPort = serialSource.getSerialPort();
+                SerialPort serialPort = sourcePort.getSerialPort();
                 int bytesAvailable = serialPort.bytesAvailable();
                 if (bytesAvailable > 0) {
                     byte[] data = new byte[bytesAvailable];
                     int bytesRead = serialPort.readBytes(data, data.length);
 
                     if (bytesRead > 0) {
-                        log.debug(this.serialSource.getPortName() + " received " + bytesRead + " bytes");
+                        log.debug(this.sourcePort.getPortName() + " received " + bytesRead + " bytes");
                         // 打印16进制数据和ASCII字符串
                         String hex = bytesToHex(data, bytesRead);
                         String ascii = bytesToAscii(data, bytesRead);
-                        log.debug(this.serialSource.getPortName() + " data: " + hex + " | ASCII: " + ascii);
+                        log.debug(this.sourcePort.getPortName() + " data: " + hex + " | ASCII: " + ascii);
                         notifyDataReceived(data, bytesRead);
                     }
                 }
@@ -112,7 +112,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
             // LISTENING_EVENT_PORT_DISCONNECTED 在当前版本中不可用
             // 可以通过其他方式检测端口断开
         } catch (Exception e) {
-            log.error(this.serialSource.getPortName() + " error handling serial event: " + e.getMessage());
+            log.error(this.sourcePort.getPortName() + " error handling serial event: " + e.getMessage());
             notifyError(e);
         }
     }
@@ -128,7 +128,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
             try {
                 listener.onDataReceived(data, length);
             } catch (Exception e) {
-                log.warn(this.serialSource.getPortName() + " error notifying listener: " + e.getMessage());
+                log.warn(this.sourcePort.getPortName() + " error notifying listener: " + e.getMessage());
                 listener.onError(e);
             }
         }
@@ -144,7 +144,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
             try {
                 listener.onError(ex);
             } catch (Exception e) {
-                log.warn(this.serialSource.getPortName() + " error notifying listener of error: " + e.getMessage());
+                log.warn(this.sourcePort.getPortName() + " error notifying listener of error: " + e.getMessage());
             }
         }
     }
