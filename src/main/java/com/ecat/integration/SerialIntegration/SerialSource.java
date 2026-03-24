@@ -162,6 +162,22 @@ public class SerialSource {
     }
 
     /**
+     * 暂停事件适配器，阻止其从串口读取数据。
+     * Modbus 等需要直接 InputStream/OutputStream 访问串口时调用。
+     */
+    public void pauseEventAdapter() {
+        sourcePort.pauseEventAdapter();
+    }
+
+    /**
+     * 恢复事件适配器，重新注册到串口。
+     * Modbus 释放直接串口访问后调用。
+     */
+    public void resumeEventAdapter() {
+        sourcePort.resumeEventAdapter();
+    }
+
+    /**
      * 获取当前串口超时设置（毫秒）
      */
     public int getTimeout() {

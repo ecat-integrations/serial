@@ -21,6 +21,7 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
 
     private final List<SerialDataListener> listeners = new CopyOnWriteArrayList<>();
     private final com.ecat.integration.SerialIntegration.SerialSourcePort sourcePort;
+    private volatile boolean paused = false; // 暂停标志：Modbus 直接使用 InputStream 时设为 true
 
     /**
      * 创建事件适配器
@@ -75,6 +76,18 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
         return listeners.size();
     }
 
+    /**
+     * 设置暂停状态。暂停时 serialEvent() 不会读取串口数据，
+     * 允许 Modbus 等通过直接 InputStream 访问串口。
+     */
+    public void setPaused(boolean paused) {
+        this.paused = paused;
+    }
+
+    public boolean isPaused() {
+        return paused;
+    }
+
     @Override
     public int getListeningEvents() {
         // jSerialComm 2.6.2 中可能不支持 LISTENING_EVENT_PORT_DISCONNECTED
@@ -84,8 +97,8 @@ public class SerialSourceEventAdapter implements SerialPortDataListener {
 
     @Override
     public void serialEvent(SerialPortEvent event) {
-        if (listeners.isEmpty()) {
-            return; // 没有监听器，直接返回
+        if (paused || listeners.isEmpty()) {
+            return; // 暂停状态或没有监听器，不读取数据（让 Modbus InputStream 直接读取）
         }
 
         try {

@@ -359,6 +359,29 @@ public class SerialSourcePort {
         }
     }
 
+    /**
+     * 暂停事件适配器，阻止其从串口读取数据。
+     * 当 Modbus 等需要直接 InputStream/OutputStream 访问串口时调用，
+     * 避免 event adapter 与 direct stream 竞争数据。
+     */
+    void pauseEventAdapter() {
+        if (eventAdapter != null) {
+            eventAdapter.setPaused(true);
+            log.info("[ADAPTER PAUSED] port={}", getPortName());
+        }
+    }
+
+    /**
+     * 恢复事件适配器，重新注册到串口。
+     * 当 Modbus 释放直接串口访问后调用。
+     */
+    void resumeEventAdapter() {
+        if (eventAdapter != null) {
+            eventAdapter.setPaused(false);
+            log.info("[ADAPTER RESUMED] port={}", getPortName());
+        }
+    }
+
     void deliverBufferedData(SerialDataListener listener) {
         if (continuousReceiveBuffer.size() > 0) {
             byte[] buffer;
