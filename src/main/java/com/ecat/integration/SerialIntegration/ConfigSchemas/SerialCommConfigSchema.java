@@ -26,6 +26,7 @@ import com.fazecast.jSerialComm.SerialPort;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * 串口通讯 Schema - 可被其他集成复用
@@ -43,6 +44,62 @@ import java.util.Map;
  * @author coffee
  */
 public class SerialCommConfigSchema implements ConfigSchemaProvider {
+
+    /**
+     * 测试用端口注入点。
+     * <p>
+     * <b>仅供单元测试使用，生产环境禁止调用！</b>
+     * 设置后 {@link #getAvailablePorts()} 将直接返回此 Supplier 的结果，跳过 jSerialComm 硬件调用。
+     * <p>
+     * 用法示例（在测试的 @Before 中设置，@After 中清除）：
+     * <pre>
+     *   SerialCommConfigSchema.setTestPortSupplier(
+     *       () -&gt; SerialCommConfigSchema.createTestPorts("ttyUSB0"));
+     * </pre>
+     */
+    private static Supplier<Map<String, String>> testPortSupplier = null;
+
+    /**
+     * 注入测试用虚拟串口列表。
+     * <p>
+     * <b>仅供单元测试使用，生产环境禁止调用！</b>
+     * 在测试的 @Before 中调用此方法注入虚拟端口，
+     * 使 {@link DynamicEnumConfigItem} 的 validate 能在无物理串口的机器上通过。
+     *
+     * @param supplier 返回虚拟端口 Map 的 Supplier，传 null 等同于 {@link #clearTestPortSupplier()}
+     */
+    public static void setTestPortSupplier(Supplier<Map<String, String>> supplier) {
+        testPortSupplier = supplier;
+    }
+
+    /**
+     * 清除测试用端口注入。
+     * <p>
+     * <b>仅供单元测试使用，生产环境禁止调用！</b>
+     * 必须在测试的 @After 中调用，避免影响其他测试用例。
+     */
+    public static void clearTestPortSupplier() {
+        testPortSupplier = null;
+    }
+
+    /**
+     * 创建一个标准的测试用虚拟串口列表。
+     * <p>
+     * <b>仅供单元测试使用，生产环境禁止调用！</b>
+     * 返回的 Map 格式与 {@link #getAvailablePorts()} 一致（首项为提示项，后续为端口列表），
+     * 可直接传给 {@link #setTestPortSupplier(Supplier)}。
+     *
+     * @param portNames 虚拟端口名称，如 "ttyUSB0", "ttyUSB1"
+     * @return 格式为 {"" -&gt; "-- 请选择串口 --", "ttyUSB0" -&gt; "ttyUSB0", ...} 的 Map
+     */
+    public static Map<String, String> createTestPorts(String... portNames) {
+        Map<String, String> ports = new LinkedHashMap<>();
+        ports.put("", "-- 请选择串口 --");
+        for (String name : portNames) {
+            ports.put(name, name);
+        }
+        return ports;
+    }
 
     @Override
     public ConfigSchema createSchema() {
@@ -101,6 +158,11 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
      * @return 串口选项映射 (portName -> displayName)
      */
     public static Map<String, String> getAvailablePorts() {
+        // 测试注入点：如果设置了测试端口 Supplier，直接返回虚拟端口，不调用 jSerialComm
+        if (testPortSupplier != null) {
+            return testPortSupplier.get();
+        }
+
         Map<String, String> ports = new LinkedHashMap<>();
         SerialPort[] serialPorts = SerialPort.getCommPorts();
 
