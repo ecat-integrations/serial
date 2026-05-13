@@ -1,0 +1,63 @@
+{
+  "config_schemas": {
+    "serial_comm": {
+      "serial_port": {
+        "display_name": "Serial Port",
+        "description": "Select the serial port for communication"
+      },
+      "baudrate": {
+        "display_name": "Baud Rate",
+        "description": "Communication speed in bits per second",
+        "options": {
+          "1200": "1200",
+          "2400": "2400",
+          "4800": "4800",
+          "9600": "9600",
+          "19200": "19200",
+          "38400": "38400",
+          "57600": "57600",
+          "115200": "115200"
+        }
+      },
+      "data_bits": {
+        "display_name": "Data Bits",
+        "description": "Number of data bits per frame",
+        "options": {
+          "7": "7",
+          "8": "8"
+        }
+      },
+      "stop_bits": {
+        "display_name": "Stop Bits",
+        "description": "Number of stop bits per frame",
+        "options": {
+          "1": "1",
+          "2": "2"
+        }
+      },
+      "parity": {
+        "display_name": "Parity",
+        "description": "Error detection method for serial communication",
+        "options": {
+          "None": "No Parity",
+          "Odd": "Odd Parity",
+          "Even": "Even Parity"
+        }
+      },
+      "flow_control": {
+        "display_name": "Flow Control",
+        "description": "Data flow control mechanism",
+        "options": {
+          "0": "None",
+          "17": "RTS/CTS (Hardware)",
+          "4352": "DTR/DSR (Hardware)",
+          "1114112": "XOn/XOff (Software)"
+        }
+      },
+      "timeout": {
+        "display_name": "Timeout (ms)",
+        "description": "Read timeout in milliseconds"
+      }
+    }
+  }
+}

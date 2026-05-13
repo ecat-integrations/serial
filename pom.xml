@@ -47,6 +47,11 @@
           <archiverConfig>
             <compress>false</compress>
           </archiverConfig>
+          <archive>
+            <manifestEntries>
+              <Ecat-Artifact-Id>${project.artifactId}</Ecat-Artifact-Id>
+            </manifestEntries>
+          </archive>
         </configuration>
         <executions>
           <execution>
