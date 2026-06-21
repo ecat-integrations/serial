@@ -219,8 +219,11 @@ public class SerialSourcePort {
         serialPort.setParity(serialInfo.parity);
         serialPort.setFlowControl(serialInfo.flowControl);
 
-        int timeoutMode = SerialPort.TIMEOUT_READ_SEMI_BLOCKING | SerialPort.TIMEOUT_WRITE_BLOCKING;
-        serialPort.setComPortTimeouts(timeoutMode, serialInfo.timeout, serialInfo.timeout);
+        // 非阻塞写升级（§H.2.2）：jSerialComm 的 read/write 超时模式共享同一 fd 的 O_NONBLOCK 标志，
+        // 是「全有或全无」（§B.2），无法只把 write 设非阻塞而保持 read 阻塞。故整端口改 TIMEOUT_NONBLOCKING。
+        // 读路径是事件驱动（DATA_AVAILABLE → continuousReceiveBuffer），不依赖阻塞读（§B.8 实证安全）；
+        // write 反压时返回 -1 并被 jSerialComm 关闭端口（§B.6），由 asyncSendData 显式处理（见下）。
+        serialPort.setComPortTimeouts(SerialPort.TIMEOUT_NONBLOCKING, 0, 0);
 
         if (!serialPort.openPort()) {
             log.error("[OPEN FAILED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
@@ -401,6 +404,19 @@ public class SerialSourcePort {
 
     CompletableFuture<Boolean> asyncSendData(byte[] bytes) {
         return CompletableFuture.runAsync(() -> {
+            // 【改动②-1 写前自动 reopen】非阻塞 write 反压会关闭端口（§B.6），下次写前若端口已关则重开，
+            // 避免依赖外部干预即恢复通信；重开仍失败说明端口不可用（如 ttyUSB 拔线），抛 SerialWriteException 明确错误。
+            // 无 isTestMode guard：单测均 stub 掉 asyncSendData（真实方法体不执行），真端口功能测试对端都在（-1 不触发），
+            // 故 reopen/-1 检查无条件执行即可（§H.2.5 定稿）。
+            if (serialPort == null || !serialPort.isOpen()) {
+                log.warn("[WRITE-REOPEN] port={}, 端口未开, 写前自动重开", serialInfo.portName);
+                openPort("[auto-reopen]");
+                if (serialPort == null || !serialPort.isOpen()) {
+                    log.warn("[WRITE-REOPEN-FAIL] port={}, 自动重开失败, 写路径抛 SerialWriteException", serialInfo.portName);
+                    throw new SerialWriteException("串口重开失败(端口不可用): port=" + serialInfo.portName);
+                }
+            }
+            // 写前清缓冲（原有逻辑保留）
             if (isTestMode) {
                 while (serialPort.bytesAvailable() > 0) {
                     serialPort.readBytes(new byte[serialPort.bytesAvailable()], serialPort.bytesAvailable());
@@ -408,11 +424,25 @@ public class SerialSourcePort {
             } else {
                 clearReceiveBuffer();
             }
-            serialPort.writeBytes(bytes, bytes.length);
+            // 【改动③ / B5 根因修复】非阻塞 write 返回 <0 表示反压（端口已被 jSerialComm 关闭）。
+            // 旧代码丢弃 writeBytes 返回值（静默成功，asyncSendData 永远返 true），现在显式检查并抛出——
+            // 把「发不出去」如实告诉调用方，而非伪装成功。
+            int written = serialPort.writeBytes(bytes, bytes.length);
+            if (written < 0) {
+                log.warn("[WRITE-FAIL] port={}, writeBytes 返 {} (非阻塞反压, 端口已被关闭), 写路径抛 SerialWriteException",
+                        serialInfo.portName, written);
+                throw new SerialWriteException("串口写入失败(writeBytes 返 " + written + ", 端口已被反压关闭): port=" + serialInfo.portName);
+            }
         }, SerialAsyncExecutor.getExecutor()).thenApplyAsync(v -> {
             return true;
         }, SerialAsyncExecutor.getExecutor()).exceptionally(ex -> {
-            throw new RuntimeException("Failed to send data: " + ex.getMessage());
+            // 【改动②-2 类型透传】SerialWriteException 原样向上抛（保留写失败语义供调用方识别），
+            // 其余异常仍包成通用 RuntimeException（保持旧行为兼容）。
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            if (cause instanceof SerialWriteException) {
+                throw (SerialWriteException) cause;
+            }
+            throw new RuntimeException("Failed to send data: " + cause.getMessage(), cause);
         });
     }
 
