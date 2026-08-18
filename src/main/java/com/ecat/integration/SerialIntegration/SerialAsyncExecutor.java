@@ -77,10 +77,8 @@ public class SerialAsyncExecutor {
         }
     }
 
-    // JVM关闭钩子
+    // JVM关闭钩子（具名：ThreadNamingArchTest 规则 3 立法，线程普查可归属）
     static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            shutdown();
-        }));
+        Runtime.getRuntime().addShutdownHook(new Thread(SerialAsyncExecutor::shutdown, "serial-async-shutdown"));
     }
 }

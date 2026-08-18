@@ -2,6 +2,7 @@ package com.ecat.integration.SerialIntegration.Listener;
 
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
+import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlingContext;
 
 import java.util.concurrent.CompletableFuture;
@@ -24,7 +25,7 @@ public class BytePooledSerialDataListener implements SerialDataListener, Poolabl
 
     private ByteResponseHandlingContext<?> context;
     private CompletableFuture<?> responseFuture;
-    private com.ecat.integration.SerialIntegration.SerialSource serialSource;
+    private SerialSource serialSource;
     private Function<byte[], byte[]> checkResponseFunction;
 
     private long lastUsedTime;
@@ -47,7 +48,7 @@ public class BytePooledSerialDataListener implements SerialDataListener, Poolabl
      */
     public void reset(ByteResponseHandlingContext<?> context,
                      CompletableFuture<?> responseFuture,
-                     com.ecat.integration.SerialIntegration.SerialSource serialSource,
+                     SerialSource serialSource,
                      Function<byte[], byte[]> checkResponseFunction) {
         log.debug("重置字节监听器 #{}, 串口: {}, 上下文: {}",
                 instanceId,
@@ -81,76 +82,83 @@ public class BytePooledSerialDataListener implements SerialDataListener, Poolabl
 
     @Override
     public void onDataReceived(byte[] data, int length) {
-        if (!isInUse || context == null || responseFuture == null || serialSource == null) {
+        // 入口快照：监听器业务字段在 reset() 之后、cleanup() 之前，随时可能被池释放链
+        // （ByteResponseHandlerStrategy.handleResponseInterrupt 的 whenCompleteAsync →
+        // pool.release → cleanup）在另一线程并发清空——typedFuture.complete() 一经执行，
+        // 监听器生命周期即移交该异步清理链，而通知线程（jSerialComm 事件线程）还要继续
+        // 走完本方法。守卫校验的是快照，后续所有读写也必须用同一组引用，否则守卫与
+        // 使用之间字段被清空即静默跳过移除（注册残留）或 NPE。
+        ByteResponseHandlingContext<?> currentContext = context;
+        CompletableFuture<?> currentFuture = responseFuture;
+        SerialSource currentSource = serialSource;
+        Function<byte[], byte[]> currentCheck = checkResponseFunction;
+
+        if (!isInUse || currentContext == null || currentFuture == null || currentSource == null) {
             log.warn("字节监听器 #{} 在无效状态下收到数据，忽略. isInUse={}, context={}, responseFuture={}, serialSource={}",
-                instanceId, isInUse, context != null ? "exists" : "null",
-                responseFuture != null ? "exists" : "null",
-                serialSource != null ? serialSource.getPortName() : "null");
+                instanceId, isInUse, currentContext != null ? "exists" : "null",
+                currentFuture != null ? "exists" : "null",
+                currentSource != null ? currentSource.getPortName() : "null");
             return;
         }
 
         try {
             // 直接追加字节数据
-            context.getReceiveBuffer().write(data, 0, length);
+            currentContext.getReceiveBuffer().write(data, 0, length);
 
             log.trace("字节监听器 #{} 收到 {} 字节, 串口: {}",
-                instanceId, length, serialSource.getPortName());
+                instanceId, length, currentSource.getPortName());
 
             // 检查响应是否完整
-            byte[] bufferContent = context.getReceiveBytes();
-            byte[] checkResult = checkResponseFunction.apply(bufferContent);
+            byte[] bufferContent = currentContext.getReceiveBytes();
+            byte[] checkResult = currentCheck.apply(bufferContent);
 
             if (checkResult != null) {
                 log.debug("字节监听器 #{} 响应完整 ({} 字节), 移除监听器. 串口: {}",
-                    instanceId, bufferContent.length, serialSource.getPortName());
+                    instanceId, bufferContent.length, currentSource.getPortName());
 
-                context.getFinishedFlag().set(true);
+                currentContext.getFinishedFlag().set(true);
 
                 @SuppressWarnings("unchecked")
                 CompletableFuture<ByteResponseHandlingContext<?>> typedFuture =
-                    (CompletableFuture<ByteResponseHandlingContext<?>>) responseFuture;
-                typedFuture.complete(context);
-                // 只在响应完整时才移除监听器
-                if (serialSource != null) {
-                    serialSource.removeDataListener(this);
-                }
+                    (CompletableFuture<ByteResponseHandlingContext<?>>) currentFuture;
+                typedFuture.complete(currentContext);
+                // 只在响应完整时移除监听器。按监听器身份移除且幂等
+                // （CopyOnWriteArrayList.remove），与释放链 whenCompleteAsync 中的
+                // 兜底移除互不冲突。
+                currentSource.removeDataListener(this);
             }
             // 如果响应不完整，继续等待更多数据，不移除监听器
 
         } catch (Exception e) {
-            log.warn("字节监听器 #{} 处理数据时发生异常: {}", instanceId, e);
+            // slf4j 约定：Throwable 作最后一个参数自动绑定堆栈，不能为它再写 {} 占位符
+            log.warn("字节监听器 #{} 处理数据时发生异常", instanceId, e);
             try {
-                if (responseFuture != null) {
-                    responseFuture.completeExceptionally(e);
-                }
-                if (serialSource != null) {
-                    serialSource.removeDataListener(this);
-                }
+                currentFuture.completeExceptionally(e);
+                currentSource.removeDataListener(this);
             } catch (Exception removeEx) {
-                log.warn("字节监听器 #{} 移除时发生异常: {}", instanceId, removeEx);
+                log.warn("字节监听器 #{} 移除时发生异常", instanceId, removeEx);
             }
         }
     }
 
     @Override
     public void onError(Exception ex) {
-        if (!isInUse || responseFuture == null || serialSource == null) {
+        // 入口快照：与 onDataReceived 同理，清理链可能与本调用并发
+        CompletableFuture<?> currentFuture = responseFuture;
+        SerialSource currentSource = serialSource;
+
+        if (!isInUse || currentFuture == null || currentSource == null) {
             log.warn("字节监听器 #{} 在无效状态下收到错误，忽略. isInUse={}, responseFuture={}, serialSource={}",
-                instanceId, isInUse, responseFuture != null ? "exists" : "null",
-                serialSource != null ? serialSource.getPortName() : "null");
+                instanceId, isInUse, currentFuture != null ? "exists" : "null",
+                currentSource != null ? currentSource.getPortName() : "null");
             return;
         }
 
         log.warn("字节监听器 #{} 收到错误: {}, 串口: {}",
-                instanceId, ex.getMessage(),
-                serialSource != null ? serialSource.getPortName() : "unknown");
+                instanceId, ex.getMessage(), currentSource.getPortName());
 
-        if (responseFuture != null) {
-            responseFuture.completeExceptionally(ex);
-        }
-        if (serialSource != null) {
-            serialSource.removeDataListener(this);
-        }
+        currentFuture.completeExceptionally(ex);
+        currentSource.removeDataListener(this);
     }
 
     @Override

@@ -146,10 +146,9 @@ public class ByteResponseHandlerStrategy<T> {
         // 注册监听器
         serialSource.addDataListener(listener);
 
-        // 设置超时 - 使用端口隔离的线程池
+        // 设置超时 - 委托共享调度器（B3 合并，端口级线程池已移除）
         // 超时任务只标记和移除监听器，不释放（由 whenCompleteAsync 统一释放）
         ScheduledFuture<?> timeoutTask = SerialTimeoutScheduler.schedule(
-            portName,
             () -> {
                 if (responseFuture.completeExceptionally(TIMEOUT_EXCEPTION)) {
                     serialSource.removeDataListener(listener);
@@ -222,7 +221,6 @@ public class ByteResponseHandlerStrategy<T> {
 
         // 设置超时
         ScheduledFuture<?> timeoutTask = SerialTimeoutScheduler.schedule(
-            portName,
             () -> {
                 responseFuture.completeExceptionally(TIMEOUT_EXCEPTION);
                 serialSource.removeDataListener(listener);

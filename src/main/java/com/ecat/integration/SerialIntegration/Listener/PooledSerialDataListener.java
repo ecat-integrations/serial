@@ -90,75 +90,91 @@ public class PooledSerialDataListener implements SerialDataListener, PoolableLis
 
     @Override
     public void onDataReceived(byte[] data, int length) {
+        // 入口快照：监听器业务字段在 reset() 之后、cleanup() 之前，随时可能被池释放链
+        // （DefaultResponseHandlerStrategy.handleResponseInterrupt 的 whenCompleteAsync →
+        // pool.release → cleanup）在另一线程并发清空——typedFuture.complete() 一经执行，
+        // 监听器生命周期即移交该异步清理链，而通知线程（jSerialComm 事件线程）还要继续
+        // 走完本方法。守卫校验的是快照，后续所有读写也必须用同一组引用：守卫与使用之间
+        // 若改读字段，被 cleanup 置 null 即 NPE（曾被自身 catch 吞掉，表现为 WARN 风暴）。
+        ResponseHandlingContext<?> currentContext = context;
+        CompletableFuture<?> currentFuture = responseFuture;
+        SerialSource currentSource = serialSource;
+        Function<String, String> currentCheck = checkResponseFunction;
+
         // 安全检查：防止已被回收的监听器被调用
-        if (!isInUse || context == null || responseFuture == null || serialSource == null) {
+        if (!isInUse || currentContext == null || currentFuture == null || currentSource == null) {
             // ECAT log handles level checking automatically
             log.warn("监听器 #{} 在无效状态下收到数据，忽略. isInUse={}, context={}, responseFuture={}, serialSource={}",
-                instanceId, isInUse, context != null ? "exists" : "null",
-                responseFuture != null ? "exists" : "null",
-                serialSource != null ? serialSource.getPortName() : "null");
+                instanceId, isInUse, currentContext != null ? "exists" : "null",
+                currentFuture != null ? "exists" : "null",
+                currentSource != null ? currentSource.getPortName() : "null");
             return;
         }
 
         try {
             String receivedData = new String(data, 0, length);
             log.trace("监听器 #{} 收到数据 [{}]: {}",
-                instanceId, serialSource.getPortName(), receivedData.trim());
+                instanceId, currentSource.getPortName(), receivedData.trim());
 
             // 追加接收到的数据
-            context.getReceiveBuffer().append(receivedData);
+            currentContext.getReceiveBuffer().append(receivedData);
 
             // 检查响应是否完整
-            String bufferContent = context.getReceiveBuffer().toString();
-            String checkResult = checkResponseFunction.apply(bufferContent);
+            String bufferContent = currentContext.getReceiveBuffer().toString();
+            String checkResult = currentCheck.apply(bufferContent);
 
             if (checkResult != null) {
                 log.debug("监听器 #{} 响应完整，移除监听器. 串口: {}, 响应长度: {}",
-                    instanceId, serialSource.getPortName(), checkResult.length());
+                    instanceId, currentSource.getPortName(), checkResult.length());
 
                 // 设置完成标志
-                context.getFinishedFlag().set(true);
+                currentContext.getFinishedFlag().set(true);
 
                 // 完成Future
                 @SuppressWarnings("unchecked")
                 CompletableFuture<ResponseHandlingContext<?>> typedFuture =
-                    (CompletableFuture<ResponseHandlingContext<?>>) responseFuture;
-                typedFuture.complete(context);
+                    (CompletableFuture<ResponseHandlingContext<?>>) currentFuture;
+                typedFuture.complete(currentContext);
 
-                // 仅在响应完整时移除监听器（保留监听器以接收分片数据的后续部分）
-                serialSource.removeDataListener(this);
+                // 仅在响应完整时移除监听器（保留监听器以接收分片数据的后续部分）。
+                // 按监听器身份移除且幂等（CopyOnWriteArrayList.remove），与释放链
+                // whenCompleteAsync 中的兜底移除互不冲突。
+                currentSource.removeDataListener(this);
             }
             // 如果响应不完整，保留监听器继续接收后续数据包
-            // serialSource.removeDataListener(this);
 
         } catch (Exception e) {
-            log.warn("监听器 #{} 处理数据时发生异常: {}", instanceId, e);
-            // 异常时也要移除监听器
+            // slf4j 约定：Throwable 作最后一个参数自动绑定堆栈，不能为它再写 {} 占位符
+            log.warn("监听器 #{} 处理数据时发生异常", instanceId, e);
+            // 异常时也要移除监听器（currentFuture/currentSource 经守卫保证非空）
             try {
-                responseFuture.completeExceptionally(e);
-                serialSource.removeDataListener(this);
+                currentFuture.completeExceptionally(e);
+                currentSource.removeDataListener(this);
             } catch (Exception removeEx) {
-                log.warn("监听器 #{} 移除时发生异常: {}", instanceId, removeEx);
+                log.warn("监听器 #{} 移除时发生异常", instanceId, removeEx);
             }
         }
     }
 
     @Override
     public void onError(Exception ex) {
+        // 入口快照：与 onDataReceived 同理，清理链可能与本调用并发
+        CompletableFuture<?> currentFuture = responseFuture;
+        SerialSource currentSource = serialSource;
+
         // 安全检查
-        if (!isInUse || responseFuture == null || serialSource == null) {
+        if (!isInUse || currentFuture == null || currentSource == null) {
             log.warn("监听器 #{} 在无效状态下收到错误，忽略. isInUse={}, responseFuture={}, serialSource={}",
-                instanceId, isInUse, responseFuture != null ? "exists" : "null",
-                serialSource != null ? serialSource.getPortName() : "null");
+                instanceId, isInUse, currentFuture != null ? "exists" : "null",
+                currentSource != null ? currentSource.getPortName() : "null");
             return;
         }
 
         log.warn("监听器 #{} 收到错误: {}, 串口: {}",
-                instanceId, ex.getMessage(),
-                serialSource != null ? serialSource.getPortName() : "unknown");
+                instanceId, ex.getMessage(), currentSource.getPortName());
 
-        responseFuture.completeExceptionally(ex);
-        serialSource.removeDataListener(this);
+        currentFuture.completeExceptionally(ex);
+        currentSource.removeDataListener(this);
     }
 
     // 添加调试方法

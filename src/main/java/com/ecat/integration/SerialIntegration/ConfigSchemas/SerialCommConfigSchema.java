@@ -24,8 +24,12 @@ import com.ecat.core.ConfigFlow.ConfigItem.NumericConfigItem;
 import com.ecat.integration.SerialIntegration.Const;
 import com.fazecast.jSerialComm.SerialPort;
 
+import java.io.File;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -216,16 +220,102 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
 
     // ========== 辅助方法 ==========
 
+    // ========== 枚举源 seam（可注入，默认真实实现） ==========
+
     /**
-     * 获取系统可用的串口列表
+     * jSerialComm API 枚举提供器。
      * <p>
-     * 返回格式：
-     * <ul>
-     *   <li>有串口时：首项为"请选择串口"提示，后续为实际串口列表</li>
-     *   <li>无串口时：仅返回"无串口信息"提示项</li>
-     * </ul>
+     * 契约：返回裸端口映射（portName -&gt; displayName），不含 "" 提示头；非 null，无口时为空 Map。
+     * <b>仅供单元测试注入，生产环境禁止修改！</b>
+     */
+    static Supplier<Map<String, String>> apiPortOptionsSupplier = SerialCommConfigSchema::enumerateViaJSerialComm;
+
+    /**
+     * Linux /dev tty 设备节点扫描提供器。
+     * <p>
+     * 契约：返回裸端口映射（portName -&gt; displayName），不含 "" 提示头；非 null，无口时为空 Map。
+     * <b>仅供单元测试注入，生产环境禁止修改！</b>
+     */
+    static Supplier<Map<String, String>> devNodeScanSupplier = SerialCommConfigSchema::scanDevTtyNodes;
+
+    /**
+     * Windows 判定（true = 只走 jSerialComm API，不扫 /dev）。
+     * <p>
+     * <b>仅供单元测试注入，生产环境禁止修改！</b>
+     */
+    static BooleanSupplier windowsDetector = SerialCommConfigSchema::detectWindows;
+
+    /**
+     * 恢复三个枚举 seam 为真实默认实现（测试 @After 调用，防止注入泄漏到其他测试）。
+     */
+    static void resetEnumerationSeams() {
+        apiPortOptionsSupplier = SerialCommConfigSchema::enumerateViaJSerialComm;
+        devNodeScanSupplier = SerialCommConfigSchema::scanDevTtyNodes;
+        windowsDetector = SerialCommConfigSchema::detectWindows;
+    }
+
+    /** /dev 下参与确定性扫描的串口设备节点前缀（USB 串口 / 传统 8250 / USB CDC-ACM） */
+    private static final String[] DEV_TTY_PREFIXES = { "ttyUSB", "ttyS", "ttyACM" };
+
+    /**
+     * 串口名自然序：数字段按数值比较（ttyUSB2 &lt; ttyUSB10 &lt; ttyUSB100），字母段按字符比较。
+     * <p>
+     * 内核串口编号无前导零，数字段「先比长度再比字典」即等价数值序。
+     */
+    private static final Comparator<String> NATURAL_PORT_ORDER = (a, b) -> {
+        int ia = 0;
+        int ib = 0;
+        while (ia < a.length() && ib < b.length()) {
+            char ca = a.charAt(ia);
+            char cb = b.charAt(ib);
+            if (Character.isDigit(ca) && Character.isDigit(cb)) {
+                int ja = ia;
+                while (ja < a.length() && Character.isDigit(a.charAt(ja))) {
+                    ja++;
+                }
+                int jb = ib;
+                while (jb < b.length() && Character.isDigit(b.charAt(jb))) {
+                    jb++;
+                }
+                String da = a.substring(ia, ja);
+                String db = b.substring(ib, jb);
+                if (da.length() != db.length()) {
+                    return da.length() - db.length();
+                }
+                int digitCmp = da.compareTo(db);
+                if (digitCmp != 0) {
+                    return digitCmp;
+                }
+                ia = ja;
+                ib = jb;
+            } else {
+                if (ca != cb) {
+                    return Character.compare(ca, cb);
+                }
+                ia++;
+                ib++;
+            }
+        }
+        return (a.length() - ia) - (b.length() - ib);
+    };
+
+    /**
+     * 获取系统可用的串口列表。
+     * <p>
+     * 选项集 = jSerialComm API 枚举 ∪ /dev tty 节点扫描（仅 Linux），重叠口去重（API 描述优先），
+     * 自然序排序。
+     * <p>
+     * <b>为什么不能只用 jSerialComm API：</b>jSerialComm 2.9.x 的 Linux 枚举从 2.6.x 的
+     * /dev 目录扫描改为 walk {@code /sys/class/tty/} 并按 {@code device/subsystem}
+     * 符号链接认口（USB-serial 总线口 / 8250 传统口）。tty0tty 等内核虚拟串口对在 sysfs
+     * 中无 {@code device} 符号链接，且其 /dev/ttyUSB* 命名只是 userspace symlink（内核
+     * 设备名是 tnt*），sysfs walk 永远看不到——升级 2.9.3（为 Win2003 32 位 native 兼容，
+     * 2.6.2 的 win-x86 dll 调用 Vista+ API 无法回退）后 Linux 选项集塌缩到 {ttyS0}，
+     * 已有 entry 的 serial_port DynamicEnum 校验全挂。union 保证选项集覆盖真实存在的节点，
+     * 校验语义不变：仍只接受真实存在的口，打开失败由 jSerialComm 在运行时报错。
      *
-     * @return 串口选项映射 (portName -> displayName)
+     * @return 串口选项映射 (portName -> displayName)；有口时首项为"请选择串口"提示，
+     *         无口时仅返回"无串口信息"提示项
      */
     public static Map<String, String> getAvailablePorts() {
         // 测试注入点：如果设置了测试端口 Supplier，直接返回虚拟端口，不调用 jSerialComm
@@ -233,28 +323,86 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
             return testPortSupplier.get();
         }
 
-        Map<String, String> ports = new LinkedHashMap<>();
-        SerialPort[] serialPorts = SerialPort.getCommPorts();
-
-        if (serialPorts != null && serialPorts.length > 0) {
-            // 首项：请选择串口（默认选项，不预设具体串口）
-            ports.put("", "-- 请选择串口 --");
-
-            // 添加实际串口列表
-            for (SerialPort port : serialPorts) {
-                String portName = port.getSystemPortName();
-                String description = port.getPortDescription();
-                // 显示格式: "描述 (端口名)" 或直接端口名
-                String displayName = (description != null && !description.trim().isEmpty())
-                        ? description + " (" + portName + ")"
-                        : portName;
-                ports.put(portName, displayName);
+        Map<String, String> union = new LinkedHashMap<>();
+        // 源 1：jSerialComm API（Windows 上 COM 口的唯一来源；Linux 上提供 USB/PCI 总线口及描述）
+        union.putAll(apiPortOptionsSupplier.get());
+        // 源 2：/dev 确定性节点扫描——jSerialComm 2.9+ Linux 枚举漏掉的非总线口（tty0tty 虚拟对、
+        // symlink 命名口）在这里补齐；Windows 的 COM 口无 /dev 节点语义，不扫
+        if (!windowsDetector.getAsBoolean()) {
+            for (Map.Entry<String, String> entry : devNodeScanSupplier.get().entrySet()) {
+                // 重叠口 API 先占位（带硬件描述的显示名优先），FS 只补缺
+                union.putIfAbsent(entry.getKey(), entry.getValue());
             }
-        } else {
-            // 无串口时提示 - 使用特殊占位值，空字符串不会提交到后端
-            ports.put("", "-- 无串口信息 --");
         }
 
+        Map<String, String> sorted = new TreeMap<>(NATURAL_PORT_ORDER);
+        sorted.putAll(union);
+
+        Map<String, String> ports = new LinkedHashMap<>();
+        if (sorted.isEmpty()) {
+            // 无串口时提示 - 使用特殊占位值，空字符串不会提交到后端
+            ports.put("", "-- 无串口信息 --");
+        } else {
+            // 首项：请选择串口（默认选项，不预设具体串口）
+            ports.put("", "-- 请选择串口 --");
+            ports.putAll(sorted);
+        }
         return ports;
+    }
+
+    /**
+     * jSerialComm API 枚举（真实默认实现）。
+     *
+     * @return 裸端口映射；getCommPorts 在个别平台返回 null（历史行为），按无口处理
+     */
+    private static Map<String, String> enumerateViaJSerialComm() {
+        Map<String, String> result = new LinkedHashMap<>();
+        SerialPort[] serialPorts = SerialPort.getCommPorts();
+        if (serialPorts == null) {
+            return result;
+        }
+        for (SerialPort port : serialPorts) {
+            String portName = port.getSystemPortName();
+            String description = port.getPortDescription();
+            // 显示格式: "描述 (端口名)" 或直接端口名
+            String displayName = (description != null && !description.trim().isEmpty())
+                    ? description + " (" + portName + ")"
+                    : portName;
+            result.put(portName, displayName);
+        }
+        return result;
+    }
+
+    /**
+     * Linux /dev tty 设备节点确定性扫描（真实默认实现）。
+     * <p>
+     * 按 {@link #DEV_TTY_PREFIXES} 前缀列 /dev 下实际存在的节点名（symlink 亦为存在——
+     * tty0tty 环境的 /dev/ttyUSB* 即指向 /dev/tnt* 的 symlink）。显式设计边界：
+     * 节点存在即可选，是否真能打开由 jSerialComm 打开时报告，此处不做能力探测。
+     * listFiles 对不存在/不可读目录返回 null 是 File API 契约，按该前缀无结果处理。
+     *
+     * @return 裸端口映射（portName -&gt; portName，无硬件描述可用）
+     */
+    private static Map<String, String> scanDevTtyNodes() {
+        Map<String, String> result = new TreeMap<>(NATURAL_PORT_ORDER);
+        File devDir = new File("/dev");
+        for (String prefix : DEV_TTY_PREFIXES) {
+            File[] nodes = devDir.listFiles((dir, name) -> name.startsWith(prefix));
+            if (nodes == null) {
+                continue;
+            }
+            for (File node : nodes) {
+                result.put(node.getName(), node.getName());
+            }
+        }
+        return new LinkedHashMap<>(result);
+    }
+
+    /**
+     * Windows 平台判定（真实默认实现）。
+     */
+    private static boolean detectWindows() {
+        String osName = System.getProperty("os.name");
+        return osName != null && osName.toLowerCase().contains("win");
     }
 }

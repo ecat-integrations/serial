@@ -2,19 +2,20 @@ package com.ecat.integration.SerialIntegration;
 
 import com.fazecast.jSerialComm.SerialPort;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
-import com.ecat.integration.SerialIntegration.Listener.SerialSourceEventAdapter;
-import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
+import com.ecat.core.CommTrace.CommTraceBuffer;
+import com.ecat.core.CommTrace.CommTraceTransport;
 
 /**
  * SerialSourcePort manages the underlying serial port resource.
@@ -37,10 +38,14 @@ public class SerialSourcePort {
     SerialInfo serialInfo;
     private final SerialIntegration integration;
 
-    // Interrupt-driven fields
+    // Receive-path fields（P1 后：事件驱动 → 轮询；103000 后由自持 serial-io-sweeper 承载，见 SerialPollScheduler）
     private final DynamicByteArrayBuffer continuousReceiveBuffer = new DynamicByteArrayBuffer(1024, 2.0f);
     private final Lock bufferLock = new ReentrantLock();
-    private SerialSourceEventAdapter eventAdapter;
+    /** 轮询任务句柄；null = 无任务（未开/已停/测试模式不注册）。startPolling/stopPolling 在 pollLock 下读写。 */
+    private ScheduledFuture<?> pollTask;
+    private final Object pollLock = new Object();
+    /** Modbus 等直持 InputStream 期间置 true：轮询任务跳过读取，数据留给直接流消费（旧事件适配器 pause 语义平移）。 */
+    private volatile boolean pollPaused = false;
     private boolean isTestMode = false;
 
     // Connected SerialSource instances
@@ -73,8 +78,8 @@ public class SerialSourcePort {
                     getPortName(), source.getIdentity(), connectedSources.size(), formatIdentities());
             if (connectedSources.isEmpty()) {
                 // Last source disconnected — close port and remove from integration map
+                stopPolling();
                 if (serialPort != null && serialPort.isOpen()) {
-                    SerialTimeoutScheduler.cleanupScheduler(getPortName());
                     serialPort.closePort();
                     log.info("[CLOSED] port={}, last source removed by identity={}", getPortName(), source.getIdentity());
                 }
@@ -118,7 +123,8 @@ public class SerialSourcePort {
      * 尝试获取锁，支持等待队列和超时
      * @param timeout 超时时间
      * @param unit 时间单位
-     * @return 锁标识（成功获取/唤醒或进入等待），null表示超时或超出等待队列容量
+     * @return 锁标识（成功获取/唤醒或进入等待），null表示超时、超出等待队列容量，
+     *         或唤醒后锁已被快速路径请求抢占（handed-off race 失败，按未取得总线重试）
      */
     String acquire(long timeout, TimeUnit unit) {
         String requestKey = generateRequestKey();
@@ -128,12 +134,10 @@ public class SerialSourcePort {
                 currentKey = requestKey;
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
-                log.info("Lock acquired: {} by thread {} at {}", requestKey, lockAcquireThread, lockAcquireTime);
                 return requestKey;
             } else {
                 if (waitQueue.size() < maxWaiters) {
                     waitQueue.add(requestKey);
-                    log.info("Enter wait queue: " + requestKey + ", queue size: " + waitQueue.size());
                     boolean isAwoken = false;
                     try {
                         isAwoken = condition.await(timeout, unit);
@@ -145,17 +149,22 @@ public class SerialSourcePort {
                     }
 
                     if (isAwoken) {
-                        if (waitQueue.peek() != null && waitQueue.peek().equals(requestKey)) {
+                        // 接管锁必须同时满足：自己是队头 且 锁确实空闲（currentKey==null 复查不可省：
+                        // release() 发出 signal 之后、等待者重入临界区之前，另一请求可经快速路径
+                        // （currentKey==null 分支）抢先持有；若仍执行 currentKey = requestKey 会无声
+                        // 覆盖其持有权，两个 key 同时自认持锁，RS485 半双工总线上并发收发即帧碰撞。
+                        if (currentKey == null && waitQueue.peek() != null && waitQueue.peek().equals(requestKey)) {
                             currentKey = requestKey;
                             waitQueue.poll();
                             lockAcquireTime = System.currentTimeMillis();
                             lockAcquireThread = Thread.currentThread().getName();
-                            log.info("Lock acquired after waiting: {} by thread {} at {}", requestKey, lockAcquireThread, lockAcquireTime);
                             return requestKey;
-                        } else {
-                            log.info("Wait queue changed, skip acquisition: " + requestKey);
-                            return null;
                         }
+                        // 队头不是自己（队列变更，skip），或锁已被快速路径抢占：返回 null 前必须摘除自身
+                        // key。若残留队头即成死 key——此后每次 signal 唤醒的等待者都因队头不匹配被
+                        // 错误拒绝并同样泄漏，队列只增不减直至 maxWaiters 名额被尸体耗尽。
+                        waitQueue.remove(requestKey);
+                        return null;
                     } else {
                         waitQueue.remove(requestKey);
                         log.warn("Acquire timeout: {}, lock currently held by: {} (acquired at {} by thread {}), waitQueue size: {}",
@@ -181,10 +190,6 @@ public class SerialSourcePort {
         lock.lock();
         try {
             if (currentKey != null && currentKey.equals(releaseKey)) {
-                long heldDuration = System.currentTimeMillis() - lockAcquireTime;
-                String releasingThread = Thread.currentThread().getName();
-                log.info("Lock released: {} by thread {} (held by {} for {} ms)",
-                        releaseKey, releasingThread, lockAcquireThread, heldDuration);
                 currentKey = null;
                 lockAcquireTime = 0;
                 lockAcquireThread = null;
@@ -232,7 +237,7 @@ public class SerialSourcePort {
         }
 
         if (!isTestMode) {
-            registerFixedListener();
+            startPolling();
             log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
                     serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
         } else {
@@ -305,41 +310,73 @@ public class SerialSourcePort {
         }, SerialAsyncExecutor.getExecutor());
     }
 
-    // ========== Interrupt listener ==========
+    // ========== Port read polling（P1：jSerialComm 事件线程 → 共享调度器轮询） ==========
 
     /**
-     * 注册固定中断监听器
+     * 轮询周期（毫秒），对齐 IO 线程收敛调研建议（≤50ms，modbus4j InputStreamListener 同量级）。
+     * 生效粒度：生产 sweeper 与测试注入的 STPE 均为真实 25ms（103000 后端口轮询已撤出
+     * 引擎表轮——引擎 tick 100ms 的取整粒度不再适用于本任务）。
      */
-    private void registerFixedListener() {
-        if (serialPort == null || !serialPort.isOpen()) {
-            log.warn(getPortName() + " cannot register listener: port not open");
-            return;
+    static final long POLL_PERIOD_MS = 25L;
+
+    /**
+     * 启动端口读轮询（openPort 成功后调用；测试模式不调用，沿用旧 isTestMode 边界）。
+     * 先取消既有任务再挂新任务——写反压自动重开、并发注册等场景下保证单口单任务，
+     * 不会出现双任务同口双读。与 {@link #stopPolling()} 在 pollLock 下串行化。
+     */
+    void startPolling() {
+        synchronized (pollLock) {
+            stopPolling();
+            if (serialPort == null || !serialPort.isOpen()) {
+                log.warn("{} cannot start polling: port not open", getPortName());
+                return;
+            }
+            SerialPortPollTask task = new SerialPortPollTask(this);
+            ScheduledFuture<?> handle = SerialPollScheduler.delegate()
+                    .scheduleWithFixedDelay(task, POLL_PERIOD_MS, POLL_PERIOD_MS, TimeUnit.MILLISECONDS);
+            task.bindHandle(handle);
+            pollTask = handle;
+            log.info("[POLL-START] port={}, period={}ms, scheduler={}",
+                    getPortName(), POLL_PERIOD_MS, SerialPollScheduler.describe());
         }
-
-        eventAdapter = new SerialSourceEventAdapter(this);
-
-        eventAdapter.addListener(new SerialDataListener() {
-            @Override
-            public void onDataReceived(byte[] data, int length) {
-                handleIncomingData(data, length);
-            }
-
-            @Override
-            public void onError(Exception ex) {
-                log.warn("Error in fixed listener: " + ex.getMessage());
-            }
-        });
-
-        serialPort.addDataListener(eventAdapter);
     }
 
     /**
-     * 处理接收到的数据
+     * 停止端口读轮询（最后一个 source 注销关闭端口时调用；幂等）。
+     * 口被写反压/jSerialComm 自动关闭的场景由 {@link SerialPortPollTask} 的 -1 哨兵自取消兜住，
+     * 两条停止路径任一先到即停。
+     */
+    private void stopPolling() {
+        synchronized (pollLock) {
+            ScheduledFuture<?> handle = pollTask;
+            pollTask = null;
+            if (handle != null) {
+                handle.cancel(false);
+            }
+        }
+    }
+
+    /** 当前轮询任务句柄（生命周期断言用；无任务为 null）。 */
+    ScheduledFuture<?> getPollTaskHandle() {
+        synchronized (pollLock) {
+            return pollTask;
+        }
+    }
+
+    /** Modbus 直持 InputStream 期间轮询任务是否让路。 */
+    boolean isPollPaused() {
+        return pollPaused;
+    }
+
+    /**
+     * 处理接收到的数据（轮询任务在读到字节后调用；与旧事件路径同一入口）
      *
      * @param data 接收到的数据
      * @param length 数据长度
      */
-    private void handleIncomingData(byte[] data, int length) {
+    void handleIncomingData(byte[] data, int length) {
+        // 通讯帧捕获：读路径唯一入口（轮询与事件路径共用），独立数据面零 logback 开销
+        CommTraceBuffer.instance().rx(CommTraceTransport.SERIAL, serialInfo.portName, data, length, null, null);
         bufferLock.lock();
         try {
             // 直接追加字节数组，无需转换
@@ -363,26 +400,23 @@ public class SerialSourcePort {
     }
 
     /**
-     * 暂停事件适配器，阻止其从串口读取数据。
+     * 暂停端口读轮询，阻止轮询任务从串口读取数据。
      * 当 Modbus 等需要直接 InputStream/OutputStream 访问串口时调用，
-     * 避免 event adapter 与 direct stream 竞争数据。
+     * 避免轮询读取与 direct stream 竞争数据（旧事件适配器 pause 语义的轮询版平移，
+     * 方法名保留——SerialSource 公共 API，Modbus 侧消费方零改动）。
      */
     void pauseEventAdapter() {
-        if (eventAdapter != null) {
-            eventAdapter.setPaused(true);
-            log.info("[ADAPTER PAUSED] port={}", getPortName());
-        }
+        pollPaused = true;
+        log.info("[POLL-PAUSED] port={}", getPortName());
     }
 
     /**
-     * 恢复事件适配器，重新注册到串口。
+     * 恢复端口读轮询。
      * 当 Modbus 释放直接串口访问后调用。
      */
     void resumeEventAdapter() {
-        if (eventAdapter != null) {
-            eventAdapter.setPaused(false);
-            log.info("[ADAPTER RESUMED] port={}", getPortName());
-        }
+        pollPaused = false;
+        log.info("[POLL-RESUMED] port={}", getPortName());
     }
 
     void deliverBufferedData(SerialDataListener listener) {
@@ -428,6 +462,12 @@ public class SerialSourcePort {
             // 旧代码丢弃 writeBytes 返回值（静默成功，asyncSendData 永远返 true），现在显式检查并抛出——
             // 把「发不出去」如实告诉调用方，而非伪装成功。
             int written = serialPort.writeBytes(bytes, bytes.length);
+            // 通讯帧捕获：写路径唯一出口；写失败只累计通道错误计数（不产生 TX 帧，如实）
+            if (written >= 0) {
+                CommTraceBuffer.instance().tx(CommTraceTransport.SERIAL, serialInfo.portName, bytes, null);
+            } else {
+                CommTraceBuffer.instance().error(CommTraceTransport.SERIAL, serialInfo.portName);
+            }
             if (written < 0) {
                 log.warn("[WRITE-FAIL] port={}, writeBytes 返 {} (非阻塞反压, 端口已被关闭), 写路径抛 SerialWriteException",
                         serialInfo.portName, written);

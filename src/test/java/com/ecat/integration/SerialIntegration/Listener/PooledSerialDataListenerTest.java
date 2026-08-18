@@ -9,6 +9,9 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
@@ -344,6 +347,67 @@ public class PooledSerialDataListenerTest {
 
         // Assert
         assertEquals(complete, context.getReceiveBuffer().toString());
+        verify(mockSerialSource, times(1)).removeDataListener(listener);
+    }
+
+    // ==================== 回归：池释放链与在途通知并发（line-129 NPE 风暴） ====================
+
+    /**
+     * 复现生产回归：守卫（isInUse/context/responseFuture/serialSource 判空）通过之后、
+     * 响应完整分支的 serialSource.removeDataListener(this) 之前，池释放链
+     * （handleResponseInterrupt 的 whenCompleteAsync → pool.release → cleanup）
+     * 并发把 serialSource 字段置 null，通知线程在 line 129 解引用到 null 抛 NPE，
+     * 被方法自身的 catch 吞掉——移除调用丢失 + WARN 风暴。
+     *
+     * 生产时序：typedFuture.complete(context) 已把监听器生命周期移交给异步清理链，
+     * 通知线程（jSerialComm 事件线程）随后继续执行 removeDataListener；
+     * 清理链（含 processResponse 解析）可能抢在这次字段读之前完成 cleanup。
+     * 本测试在 checkResponseFunction 内用 latch 确定性卡住通知线程于守卫之后，
+     * 精确构造同一交错，不依赖线程调度运气。
+     */
+    @Test
+    public void testCleanupRacingCompleteBranch_ShouldStillRemoveListenerFromEntrySnapshot() throws Exception {
+        CountDownLatch checkEntered = new CountDownLatch(1);
+        CountDownLatch cleanupFinished = new CountDownLatch(1);
+        CountDownLatch callReturned = new CountDownLatch(1);
+        AtomicReference<Throwable> thrownToCaller = new AtomicReference<>();
+
+        listener.reset(context, mockFuture, mockSerialSource, response -> {
+            checkEntered.countDown();
+            try {
+                // 卡在守卫之后、complete/remove 分支之前，等待主线程执行 cleanup()
+                cleanupFinished.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return response; // 响应完整 → 走 complete + removeDataListener 分支
+        });
+
+        Thread notifyingThread = new Thread(() -> {
+            try {
+                byte[] data = "$\r\n".getBytes();
+                listener.onDataReceived(data, data.length);
+            } catch (Throwable t) {
+                thrownToCaller.set(t);
+            } finally {
+                callReturned.countDown();
+            }
+        }, "simulated-serial-event-thread");
+        notifyingThread.start();
+
+        assertTrue("onDataReceived 应已通过守卫并进入 checkResponseFunction",
+            checkEntered.await(5, TimeUnit.SECONDS));
+
+        // 并发方：GenericSerialDataListenerPool.release() → cleanup()（生产释放链的原子动作）
+        listener.cleanup();
+        cleanupFinished.countDown();
+
+        assertTrue("onDataReceived 应正常返回", callReturned.await(5, TimeUnit.SECONDS));
+        assertNull("onDataReceived 不得向调用方（notifyListeners）抛异常", thrownToCaller.get());
+
+        // 修复语义：本次通知按入口快照完成完整收尾——complete 与移除调用
+        // 不得因并发 cleanup 丢失（移除幂等，与释放链的兜底移除互不冲突）
+        verify(mockFuture, times(1)).complete(context);
         verify(mockSerialSource, times(1)).removeDataListener(listener);
     }
 }

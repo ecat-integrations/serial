@@ -9,7 +9,6 @@ import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.SerialTransactionStrategy;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlerStrategy;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlingContext;
-import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -175,7 +174,6 @@ public class ListenerPoolExhaustionReproductionTest {
                 clientSource.removeAllDataListeners();
                 clientSource.closePort();
             }
-            SerialTimeoutScheduler.cleanupScheduler(CLIENT_PORT);
             SerialListenerPools.BYTE_POOL.cleanup();
             System.out.println(logWithTimestamp("资源清理完成"));
         }

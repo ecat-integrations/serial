@@ -1,8 +1,6 @@
 package com.ecat.integration.SerialIntegration;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -10,6 +8,7 @@ import java.util.function.Function;
 
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
+import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 
 
 /**
@@ -53,17 +52,6 @@ public class SerialTransactionStrategy {
     private static final Log log = LogFactory.getLogger(SerialTransactionStrategy.class);
 
     /**
-     * 事务级硬超时计时器：单线程 daemon 调度池，到点把计时 future 异常完成（{@link TimeoutException}）。
-     * 全类共享（非每事务新建），daemon 线程不阻止 JVM 退出。
-     */
-    private static final ScheduledExecutorService HARD_TIMEOUT_SCHEDULER =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "serial-tx-hard-timeout");
-                t.setDaemon(true);
-                return t;
-            });
-
-    /**
      * 事务级硬超时倍数：相对设备配置的串口读超时（单次读）的放大系数。
      * 一次事务通常含多次 send-read（如 sailhero CO = getRealData().thenCompose(getStatusData) = 2 次读），
      * 故按倍数放大以覆盖整事务 + 安全余量；长事务设备（标定/多步流程）应改用
@@ -91,9 +79,13 @@ public class SerialTransactionStrategy {
      * （{@code source.getTimeout() > 0 ? source.getTimeout() : Const.READ_TIMEOUT_MS}）取设备配置的串口超时，
      * 再按 {@link #TRANSACTION_TIMEOUT_FACTOR} 放大以覆盖含多次读的整事务。
      *
+     * <p>public 供跨集成消费方派生「等待串口侧资源」的有界上限（103000：teledyne 的事务 permit
+     * 等待取本值——等满一个事务级硬超时仍未取得，即上一事务已超出其硬超时保证，等待方按失败
+     * 处理而非无限钉死线程）。
+     *
      * @return 事务级硬超时（毫秒）；source 为 null 或其串口超时无效时回退 Const.READ_TIMEOUT_MS × 倍数
      */
-    static long resolveDefaultTransactionTimeoutMs(SerialSource source) {
+    public static long resolveDefaultTransactionTimeoutMs(SerialSource source) {
         int deviceTimeout = (source != null && source.getTimeout() > 0)
                 ? source.getTimeout() : Const.READ_TIMEOUT_MS;
         return (long) deviceTimeout * TRANSACTION_TIMEOUT_FACTOR;
@@ -190,7 +182,7 @@ public class SerialTransactionStrategy {
      * （成功则透传原 future 结果，超时则异常 {@link TimeoutException}）。
      *
      * <p>Java 8 无 {@code CompletableFuture.orTimeout}（Java 9+ 才有），故用
-     * {@code applyToEither} 叠加一个由 {@link ScheduledExecutorService} 到点异常完成的计时 future 实现。
+     * {@code applyToEither} 叠加一个由 {@link SerialTimeoutScheduler}（共享调度器）到点异常完成的计时 future 实现。
      *
      * <p>参考 modbus_rtu：modbus4j {@code master.setTimeout} 在 I/O 层保证操作必然完成（成功或超时），
      * 从而 {@code ModbusTransactionStrategy} 的 {@code whenComplete} 必触发 → release 必执行。
@@ -203,7 +195,7 @@ public class SerialTransactionStrategy {
      */
     static CompletableFuture<Boolean> withHardTimeout(CompletableFuture<Boolean> future, long timeoutMs) {
         CompletableFuture<Boolean> timer = new CompletableFuture<>();
-        ScheduledFuture<?> scheduled = HARD_TIMEOUT_SCHEDULER.schedule(
+        ScheduledFuture<?> scheduled = SerialTimeoutScheduler.schedule(
                 () -> timer.completeExceptionally(new TimeoutException(
                         "Transaction hard timeout after " + timeoutMs + " ms")),
                 timeoutMs, TimeUnit.MILLISECONDS);

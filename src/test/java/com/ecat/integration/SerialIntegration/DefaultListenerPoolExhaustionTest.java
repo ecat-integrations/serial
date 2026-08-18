@@ -6,7 +6,6 @@ import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListenerPool;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.DefaultResponseHandlerStrategy;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ResponseHandlingContext;
-import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -172,7 +171,6 @@ public class DefaultListenerPoolExhaustionTest {
                 clientSource.removeAllDataListeners();
                 clientSource.closePort();
             }
-            SerialTimeoutScheduler.cleanupScheduler(CLIENT_PORT);
             SerialDataListenerPool.cleanup();
             System.out.println(logWithTimestamp("资源清理完成"));
         }

@@ -5,7 +5,6 @@ import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.SerialListenerPools;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlerStrategy;
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlingContext;
-import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -65,9 +64,8 @@ public class MultiPortConcurrencyByteTest {
         // 1. 初始化20对串口
         List<SerialPortPair> portPairs = initializePorts();
 
-        // 2. 记录初始线程池状态
-        System.out.println("初始线程池状态:");
-        System.out.println("  活跃线程池数: " + SerialTimeoutScheduler.getActiveSchedulerCount());
+        // 2. 记录初始监听器池状态（超时调度已合并共享调度器，无端口级线程池）
+        System.out.println("初始监听器池状态:");
         System.out.println("  当前线程可用监听器: " + SerialListenerPools.BYTE_POOL.getAvailableCount());
         System.out.println();
 
@@ -386,8 +384,7 @@ public class MultiPortConcurrencyByteTest {
             System.out.println("⚠ 低并发：串口主要是顺序执行");
         }
 
-        System.out.println("\n=== 线程池使用统计 ===");
-        System.out.println("活跃线程池数: " + SerialTimeoutScheduler.getActiveSchedulerCount());
+        System.out.println("\n=== 监听器池使用统计 ===");
         System.out.println("监听器池最终状态:");
         System.out.println("  可用监听器: " + SerialListenerPools.BYTE_POOL.getAvailableCount());
         System.out.println("  总监听器数: " + SerialListenerPools.BYTE_POOL.getTotalCount());
@@ -449,7 +446,6 @@ public class MultiPortConcurrencyByteTest {
             try {
                 pair.sender.closePort();
                 pair.receiver.closePort();
-                SerialTimeoutScheduler.cleanupScheduler(pair.sender.getPortName());
             } catch (Exception e) {
                 // 忽略清理错误
             }

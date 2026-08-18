@@ -107,7 +107,7 @@ public class SerialTransactionStrategyAsyncContractTest {
 
     /**
      * 【正确范式 GREEN】异步消费（{@code whenComplete}，不 {@code .get()}）一个永不 complete 的 future 时，
-     * 调度线程立即返回（硬超时计时在独立的 HARD_TIMEOUT_SCHEDULER 上）→ 同池标记任务<b>即时执行，不饥饿</b>。
+     * 调度线程立即返回（硬超时计时经 SerialTimeoutScheduler 委托给本测试池之外的调度器）→ 同池标记任务<b>即时执行，不饥饿</b>。
      *
      * <p>这是各设备 {@code start()} 必须遵循的契约（对齐 modbus 与 sailhero XH*、PM3000E 等既有设备）。
      */
