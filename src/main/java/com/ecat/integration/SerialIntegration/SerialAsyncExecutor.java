@@ -1,47 +1,33 @@
 package com.ecat.integration.SerialIntegration;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import com.ecat.core.Task.NamedThreadFactory;
-import com.ecat.core.Utils.LogFactory;
-import com.ecat.core.Utils.Log;
-import com.ecat.core.Utils.Mdc.MdcExecutorService;
+import com.ecat.core.Task.GuardedExecutor;
 
 /**
  * Serial 集成模块统一的异步执行器
- * 为所有串口相关的异步操作提供统一的线程池
+ * 为所有串口相关的异步操作提供统一的执行通道
  *
- * <p>已包装 MDC 上下文传播，确保异步线程中的日志正确路由到对应集成。
+ * <p>执行通道为 GuardedExecutor 硬超时看门狗视图（同 gate FIFO 串行 + 超时执法 + 有账），
+ * MDC/traceId 上下文随提交捕获、在 worker 内恢复，日志正确路由到对应集成。
+ * 池由 GuardedExecutor 共享持有（daemon 线程，随 JVM 退出），本类不再自持线程池，
+ * 状态查询透传 GuardedExecutor 全局账目（completed/timedOut/rejected/running/activeGates）。
  *
  * @author coffee
  */
 public class SerialAsyncExecutor {
-    private static final Log log = LogFactory.getLogger(SerialAsyncExecutor.class);
 
     /**
-     * 原始线程池（用于状态查询和关闭）
-     * 使用 NamedThreadFactory 命名，线程名格式: integration-serial-0, integration-serial-1
+     * 统一串口异步操作执行通道（arch-review 27 号组件示范接入）：看门狗 guarded 视图。
+     * 提交到 GuardedExecutor 共享小池（gate=serial-async 同 gate FIFO 串行），超时由硬超时
+     * 看门狗执法（默认 60s，可配 ecat.guarded.timeout-ms）；MDC/traceId 由 GuardedExecutor
+     * 提交时捕获、worker 内恢复，等价原 MdcExecutorService.wrap 语义。
+     * 不可中断任务超时后占槽至自然结束是有意的诚实边界（隔离上限=看门狗池大小）。
      */
-    private static final ThreadPoolExecutor RAW_EXECUTOR = new ThreadPoolExecutor(
-        4,                                      // 核心线程数
-        8,                                      // 最大线程数
-        60L,                                    // 空闲线程存活时间
-        TimeUnit.SECONDS,
-        new LinkedBlockingQueue<>(200),         // 队列大小
-        new NamedThreadFactory("integration-serial"),  // 线程名前缀
-        new ThreadPoolExecutor.CallerRunsPolicy()  // 队列满时在调用线程执行
-    );
+    private static final ExecutorService EXECUTOR = GuardedExecutor.guardedExecutorFor(
+        "serial-async", GuardedExecutor.defaultTimeoutMs());
 
     /**
-     * MDC 包装的统一串口异步操作线程池
-     * 自动传播 MDC 上下文到异步线程
-     */
-    private static final ExecutorService EXECUTOR = MdcExecutorService.wrap(RAW_EXECUTOR);
-
-    /**
-     * 获取统一的异步执行器（已包装 MDC）
+     * 获取统一的异步执行器（guarded 视图，已含 MDC 传播）
      * @return ExecutorService 线程池
      */
     public static ExecutorService getExecutor() {
@@ -49,36 +35,12 @@ public class SerialAsyncExecutor {
     }
 
     /**
-     * 获取线程池状态信息
+     * 获取执行通道状态信息（GuardedExecutor 共享池的全局账目，非本 gate 独立计数）。
+     * 原 ThreadPoolExecutor 版本在切换 guarded 视图后已成零任务死池、指标恒零误导排障，
+     * 已删除；此处透传真实账目保持诊断出口可用。
      * @return 状态字符串
      */
     public static String getStatus() {
-        return String.format("SerialAsyncExecutor[queue=%d, active=%d, completed=%d, poolSize=%d]",
-                            RAW_EXECUTOR.getQueue().size(),
-                            RAW_EXECUTOR.getActiveCount(),
-                            RAW_EXECUTOR.getCompletedTaskCount(),
-                            RAW_EXECUTOR.getPoolSize());
-    }
-
-    /**
-     * 关闭线程池（应用关闭时调用）
-     */
-    public static void shutdown() {
-        log.info("Shutting down SerialAsyncExecutor");
-        EXECUTOR.shutdown();
-        try {
-            if (!EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
-                log.warn("Forcefully shutting down SerialAsyncExecutor");
-                EXECUTOR.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            EXECUTOR.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    // JVM关闭钩子（具名：ThreadNamingArchTest 规则 3 立法，线程普查可归属）
-    static {
-        Runtime.getRuntime().addShutdownHook(new Thread(SerialAsyncExecutor::shutdown, "serial-async-shutdown"));
+        return "SerialAsyncExecutor[guarded, " + GuardedExecutor.getStats() + "]";
     }
 }
