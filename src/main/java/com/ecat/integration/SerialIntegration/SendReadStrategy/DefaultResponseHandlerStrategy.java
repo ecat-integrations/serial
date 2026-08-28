@@ -11,7 +11,6 @@ import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.Const;
-import com.ecat.integration.SerialIntegration.SerialAsyncExecutor;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.PooledSerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListenerPool;
@@ -133,7 +132,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
      * @return CompletableFuture<Boolean>
      */
     private CompletableFuture<Boolean> handleResponseLegacy(ResponseHandlingContext<T> context) {
-        // readDataRecursively 已经在 SerialAsyncExecutor 中执行
+        // readDataRecursively 已经在端口 IO 车道（serial-io:{port}）中执行
         // 使用 thenApply（而非 thenApplyAsync）保持在该线程中执行，避免线程切换
         return readDataRecursively(context)
                .thenApply(processResponseFunction)
@@ -179,17 +178,23 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
             TimeUnit.MILLISECONDS
         );
 
-        // 使用异步处理链，在独立线程池中执行，不阻塞串口线程
-        return responseFuture
-            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
-            .exceptionally(ex -> handleExceptionFunction.apply(ex))
-            .whenCompleteAsync((res, ex) -> {
-                if (timeoutTask != null && !timeoutTask.isDone()) {
-                    timeoutTask.cancel(true);
-                }
-                serialSource.removeDataListener(listener);
-                SerialDataListenerPool.release(listener);
-            }, SerialAsyncExecutor.getExecutor());
+        // P1（29 号 M3）：responseFuture 的完成方已迁 Core Worker（监听器组帧命中后经
+        // Core.submit 投递）。非 async 续链——processResponse 在完成线程（Core Worker）上执行。
+        // 123000 根修：返回 future 的完成只依赖 responseFuture（响应/超时）；清理 fire-and-forget
+        // 投域池端口串行视图，不得门控完成——完成等待只应有界于响应/超时（deadline 契约），
+        // 清理在同口 FIFO 里排于其后的写流量之后（165500：写压测下口内任务有时延），
+        // 门控完成会把事务时长拖出口内排队时延，且等待方 join 的事务超时窗被无谓放大。
+        CompletableFuture<Boolean> result = responseFuture
+            .thenApply(result0 -> processResponseFunction.apply(result0))
+            .exceptionally(ex -> handleExceptionFunction.apply(ex));
+        result.whenCompleteAsync((res, ex) -> {
+            if (timeoutTask != null && !timeoutTask.isDone()) {
+                timeoutTask.cancel(true);
+            }
+            serialSource.removeDataListener(listener);
+            SerialDataListenerPool.release(listener);
+        }, serialSource.getIoExecutor());
+        return result;
     }
 
     /**
@@ -210,9 +215,11 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                 context.getReceiveBuffer().append(receivedData);
 
                 // 检查响应是否完整
-                if (checkResponseFunction.apply(context.getReceiveBuffer().toString()) != null) {
+                String bufferContent = context.getReceiveBuffer().toString();
+                if (checkResponseFunction.apply(bufferContent) != null) {
                     context.getFinishedFlag().set(true);
-                    responseFuture.complete(context);
+                    // P1：IO 线程只投递，finalize 在 Core Worker 上完成 future（同池化监听器路径）
+                    serialSource.submitInboundFrame(bufferContent.getBytes(), () -> responseFuture.complete(context));
                     serialSource.removeDataListener(this);
                 }
             }
@@ -237,16 +244,20 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
             TimeUnit.MILLISECONDS
         );
 
-        // 使用异步处理链
-        return responseFuture
-            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
-            .exceptionally(ex -> handleExceptionFunction.apply(ex))
-            .whenCompleteAsync((res, ex) -> {
-                if (timeoutTask != null && !timeoutTask.isDone()) {
-                    timeoutTask.cancel(true);
-                }
-                serialSource.removeDataListener(listener);
-            }, SerialAsyncExecutor.getExecutor());
+        // P1：非 async 续链——processResponse 在完成 future 的线程（Core Worker）上执行
+        // 123000 根修（同池化路径范本）：返回 future 的完成只依赖 responseFuture（响应/超时）；
+        // 清理 fire-and-forget 投域池端口串行视图，不得门控完成（完成等待只应有界于响应/超时
+        // 的 deadline 契约，同上——清理在口内 FIFO 的排队时延不得放大事务超时窗）。
+        CompletableFuture<Boolean> result = responseFuture
+            .thenApply(result0 -> processResponseFunction.apply(result0))
+            .exceptionally(ex -> handleExceptionFunction.apply(ex));
+        result.whenCompleteAsync((res, ex) -> {
+            if (timeoutTask != null && !timeoutTask.isDone()) {
+                timeoutTask.cancel(true);
+            }
+            serialSource.removeDataListener(listener);
+        }, serialSource.getIoExecutor());
+        return result;
     }
 
     /**
@@ -277,7 +288,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
             future.completeExceptionally(new InterruptedException("Interrupted during polling"));
             return future;
         }
-        // asyncReadData() 已经在 SerialAsyncExecutor 中执行
+        // asyncReadData() 已经在端口 IO 车道（serial-io:{port}）中执行
         // 使用 thenCompose（而非 thenComposeAsync）保持在该线程中执行，避免线程切换
         // 这对于测试环境的 Mock 验证很重要
         return serialSource.asyncReadData()

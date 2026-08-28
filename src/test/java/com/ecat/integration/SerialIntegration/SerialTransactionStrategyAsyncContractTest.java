@@ -43,6 +43,7 @@ public class SerialTransactionStrategyAsyncContractTest {
     private static SerialSource newMockSource() {
         SerialSource source = mock(SerialSource.class);
         when(source.acquire()).thenReturn("key");
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.getTimeout()).thenReturn(50);
         return source;
     }

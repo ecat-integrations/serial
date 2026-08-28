@@ -49,6 +49,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void releaseFires_whenLambdaFutureNeverCompletes() throws Exception {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         String key = "test-key-leak";
         when(source.acquire()).thenReturn(key);
 
@@ -75,6 +76,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void releaseFires_whenLambdaFutureCompletesNormally() throws Exception {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.acquire()).thenReturn("key-normal");
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
@@ -88,6 +90,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void releaseFires_whenLambdaThrowsSynchronously() throws Exception {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.acquire()).thenReturn("key-throw");
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
@@ -106,6 +109,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void returnsFailedFuture_whenAcquireReturnsNull() throws Exception {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.acquire()).thenReturn(null);
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
@@ -129,6 +133,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void defaultTimeout_derivedFromDeviceConfigTimeout() {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.getTimeout()).thenReturn(300);
 
         long resolved = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);
@@ -140,6 +145,7 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void defaultTimeout_fallsBackToConst_whenDeviceTimeoutInvalid() {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.getTimeout()).thenReturn(0);
 
         long resolved = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);

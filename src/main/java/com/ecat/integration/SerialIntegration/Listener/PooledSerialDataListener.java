@@ -134,7 +134,10 @@ public class PooledSerialDataListener implements SerialDataListener, PoolableLis
                 @SuppressWarnings("unchecked")
                 CompletableFuture<ResponseHandlingContext<?>> typedFuture =
                     (CompletableFuture<ResponseHandlingContext<?>>) currentFuture;
-                typedFuture.complete(currentContext);
+                // P1（29 号 M3）：IO 线程只读字节+组帧+投递——业务 finalize（complete
+                // responseFuture，processResponse 续链由此在 Core Worker 上触发）经
+                // Core.submit 投递，不在本（sweeper）线程内联执行。
+                currentSource.submitInboundFrame(bufferContent.getBytes(), () -> typedFuture.complete(currentContext));
 
                 // 仅在响应完整时移除监听器（保留监听器以接收分片数据的后续部分）。
                 // 按监听器身份移除且幂等（CopyOnWriteArrayList.remove），与释放链

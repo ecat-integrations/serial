@@ -114,6 +114,7 @@ public class SerialTimeoutSchedulerMergedThreadTest {
     @Test
     public void transactionHardTimeout_firesWithoutDedicatedThread() throws Exception {
         SerialSource source = mock(SerialSource.class);
+        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.acquire()).thenReturn("key");
         when(source.getTimeout()).thenReturn(50);
         CompletableFuture<Boolean> neverCompleting = new CompletableFuture<>();

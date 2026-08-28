@@ -2,9 +2,12 @@ package com.ecat.integration.SerialIntegration;
 
 import com.fazecast.jSerialComm.SerialPort;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 
@@ -121,6 +124,21 @@ public class SerialSource {
     }
 
     /**
+     * 非阻塞获取锁（轮询专用，E2/R3「过期即弃」）：锁忙立即返回 null、零 park、不占等待队列。
+     * 语义与记账见 {@link SerialSourcePort#tryAcquire()}。
+     *
+     * @return 锁标识；锁忙时立即返回 null（本周期放弃，下周期再试）
+     */
+    public String tryAcquire() {
+        return sourcePort.tryAcquire();
+    }
+
+    /** 本端口累计轮询锁忙放弃次数（{@link SerialSourcePort#tryAcquire()} 记账）。 */
+    public long getLockBusySkipCount() {
+        return sourcePort.getLockBusySkipCount();
+    }
+
+    /**
      * 释放锁
      * @param releaseKey 要释放的锁标识
      * @return 释放是否成功
@@ -145,6 +163,25 @@ public class SerialSource {
     public String getPortName() {
         return sourcePort.getPortName();
     }
+
+    /**
+     * 本端口 IO 执行域（域自持 {@link SerialIoPool} 的 per-port 串行视图：同口 FIFO 串行、
+     * 异口并行）。串口收尾链（响应处理/事务 release 等）统一经此执行域提交——29 号 v2 S1
+     * 起脱离引擎车道，替代已退役的全局 serial-async 单 gate（E1 事故载体）与引擎车道视图。
+     */
+    public ExecutorService getIoExecutor() {
+        return sourcePort.ioExecutor();
+    }
+
+    /**
+     * IO 线程（sweeper/监听器回调）投递已定界的完整入站帧到域池端口串行视图（P1：
+     * IO 线程只读字节+组帧+投递，设备业务 finalize 在 ecat-serial-io-N 上执行）。
+     * O(1) 入队即返；域池拒绝由 dispatcher 记账，调用方不重试（响应超时兜底）。
+     * 监听器（Listener 包）与响应处理策略消费；设备集成零改码。
+     */
+    public void submitInboundFrame(byte[] frameBytes, Runnable finalizeBody) {
+        sourcePort.submitInboundFrame(frameBytes, finalizeBody);
+    }
     /**
      * 获取底层 SerialPort 对象
      * @return SerialPort 对象
@@ -159,6 +196,28 @@ public class SerialSource {
 
     public boolean isClosed() {
         return sourcePort.isClosed();
+    }
+
+    /**
+     * 挂死端口自愈（Q-1/A2）：close + reopen 强拆挂死的本地阻塞写，语义见
+     * {@link SerialSourcePort#recoverWedgedPort(String)}。由事务级硬超时路径调用
+     * （SerialTransactionStrategy），也可供 modbus RTU 等直持串口流的集成在其事务
+     * 硬超时路径上复用（挂死的 modbus 写发生在同一串口 fd 上）。
+     *
+     * @param reason 触发原因（日志定位用）
+     */
+    public void recoverWedgedPort(String reason) {
+        sourcePort.recoverWedgedPort(reason);
+    }
+
+    /**
+     * 标记当前事务已被硬超时强拆（F-43 清洗①）：端口残留写闸门生效，被掐事务代内的后续
+     * asyncSendData 提交（delay 定时器到点后的补发命令）一律拒绝，堵与新事务交错的复活路径
+     * （bugs/bug-record-20260826-093000 Q1）。由事务级硬超时路径调用
+     * （SerialTransactionStrategy），下一次 acquire 授予新代后自动放行。
+     */
+    public void markTransactionAborted() {
+        sourcePort.markTransactionAborted();
     }
 
     /**
@@ -196,6 +255,41 @@ public class SerialSource {
             // 如果发送命令后已经收到了消息，则认为是本次命令的应答，直接将数据发布给监听器
             sourcePort.deliverBufferedData(listener);
         }
+    }
+
+    /**
+     * 被动接收统一注册形态（17 号 v2.1 §2.2 接收模式薄包装）：以
+     * {@code Consumer<byte[]>} 注册被动帧处理，内部适配到既有
+     * {@link SerialDataListener} 体系（对象池/回放窗/挂起缓冲等机制原样继承，
+     * 不另造监听通道）。serial 从机/被动设备仓（biaoqi 形态）的注册词汇。
+     *
+     * <p>回调线程契约：onDataReceived 的既有调用线程（serial-io-sweeper 数据面线程），
+     * 消费方须轻量（组帧/转交，禁阻塞——同 B5 纪律）；需要业务处理时经
+     * {@link #submitInboundFrame(byte[], Runnable)} 转域池端口视图。适配器内异常由
+     * 既有 notifyListeners 兜住转 {@code onError}（本包装记 warn，不打断其他监听器）。
+     *
+     * @param frameHandler 每次收到的字节切片消费者（恰好 length 字节：短于底层数组时
+     *                     防御性拷贝切片，等长时零拷贝直传——读路径每读新分配，无复用竞争）
+     * @return 适配后的监听器（注销时经 {@link #removeDataListener(SerialDataListener)}；
+     *         设备注销场景由 {@link #closePort()} 全量清理覆盖）
+     */
+    public SerialDataListener onFrame(Consumer<byte[]> frameHandler) {
+        if (frameHandler == null) {
+            throw new IllegalArgumentException("frameHandler 不能为 null");
+        }
+        SerialDataListener adapter = new SerialDataListener() {
+            @Override
+            public void onDataReceived(byte[] data, int length) {
+                frameHandler.accept(length == data.length ? data : Arrays.copyOf(data, length));
+            }
+
+            @Override
+            public void onError(Exception ex) {
+                log.warn(getPortName() + " [" + identity + "] onFrame handler error: " + ex.getMessage());
+            }
+        };
+        addDataListener(adapter);
+        return adapter;
     }
 
     /**

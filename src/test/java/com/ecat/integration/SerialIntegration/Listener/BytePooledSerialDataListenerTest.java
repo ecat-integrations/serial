@@ -44,6 +44,14 @@ public class BytePooledSerialDataListenerTest {
         mockitoCloseable = MockitoAnnotations.openMocks(this);
         listener = new BytePooledSerialDataListener();
         context = new ByteResponseHandlingContext<>("test_context");
+
+        // P1 契约：完整帧命中后监听器只投递 submitInboundFrame（IO 线程不内联 finalize）。
+        // 测试桩同步驱动投递的事件体，保住「future 完成」旧断言语义。
+        doAnswer(invocation -> {
+            Runnable finalizeBody = invocation.getArgument(1);
+            finalizeBody.run();
+            return null;
+        }).when(mockSerialSource).submitInboundFrame(any(), any());
     }
 
     @After

@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -16,6 +17,7 @@ import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 import com.ecat.core.CommTrace.CommTraceBuffer;
 import com.ecat.core.CommTrace.CommTraceTransport;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SerialSourcePort manages the underlying serial port resource.
@@ -33,6 +35,24 @@ public class SerialSourcePort {
     private volatile long lockAcquireTime;
     private volatile String lockAcquireThread;
     private final Queue<String> waitQueue = new LinkedList<>();
+
+    /**
+     * 幽灵锁收割阈值：currentKey 持续超过该时长即判定持锁事务已死（release 永久缺失），
+     * 强制清锁救活端口。合法事务的事务级硬超时是秒级（SerialTransactionStrategy），
+     * 5 分钟远超任何合法持锁时长，误收割风险可忽略。package-private 非 final 供红测缩短。
+     */
+    static final long DEFAULT_GHOST_REAP_THRESHOLD_MS = 300_000L;
+    private long ghostReapThresholdMs = DEFAULT_GHOST_REAP_THRESHOLD_MS;
+
+    /**
+     * 红测注入口：缩短幽灵锁收割阈值（仅同包测试使用；生产用默认 5 分钟）。
+     */
+    void setGhostReapThresholdMsForTest(long thresholdMs) {
+        if (thresholdMs <= 0) {
+            throw new IllegalArgumentException("ghostReapThresholdMs must be > 0, got: " + thresholdMs);
+        }
+        this.ghostReapThresholdMs = thresholdMs;
+    }
 
     SerialPort serialPort;
     SerialInfo serialInfo;
@@ -112,6 +132,41 @@ public class SerialSourcePort {
     // ========== Lock management ==========
 
     /**
+     * 残留写闸门（F-43 清洗①，bugs/bug-record-20260826-093000 Q1）：per-port 事务代数。
+     * acquire/tryAcquire 授予时递增 {@link #txGeneration} 并刷新 {@link #activeGeneration}；
+     * 硬超时强拆时 {@link #markTransactionAborted()} 把 {@link #minLiveGeneration} 抬到
+     * 当前代 + 1——被掐事务内尚未发出的 asyncSendData 提交（代数 < minLive）全部在写口拒绝，
+     * 堵「强拆后 delay 定时器到点、剩余命令补发到（可能已重开的）端口与新事务交错」的复活路径
+     * （F-42 受控实验：被掐轮 fpmset 在强拆 18s 后落 sim）。新事务 acquire 授予新代后闸门自动放行。
+     */
+    private final AtomicLong txGeneration = new AtomicLong();
+    private volatile long activeGeneration;
+    private volatile long minLiveGeneration;
+
+    /** 硬超时强拆标记：被掐事务代内的后续发送一律拒绝（见 {@link #txGeneration} 注释）。 */
+    void markTransactionAborted() {
+        minLiveGeneration = txGeneration.get() + 1;
+        log.warn("[TX-ABORTED] port={}, 代数 {} 内的残留写将被拒绝（下代 {} 起放行）",
+                serialInfo.portName, txGeneration.get(), minLiveGeneration);
+    }
+
+    /** 授予新事务代数（acquire/tryAcquire 持锁临界区内调用）。 */
+    private void grantGeneration() {
+        activeGeneration = txGeneration.incrementAndGet();
+    }
+
+    /**
+     * 残留写检查（写口统一防线）：发送提交时捕获的代数 < 当前最低存活代数 = 被掐事务的
+     * 补发命令，拒绝落端口。
+     */
+    private void assertWriteLive(long txTag) {
+        if (txTag < minLiveGeneration) {
+            throw new SerialWriteException("残留写拒绝: 事务已被硬超时强拆 (txTag=" + txTag
+                    + " < minLive=" + minLiveGeneration + "), port=" + serialInfo.portName);
+        }
+    }
+
+    /**
      * 尝试获取锁，支持等待队列
      * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
      */
@@ -130,8 +185,10 @@ public class SerialSourcePort {
         String requestKey = generateRequestKey();
         lock.lock();
         try {
+            reapGhostLockIfStale("acquire");
             if (currentKey == null) {
                 currentKey = requestKey;
+                grantGeneration();
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
                 return requestKey;
@@ -156,6 +213,7 @@ public class SerialSourcePort {
                         if (currentKey == null && waitQueue.peek() != null && waitQueue.peek().equals(requestKey)) {
                             currentKey = requestKey;
                             waitQueue.poll();
+                            grantGeneration();
                             lockAcquireTime = System.currentTimeMillis();
                             lockAcquireThread = Thread.currentThread().getName();
                             return requestKey;
@@ -176,6 +234,60 @@ public class SerialSourcePort {
                     return null;
                 }
             }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 轮询 tryAcquire 锁忙放弃计数（E2/R3 记账：放弃必须可观测，禁静默）。 */
+    private final AtomicLong lockBusySkipCount = new AtomicLong();
+    /** 锁忙放弃日志限频时间戳（volatile：锁临界区内读写，ReentrantLock 保证可见性，此字段仅日志用）。 */
+    private volatile long lastBusySkipLogAt;
+    /** 锁忙放弃日志限频间隔：默认 60s 一条（饱和期 ~30 次/min 的放弃若不限频会刷爆日志）。 */
+    static final long BUSY_SKIP_LOG_INTERVAL_MS = 60_000L;
+
+    /** 获取累计锁忙放弃次数（轮询 tryAcquire 因锁忙立即放弃的计数，运行时可观测用）。 */
+    public long getLockBusySkipCount() {
+        return lockBusySkipCount.get();
+    }
+
+    /**
+     * 非阻塞获取锁（轮询专用，E2/R3 终态修复：调度三原则「过期即弃」）。
+     *
+     * <p>与 {@link #acquire(long, TimeUnit)} 的本质差异：锁忙时<b>不进 waitQueue、不 park
+     * 等待、不消费 signal</b>，立即返回 null——本周期放弃，下周期再试。由此：
+     * <ul>
+     *   <li>轮询 worker 永不为等锁 park（秒级阻塞事务不再钉死调度 worker，杜绝
+     *       6 worker × 87 设备互相排队的饱和震荡）；</li>
+     *   <li>waitQueue 名额与 signal 唤醒完全留给写命令等有限等待路径，不互相干扰。</li>
+     * </ul>
+     *
+     * <p>锁忙放弃有记账：累计计数 {@link #getLockBusySkipCount()} + 限频 warn 日志（饱和期
+     * 可观测，禁静默）。幽灵锁收割检查与 {@link #acquire(long, TimeUnit)} 同入口复用。
+     *
+     * @return 锁标识；锁忙时立即返回 null（本周期放弃）
+     */
+    String tryAcquire() {
+        String requestKey = generateRequestKey();
+        lock.lock();
+        try {
+            reapGhostLockIfStale("acquire");
+            if (currentKey == null) {
+                currentKey = requestKey;
+                grantGeneration();
+                lockAcquireTime = System.currentTimeMillis();
+                lockAcquireThread = Thread.currentThread().getName();
+                return requestKey;
+            }
+            long skips = lockBusySkipCount.incrementAndGet();
+            long now = System.currentTimeMillis();
+            if (now - lastBusySkipLogAt >= BUSY_SKIP_LOG_INTERVAL_MS) {
+                lastBusySkipLogAt = now;
+                log.warn("Polling tryAcquire skipped (lock busy): port={}, total skips={}, "
+                        + "lock currently held by: {} (acquired at {} by thread {})",
+                        getPortName(), skips, currentKey, lockAcquireTime, lockAcquireThread);
+            }
+            return null;
         } finally {
             lock.unlock();
         }
@@ -202,6 +314,41 @@ public class SerialSourcePort {
             return false;
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 幽灵锁收割（Q-1/Q-2 二轮根因修复）：持锁事务的事务级硬超时保证 release 必执行，
+     * 但 release 的执行链本身可能整体丢失（超时任务入队被拒后 {@code withHardTimeout} 的计时
+     * future 永不完成、持有线程被上游设备同步等待永久吸收等）——此时 currentKey 成为
+     * 永久幽灵锁：后续所有 acquire 只能超时返回，端口永久瘫痪（live 实证幽灵锁持锁 45min+，
+     * WEDGE-RECOVERY 反复触发不收敛）。本方法在 acquire 入口与 recoverWedgedPort 双点检查：
+     * 持锁时长超过 {@link #ghostReapThresholdMs} 即按 release 同一状态机强制清零
+     * （currentKey/lockAcquireTime/lockAcquireThread + signal 等待者），杜绝第二套清锁路径漂移。
+     *
+     * <p>必须在已持有 {@code lock} 的临界区内调用。收割不清空 waitQueue：等待者仍按
+     * 队头接管规则被 signal 唤醒，超时者自行摘除（既有语义不变）。
+     *
+     * @param trigger 触发点标识（日志定位用：acquire / wedge-recovery）
+     */
+    private void reapGhostLockIfStale(String trigger) {
+        if (currentKey == null || lockAcquireTime <= 0) {
+            return;
+        }
+        long heldMs = System.currentTimeMillis() - lockAcquireTime;
+        if (heldMs <= ghostReapThresholdMs) {
+            return;
+        }
+        log.error("[GHOST-LOCK-REAPED] port={}, trigger={}, 幽灵锁持锁 {}ms 超阈值 {}ms（持锁 key={}, 持锁线程={}），"
+                        + "按 release 同一状态机强制清零，等待者 {} 个被唤醒",
+                serialInfo.portName, trigger, heldMs, ghostReapThresholdMs,
+                currentKey, lockAcquireThread, waitQueue.size());
+        // 与 release() 完全一致的状态清零 + 唤醒（同一状态机，无双路径漂移）
+        currentKey = null;
+        lockAcquireTime = 0;
+        lockAcquireThread = null;
+        if (!waitQueue.isEmpty()) {
+            condition.signal();
         }
     }
 
@@ -236,6 +383,9 @@ public class SerialSourcePort {
             return;
         }
 
+        // 重开后 RX 清洗（F-43 清洗②）：清内核残留 + 应用层缓冲，重开后首读零旧字节
+        drainAndClearReceiveBuffer("port-open");
+
         if (!isTestMode) {
             startPolling();
             log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
@@ -248,6 +398,41 @@ public class SerialSourcePort {
 
     boolean isPortOpen() {
         return serialPort.isOpen();
+    }
+
+    /**
+     * RECONFIGURE 后设备重 load 时应用新 comm 设置（F-34，bug-record-20260826-001300）。
+     * 此前 register() 同口复用从不对比新旧 SerialInfo：timeout 被静默吞掉、物理参数变化
+     * 抛异常，均需 disable/enable 兜底重建才生效。分两档处理：
+     * <ul>
+     *   <li>物理参数（baudrate/dataBits/stopBits/parity/flowControl）变化：旧 fd 持旧参数
+     *       无法热改，走 disable/enable 同款重建路径 stopPolling → closePort → openPort
+     *       （{@link #openPort} 内按新 serialInfo 全量重设参数并重启轮询）；
+     *       共享此端口的全部 source 引用不变，随新 fd 继续工作；</li>
+     *   <li>timeout-only 变化：纯软件参数（{@link #getTimeout()} 读 serialInfo，不下发 OS），
+     *       原位替换 SerialInfo 即生效，不重建端口（避免无谓 churn）。</li>
+     * </ul>
+     *
+     * @param newInfo RECONFIGURE 提交的新 SerialInfo（portName 与本端口一致）
+     * @param identity 触发方标识（日志定位用）
+     */
+    void applyReconfiguredSettings(SerialInfo newInfo, String identity) {
+        if (serialInfo.settingsMatch(newInfo)) {
+            if (serialInfo.timeout != newInfo.timeout) {
+                log.info("[RECONFIGURE-TIMEOUT] port={}, identity={}, timeout {} -> {}（纯软件参数，不重建端口）",
+                        serialInfo.portName, identity, serialInfo.timeout, newInfo.timeout);
+                serialInfo = newInfo;
+            }
+            return;
+        }
+        log.warn("[RECONFIGURE-REOPEN] port={}, identity={}, 物理参数变化 [{}] -> [{}]，close+reopen 重建端口",
+                serialInfo.portName, identity, serialInfo.settingsDescription(), newInfo.settingsDescription());
+        stopPolling();
+        if (serialPort != null && serialPort.isOpen()) {
+            serialPort.closePort();
+        }
+        serialInfo = newInfo;
+        openPort(identity);
     }
 
     public SerialPort getSerialPort() {
@@ -269,6 +454,29 @@ public class SerialSourcePort {
     }
 
     /**
+     * 本端口的传输资源键（serial-io:{portName}）：端口对象生命周期内不变。
+     * 互斥对象 = 一条物理串口总线（同口所有 send/read/收尾串行，异口并行）。
+     * W2-1 后仅作 {@link SerialIoEvent} 的诊断词汇（requestId/日志定位）——互斥本体
+     * 已由域池 per-port 视图承担（见 {@link #ioExecutor()}），不再进任何执行 API。
+     */
+    private static final String IO_RESOURCE_KEY_PREFIX = "serial-io:";
+
+    String ioLaneKey() {
+        return IO_RESOURCE_KEY_PREFIX + getPortName();
+    }
+
+    /**
+     * 本端口 IO 执行域：域自持 {@link SerialIoPool} 的 per-port 串行视图（同口幂等）。
+     * 同口 FIFO 串行——入站 finalize × 发帧读 × 写三类流量同口有序（RTU 总线本性，
+     * 165500 承重顺序），异口并行。29 号 v2 S1 起替代引擎车道视图（executorFor(
+     * "serial-io:port")——E1 的根治曾借引擎 per-port 车道，终态收编为域池+视图，
+     * 引擎依赖归零）。
+     */
+    ExecutorService ioExecutor() {
+        return SerialIoPool.executorFor(getPortName());
+    }
+
+    /**
      * 获取当前串口超时设置（毫秒）
      */
     public int getTimeout() {
@@ -277,6 +485,30 @@ public class SerialSourcePort {
 
     boolean isTestMode() {
         return isTestMode;
+    }
+
+    // ========== Inbound frame event submission（P1：IO 线程只读字节+组帧+投递） ==========
+
+    /** 入站帧事件 requestId 序号（per-port，契约 §2.3 io-serial-{port}-{seq}）。 */
+    private final AtomicLong inboundSeq = new AtomicLong();
+
+    /**
+     * IO 线程（sweeper/监听器回调）投递已定界的完整入站帧（03 号设计 §4.4，W2-1 形态）：
+     * 构造 {@link SerialIoEvent} 载荷 → 经 {@link SerialEventDispatcher} 并入域池
+     * per-port 串行视图的同口 FIFO（与发帧读/写同队有序，165500 承重顺序）。
+     *
+     * <p>调用线程=serial-io-sweeper（或监听器通知线程）；O(1) 入队即返，永不阻塞 IO 线程。
+     * 域池拒绝（饱和/停机）由 dispatcher 记账+告警，Transport 不重试（响应超时机制天然兜底）。
+     *
+     * @param frameBytes   已定界的完整响应帧（IO 线程组帧产物）
+     * @param finalizeBody 事件执行体：域池端口视图上执行的业务 finalize（complete
+     *                     responseFuture，processResponse 续链由此触发），闭包捕获处理上下文
+     */
+    void submitInboundFrame(byte[] frameBytes, Runnable finalizeBody) {
+        String portName = getPortName();
+        SerialIoEvent event = new SerialIoEvent(ioLaneKey(), portName, frameBytes,
+                "io-serial-" + portName + "-" + inboundSeq.incrementAndGet());
+        SerialEventDispatcher.submit(event, finalizeBody);
     }
 
     // ========== Buffer management ==========
@@ -290,6 +522,41 @@ public class SerialSourcePort {
             continuousReceiveBuffer.clear();
         } finally {
             bufferLock.unlock();
+        }
+    }
+
+    /** drain 内核 RX 的最大轮数（每轮读空当次 bytesAvailable；超轮仍有数据=异常形态，如实上报）。 */
+    private static final int MAX_RX_DRAIN_ROUNDS = 64;
+
+    /**
+     * 重开后的 RX 清洗（F-43 清洗②，bugs/bug-record-20260826-093000 Q2）：drain 内核 tty RX
+     * 队列（jSerialComm closePort 不保证 TCFLSH，重开前在途的应答尾巴可残留内核层）+ 清应用层
+     * continuousReceiveBuffer。{@link #openPort} 每次成功打开后调用——覆盖 recoverWedgedPort
+     * 强拆重开、applyReconfiguredSettings 物理参数重建、写反压自动重开三条路径，保证重开后
+     * 首读零旧字节（旧字节会被误配对给新事务的首条命令）。
+     *
+     * @param reason 触发路径标识（日志定位用：port-open / wedge-recovery 等）
+     */
+    void drainAndClearReceiveBuffer(String reason) {
+        clearReceiveBuffer();
+        int drained = 0;
+        int rounds = 0;
+        while (serialPort != null && serialPort.isOpen() && rounds++ < MAX_RX_DRAIN_ROUNDS) {
+            int available = serialPort.bytesAvailable();
+            if (available <= 0) {
+                return;
+            }
+            byte[] sink = new byte[available];
+            serialPort.readBytes(sink, available);
+            drained += available;
+        }
+        if (drained > 0) {
+            log.info("[RX-DRAIN] port={}, 触发={}, 丢弃重开残留旧字节 {} B", serialInfo.portName, reason, drained);
+        }
+        if (rounds >= MAX_RX_DRAIN_ROUNDS && serialPort != null && serialPort.bytesAvailable() > 0) {
+            // 有界 drain 后内核仍有数据=对端持续回灌（如故障设备刷屏），如实上报不无限循环
+            log.warn("[RX-DRAIN] port={}, 触发={}, {} 轮 drain 后内核仍有 {} B，疑似对端持续回灌",
+                    serialInfo.portName, reason, MAX_RX_DRAIN_ROUNDS, serialPort.bytesAvailable());
         }
     }
 
@@ -307,7 +574,7 @@ public class SerialSourcePort {
             } finally {
                 bufferLock.unlock();
             }
-        }, SerialAsyncExecutor.getExecutor());
+        }, ioExecutor());
     }
 
     // ========== Port read polling（P1：jSerialComm 事件线程 → 共享调度器轮询） ==========
@@ -419,8 +686,32 @@ public class SerialSourcePort {
         log.info("[POLL-RESUMED] port={}", getPortName());
     }
 
+    /** 上次写发送时刻（回放时间窗判据：窗口=读超时×2，见 deliverBufferedData）。 */
+    private volatile long lastSendTimeMs;
+
+    /** 红测注入口：设定上次发送时刻（仅同包测试使用，构造「迟到旧字节」场景）。 */
+    void setLastSendTimeForTest(long timeMs) {
+        this.lastSendTimeMs = timeMs;
+    }
+
+    /** 回放时间窗（毫秒）：正常应答应在一次读超时内到达，×2 留余量；超过即视为迟到旧字节。 */
+    private long replayWindowMs() {
+        int timeout = serialInfo != null && serialInfo.timeout > 0 ? serialInfo.timeout : Const.READ_TIMEOUT_MS;
+        return 2L * timeout;
+    }
+
     void deliverBufferedData(SerialDataListener listener) {
         if (continuousReceiveBuffer.size() > 0) {
+            // 回放时间窗（F-43 清洗②）：距上次发送超过窗的缓冲字节 = 强拆前在途/迟到多行应答的
+            // 旧字节，回放会把旧帧整体误配对给新命令的监听器（F-42 Q2 形态），丢弃并如实记日志
+            if (lastSendTimeMs > 0
+                    && System.currentTimeMillis() - lastSendTimeMs > replayWindowMs()) {
+                int staleBytes = continuousReceiveBuffer.size();
+                clearReceiveBuffer();
+                log.warn("[REPLAY-DROP] port={}, 缓冲 {} B 距上次发送超过回放窗 {} ms，按迟到旧字节丢弃",
+                        serialInfo.portName, staleBytes, replayWindowMs());
+                return;
+            }
             byte[] buffer;
             bufferLock.lock();
             try {
@@ -436,9 +727,52 @@ public class SerialSourcePort {
 
     // ========== I/O operations ==========
 
+    /**
+     * 异步写发送（29 号 v2 S1 起：恒经域池 per-port 串行视图，无「当前线程直发」旁路）。
+     *
+     * <p><b>[WRITE-INLINE] 逃逸口退役（071900 结构性根除）</b>：bugs/fixed/
+     * bug-record-20260826-071900 的自锁形态是「core 写闸 ioBody 与内层写共享同一条
+     * 引擎车道队列（serial-io:{port} 单线程车道）——任务体内的 join 等待排在自身之后
+     * 的入队写，队头自锁」；当时的修复是检测「当前线程即本口车道 worker
+     * （SchedulerEngine.currentExecutingLaneKey）」则当前线程直发不入队的逃逸口。
+     * 域自持 SerialIoPool 后写闸任务体（引擎车道/业务线程）与写 IO（域池 per-port 视图）
+     * 分属两个队列，跨执行域 join 天然完成——需要给自己开逃逸口的机制已不存在，逃逸口
+     * 及其引擎检测逻辑一并删除（serial 自锁族的结构性根除实证，29 号 v2 S1）。
+     */
     CompletableFuture<Boolean> asyncSendData(byte[] bytes) {
+        // 残留写闸门：发送提交时捕获事务代数，写口按「代数是否仍存活」拒绝被掐事务的补发
+        final long txTag = activeGeneration;
         return CompletableFuture.runAsync(() -> {
-            // 【改动②-1 写前自动 reopen】非阻塞 write 反压会关闭端口（§B.6），下次写前若端口已关则重开，
+            doSendWrite(bytes, txTag);
+        }, ioExecutor()).thenApply(v -> {
+            return true;
+        }).exceptionally(ex -> {
+            // 【改动②-2 类型透传】SerialWriteException 原样向上抛（保留写失败语义供调用方识别），
+            // 其余异常仍包成通用 RuntimeException（保持旧行为兼容）。
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            throw writeFailure(cause);
+        });
+    }
+
+    /**
+     * 写失败类型归一（asyncSendData 两路径共用）：SerialWriteException 原样向上抛
+     * （保留写失败语义供调用方识别），其余异常包成通用 RuntimeException（旧行为兼容）。
+     */
+    private static RuntimeException writeFailure(Throwable cause) {
+        if (cause instanceof SerialWriteException) {
+            return (SerialWriteException) cause;
+        }
+        return new RuntimeException("Failed to send data: " + cause.getMessage(), cause);
+    }
+
+    /**
+     * 写发送体（域池 per-port 串行视图的 drain 任务体内执行）：写前自动重开 +
+     * 写前清缓冲 + 非阻塞 write 反压检查 + CommTrace 帧捕获 + 残留写闸门（txTag 存活检查）。
+     */
+    private void doSendWrite(byte[] bytes, long txTag) {
+        // 残留写闸门（F-43 清洗①）：被掐事务的补发命令在写口拒绝，不落端口
+        assertWriteLive(txTag);
+        // 【改动②-1 写前自动 reopen】非阻塞 write 反压会关闭端口（§B.6），下次写前若端口已关则重开，
             // 避免依赖外部干预即恢复通信；重开仍失败说明端口不可用（如 ttyUSB 拔线），抛 SerialWriteException 明确错误。
             // 无 isTestMode guard：单测均 stub 掉 asyncSendData（真实方法体不执行），真端口功能测试对端都在（-1 不触发），
             // 故 reopen/-1 检查无条件执行即可（§H.2.5 定稿）。
@@ -462,6 +796,7 @@ public class SerialSourcePort {
             // 旧代码丢弃 writeBytes 返回值（静默成功，asyncSendData 永远返 true），现在显式检查并抛出——
             // 把「发不出去」如实告诉调用方，而非伪装成功。
             int written = serialPort.writeBytes(bytes, bytes.length);
+            lastSendTimeMs = System.currentTimeMillis();
             // 通讯帧捕获：写路径唯一出口；写失败只累计通道错误计数（不产生 TX 帧，如实）
             if (written >= 0) {
                 CommTraceBuffer.instance().tx(CommTraceTransport.SERIAL, serialInfo.portName, bytes, null);
@@ -473,17 +808,6 @@ public class SerialSourcePort {
                         serialInfo.portName, written);
                 throw new SerialWriteException("串口写入失败(writeBytes 返 " + written + ", 端口已被反压关闭): port=" + serialInfo.portName);
             }
-        }, SerialAsyncExecutor.getExecutor()).thenApplyAsync(v -> {
-            return true;
-        }, SerialAsyncExecutor.getExecutor()).exceptionally(ex -> {
-            // 【改动②-2 类型透传】SerialWriteException 原样向上抛（保留写失败语义供调用方识别），
-            // 其余异常仍包成通用 RuntimeException（保持旧行为兼容）。
-            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-            if (cause instanceof SerialWriteException) {
-                throw (SerialWriteException) cause;
-            }
-            throw new RuntimeException("Failed to send data: " + cause.getMessage(), cause);
-        });
     }
 
     CompletableFuture<byte[]> asyncReadDataBytes() {
@@ -501,7 +825,7 @@ public class SerialSourcePort {
                     return readBuffer;
                 }
                 return new byte[0];
-            }, SerialAsyncExecutor.getExecutor());
+            }, ioExecutor());
         } else {
             return readFromBufferBytes();
         }
@@ -509,6 +833,36 @@ public class SerialSourcePort {
 
     boolean isClosed() {
         return serialPort == null || !serialPort.isOpen();
+    }
+
+    /**
+     * 挂死端口自愈（Q-1/A2）：close + reopen 强拆挂死的本地阻塞 IO。
+     *
+     * <p>应用场景：jSerialComm {@code writeBytes} 是本地阻塞写（内核态持 fd），挂死时占用
+     * per-port 单线程 IO 车道且自身无法自救。跨线程 {@code closePort()} 使阻塞在该 fd 上的
+     * 写立即失败返回（jSerialComm closePort 线程安全），车道线程得救；随后 {@link #openPort}
+     * 重开产出新 fd 供后续事务使用（写路径 {@code asyncSendData} 亦有写前自动重开兜底）。
+     * 触发方 = 事务级硬超时（见 SerialTransactionStrategy），即「端口 IO 挂死」的强证据时刻。
+     *
+     * @param reason 触发原因（日志定位用，如 transaction-hard-timeout）
+     */
+    void recoverWedgedPort(String reason) {
+        log.error("[WEDGE-RECOVERY] port={}, 原因: {}, 强制 close+reopen 拆除挂死 IO",
+                serialInfo.portName, reason);
+        stopPolling();
+        // Q-1/Q-2 二轮：物理 close+reopen 只救 fd，不清逻辑锁——若 currentKey 已成幽灵
+        //（持锁事务的 release 链整体丢失），重开口后下一个 acquire 仍撞同一把逻辑锁，
+        // 恢复循环不收敛。此处按持锁时长阈值强制清锁（与 acquire 入口同一收割状态机）。
+        lock.lock();
+        try {
+            reapGhostLockIfStale("wedge-recovery");
+        } finally {
+            lock.unlock();
+        }
+        if (serialPort != null && serialPort.isOpen()) {
+            serialPort.closePort();
+        }
+        openPort(reason);
     }
 
     // ========== Test environment detection ==========

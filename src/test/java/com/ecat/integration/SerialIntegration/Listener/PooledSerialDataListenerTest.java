@@ -53,6 +53,14 @@ public class PooledSerialDataListenerTest {
             removeListenerCallCount++;
             return null;
         }).when(mockSerialSource).removeDataListener(any(PooledSerialDataListener.class));
+
+        // P1 契约：完整帧命中后监听器只投递 submitInboundFrame（IO 线程不内联 finalize）。
+        // 测试桩同步驱动投递的事件体，保住「future 完成」旧断言语义。
+        doAnswer(invocation -> {
+            Runnable finalizeBody = invocation.getArgument(1);
+            finalizeBody.run();
+            return null;
+        }).when(mockSerialSource).submitInboundFrame(any(), any());
     }
 
     @After

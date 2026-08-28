@@ -34,6 +34,7 @@ public class SerialIntegrationModernFunctionalTest {
         when(mockSerialSource.release(anyString())).thenReturn(true);
         when(mockSerialSource.isTestMode()).thenReturn(true);
         when(mockSerialSource.getTimeout()).thenReturn(500);
+        when(mockSerialSource.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
 
         // 只使用现代 API
         when(mockSerialSource.asyncReadDataBytes())

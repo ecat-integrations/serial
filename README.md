@@ -140,6 +140,26 @@ ByteResponseHandlerStrategy<byte[]> strategy = new ByteResponseHandlerStrategy<>
 
 **仅用于向后兼容，将在未来版本移除**。新集成请勿使用。
 
+## SDK 快速上手（主动轮询 SerialPolling，L3 设备仓标准入口）
+
+设备仓的周期采集**只走本 SDK**（L2 传输 SDK 层轮询模式，17 号 v2.1 §2.1）——调度注册/源锁/锁忙跳过/事务级硬超时/异常韧性（永不注销）/统一日志全部内置（连续失败→恢复有断连状态转移行：首败 WARN/恢复 INFO 去重），设备仓的执行词汇只剩 round 函数（每轮读什么）+ 属性灌入：
+
+```java
+// 迁移终态（zhengxin 14 行样板 → 3 行；两步构建示例含段间节拍）
+this.polling = SerialPolling.on(this, serialSource)                     // this=RemovalHost，句柄自动挂设备移除生命周期
+        .round(source -> getData().thenCompose(v -> getRATEDData()))   // 一轮读什么（多段链一等公民）
+        .every(5, TimeUnit.SECONDS)                                     // fixedDelay：完成点+period=下轮
+        .onRound((ok, ex) -> absorbOutcome(ok, ex))                     // 可选：轮级观测回调
+        .start();                                                       // 域自持定时；handle::cancel 已注册 onRemove
+
+// 轮内命令间节拍（收编各仓本地 delay() 样板）：先 .interCommandDelayMs(300) 再链内 polling.delay()
+```
+
+- **round 契约**：`Function<SerialSource, ? extends CompletableFuture<?>>`（通配，容纳 `CF<Void>`）；Boolean false=业务失败（统一 warn），异常=传输错误（统一 error，轮询永不注销）；锁忙（LockBusySkippedException）SDK 内部消化不外泄。
+- **生命周期**：`on(this, serialSource)` 的 `this`（DeviceBase 即 RemovalHost）使轮询句柄的 cancel **自动注册到设备移除生命周期**（`start()` 内部 `host.onRemove(handle::cancel)`，18 号设计 §3.3）——设备 stop 的 LIFO sweep 与 `PollingHandle.cancel()` 幂等并存；cancel 为 cancel(false) 语义（不中断在飞事务）。定时为 serial 域自持 `SerialSdkTimers`（daemon 池 `ecat-serial-sched-N`，29 号 v2 S1 起 SDK 不再依赖 core 调度引擎；停机挂 `SerialIntegration.onRelease`，测试缝 `bindForTest`）。
+- **何时用哪个模式**：周期读设备 → 本 SDK；从机/被动接收（biaoqi 型）→ `SerialSource` onFrame/监听器；写命令 → 既有 `executeWriteCommand`/`executeWithLambda` 族（不动）。
+- 契约细节与五维单测（周期/熔断/锁/超时/异常韧性 + cecep 链式 + 111200 回归）见 `SerialPolling` 类 Javadoc 与 `SerialPollingSdkTest`；迁移操作手册见 workspace `arch-review-20260815/30-transport-sdk-survey/09-migration-handbook-v2.md`。
+
 ---
 
 ## 使用例子

@@ -246,12 +246,90 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
     static BooleanSupplier windowsDetector = SerialCommConfigSchema::detectWindows;
 
     /**
-     * 恢复三个枚举 seam 为真实默认实现（测试 @After 调用，防止注入泄漏到其他测试）。
+     * 恢复三个枚举 seam 为真实默认实现（测试 @After 调用，防止注入泄漏到其他测试），
+     * 并清空枚举缓存（防上个测试的缓存 union 泄漏到下个测试的 seam 数据断言）。
      */
     static void resetEnumerationSeams() {
         apiPortOptionsSupplier = SerialCommConfigSchema::enumerateViaJSerialComm;
         devNodeScanSupplier = SerialCommConfigSchema::scanDevTtyNodes;
         windowsDetector = SerialCommConfigSchema::detectWindows;
+        invalidateEnumerationCache();
+    }
+
+    // ========== 枚举缓存 + 首载串行化（bug-record-20260826-003500） ==========
+
+    /**
+     * 枚举互斥锁：串行化「jSerialComm 首次类加载 + 端口枚举」。jSerialComm 在共享父加载器
+     * 上是 parallel-capable 包，多线程并发首触 getCommPorts 会竞态 definePackage
+     * （AssertionError: Package ... has already been defined）——entry-restore 曾 4 线程并行
+     * 首触致 18 个串口集成全灭。锁内单线程完成首次加载后，后续调用只剩纯系统调用，无竞态窗口。
+     */
+    private static final Object ENUMERATION_LOCK = new Object();
+
+    /** 缓存的 union 枚举结果（不可变副本；null = 无缓存）。getCommPorts/扫 /dev 都是系统调用，TTL 内复用。 */
+    private static volatile Map<String, String> cachedUnion;
+
+    /** 缓存写入时刻（System.currentTimeMillis()）。 */
+    private static volatile long cachedUnionAtMillis;
+
+    /**
+     * 枚举缓存 TTL（毫秒）。应用场景：启动 entry-restore 突发（18+ 坐标同窗校验）与
+     * ConfigFlow 步骤渲染的重复 getOptions；热插拔新口最迟一个 TTL 后可见。
+     * package-private volatile 仅为单测确定性调 TTL（生产勿改，与 seam 同界）。
+     */
+    static volatile long enumerationCacheTtlMs = 5000;
+
+    private static void invalidateEnumerationCache() {
+        synchronized (ENUMERATION_LOCK) {
+            cachedUnion = null;
+            cachedUnionAtMillis = 0L;
+        }
+    }
+
+    /**
+     * TTL 缓存包裹的真实枚举：首次（或缓存过期）在 {@link #ENUMERATION_LOCK} 内单线程执行
+     * API 枚举 ∪ /dev 扫描并写缓存；命中则直接复用。
+     */
+    private static Map<String, String> enumerateUnionCached() {
+        long now = System.currentTimeMillis();
+        Map<String, String> cached = cachedUnion;
+        if (cached != null && now - cachedUnionAtMillis < enumerationCacheTtlMs) {
+            return cached;
+        }
+        synchronized (ENUMERATION_LOCK) {
+            // 双检：等锁期间前一线程可能已完成枚举（并发首触正是 003500 的形态）
+            long recheck = System.currentTimeMillis();
+            cached = cachedUnion;
+            if (cached != null && recheck - cachedUnionAtMillis < enumerationCacheTtlMs) {
+                return cached;
+            }
+            Map<String, String> union = new LinkedHashMap<>();
+            // 源 1：jSerialComm API（Windows 上 COM 口的唯一来源；Linux 上提供 USB/PCI 总线口及描述）
+            union.putAll(apiPortOptionsSupplier.get());
+            // 源 2：/dev 确定性节点扫描（两源的取舍见 getAvailablePorts Javadoc）
+            if (!windowsDetector.getAsBoolean()) {
+                for (Map.Entry<String, String> entry : devNodeScanSupplier.get().entrySet()) {
+                    union.putIfAbsent(entry.getKey(), entry.getValue());
+                }
+            }
+            cachedUnion = new LinkedHashMap<>(union);
+            cachedUnionAtMillis = System.currentTimeMillis();
+            return cachedUnion;
+        }
+    }
+
+    /**
+     * 启动期预热（bug-record-20260826-003500 修复方向 a+c）：在 serial 集成生命周期
+     * （{@code SerialIntegration.onStart}，IntegrationManager 单线程加载阶段）触发首次真实
+     * 枚举——jSerialComm 的类与包在唯一线程上完成加载/定义，且结果写入 TTL 缓存供随后的
+     * entry-restore 并行阶段复用。这使「4 线程并行首触 jSerialComm」的竞态窗口在时序上
+     * 不可能再出现（集成加载严格先于 entry-restore，见 onStart 调用点注释）。
+     *
+     * <p>预热走真实枚举路径（绕过 testPortSupplier——预热的意义就是触碰 jSerialComm 本体）。
+     * 严格模式：环境级失败（native 库不可用等）原样上抛由集成加载失败面呈现，不吞不改。
+     */
+    public static void warmUp() {
+        enumerateUnionCached();
     }
 
     /** /dev 下参与确定性扫描的串口设备节点前缀（USB 串口 / 传统 8250 / USB CDC-ACM） */
@@ -323,17 +401,9 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
             return testPortSupplier.get();
         }
 
-        Map<String, String> union = new LinkedHashMap<>();
-        // 源 1：jSerialComm API（Windows 上 COM 口的唯一来源；Linux 上提供 USB/PCI 总线口及描述）
-        union.putAll(apiPortOptionsSupplier.get());
-        // 源 2：/dev 确定性节点扫描——jSerialComm 2.9+ Linux 枚举漏掉的非总线口（tty0tty 虚拟对、
-        // symlink 命名口）在这里补齐；Windows 的 COM 口无 /dev 节点语义，不扫
-        if (!windowsDetector.getAsBoolean()) {
-            for (Map.Entry<String, String> entry : devNodeScanSupplier.get().entrySet()) {
-                // 重叠口 API 先占位（带硬件描述的显示名优先），FS 只补缺
-                union.putIfAbsent(entry.getKey(), entry.getValue());
-            }
-        }
+        // union 枚举经 TTL 缓存 + 首载串行化出口（003500）：源构成与取舍见 enumerateUnionCached
+        // 及本方法 Javadoc；此处只做排序与提示项装饰（纯内存操作，不缓存装饰结果）。
+        Map<String, String> union = enumerateUnionCached();
 
         Map<String, String> sorted = new TreeMap<>(NATURAL_PORT_ORDER);
         sorted.putAll(union);

@@ -110,7 +110,7 @@ public class ByteResponseHandlerStrategy<T> {
      * 传统轮询模式处理响应（测试兼容）
      */
     private CompletableFuture<Boolean> handleResponseLegacy(ByteResponseHandlingContext<T> context) {
-        // readDataRecursively 已经在 SerialAsyncExecutor 中执行
+        // readDataRecursively 已经在端口 IO 车道（serial-io:{port}）中执行
         // 使用 thenApply（而非 thenApplyAsync）保持在该线程中执行，避免线程切换
         return readDataRecursively(context)
                .thenApply(processResponseFunction)
@@ -123,8 +123,8 @@ public class ByteResponseHandlerStrategy<T> {
      */
     private CompletableFuture<Boolean> handleResponseInterrupt(ByteResponseHandlingContext<T> context) {
         long handlerStartTime = System.currentTimeMillis();
-        log.debug("handleResponseInterrupt starting for port: {} at {}, SerialAsyncExecutor status: {}",
-                portName, handlerStartTime, SerialAsyncExecutor.getStatus());
+        log.debug("handleResponseInterrupt starting for port: {} at {}, ioPool status: {}",
+                portName, handlerStartTime, SerialIoPool.describe());
 
         // 创建响应等待的 Future
         CompletableFuture<ByteResponseHandlingContext<T>> responseFuture = new CompletableFuture<>();
@@ -158,31 +158,39 @@ public class ByteResponseHandlerStrategy<T> {
             TimeUnit.MILLISECONDS
         );
 
-        // 使用异步处理链，在独立线程池中执行，不阻塞串口线程
-        return responseFuture
-            .thenApplyAsync(result -> {
-                // 在独立线程中处理响应，不阻塞串口线程
+        // P1（29 号 M3）：responseFuture 的完成方已迁 Core Worker（监听器组帧命中后经
+        // Core.submit 投递，见 BytePooledSerialDataListener）。此处用非 async 的 thenApply，
+        // 续链（processResponseFunction=设备业务：解析+属性更新）在完成线程=Core Worker 上
+        // 执行，不再额外切回 IO 车道线程。异常分支（响应超时在 SerialTimeoutScheduler 线程
+        // 异常完成）由 exceptionally 兜住，行为与改造前一致。
+        // 123000 根修（同 Default 池化路径范本）：返回 future 的完成只依赖 responseFuture
+        // （响应/超时）；清理 fire-and-forget 投域池端口串行视图，不得门控完成——完成等待
+        // 只应有界于响应/超时（deadline 契约），清理在同口 FIFO 里排于其后的写流量之后
+        // （165500：写压测下口内任务有时延），门控完成会把事务时长拖出口内排队时延。
+        CompletableFuture<Boolean> result = responseFuture
+            .thenApply(result0 -> {
                 long responseDuration = System.currentTimeMillis() - handlerStartTime;
                 log.debug("Response handling for port {} completed successfully after {} ms",
                         portName, responseDuration);
-                return processResponseFunction.apply(result);
-            }, SerialAsyncExecutor.getExecutor())
+                return processResponseFunction.apply(result0);
+            })
             .exceptionally(ex -> {
                 long responseDuration = System.currentTimeMillis() - handlerStartTime;
                 log.warn("Response handling for port {} completed exceptionally after {} ms: {}",
                         portName, responseDuration, ex.getMessage());
                 return handleExceptionFunction.apply(ex);
-            })
-            .whenCompleteAsync((res, ex) -> {
-                // 统一清理：只在这里调用一次 removeDataListener 和 release
-                if (timeoutTask != null && !timeoutTask.isDone()) {
-                    timeoutTask.cancel(true);
-                }
-                // 确保移除监听器（可能已移除，但 CopyOnWriteArrayList.remove() 是幂等的）
-                serialSource.removeDataListener(listener);
-                // 释放监听器回池
-                SerialListenerPools.BYTE_POOL.release(listener);
-            }, SerialAsyncExecutor.getExecutor());
+            });
+        result.whenCompleteAsync((res, ex) -> {
+            // 统一清理：只在这里调用一次 removeDataListener 和 release
+            if (timeoutTask != null && !timeoutTask.isDone()) {
+                timeoutTask.cancel(true);
+            }
+            // 确保移除监听器（可能已移除，但 CopyOnWriteArrayList.remove() 是幂等的）
+            serialSource.removeDataListener(listener);
+            // 释放监听器回池
+            SerialListenerPools.BYTE_POOL.release(listener);
+        }, serialSource.getIoExecutor());
+        return result;
     }
 
     /**
@@ -204,7 +212,8 @@ public class ByteResponseHandlerStrategy<T> {
 
                 if (checkResult != null) {
                     context.getFinishedFlag().set(true);
-                    responseFuture.complete(context);
+                    // P1：IO 线程只投递，finalize 在 Core Worker 上完成 future（同池化监听器路径）
+                    serialSource.submitInboundFrame(bufferContent, () -> responseFuture.complete(context));
                     serialSource.removeDataListener(this);
                 }
             }
@@ -229,16 +238,20 @@ public class ByteResponseHandlerStrategy<T> {
             TimeUnit.MILLISECONDS
         );
 
-        // 使用异步处理链
-        return responseFuture
-            .thenApplyAsync(result -> processResponseFunction.apply(result), SerialAsyncExecutor.getExecutor())
-            .exceptionally(ex -> handleExceptionFunction.apply(ex))
-            .whenCompleteAsync((res, ex) -> {
-                if (timeoutTask != null && !timeoutTask.isDone()) {
-                    timeoutTask.cancel(true);
-                }
-                serialSource.removeDataListener(listener);
-            }, SerialAsyncExecutor.getExecutor());
+        // P1：非 async 续链——processResponse 在完成 future 的线程（Core Worker）上执行
+        // 123000 根修（同池化路径范本）：返回 future 的完成只依赖 responseFuture（响应/超时）；
+        // 清理 fire-and-forget 投域池端口串行视图，不得门控完成（完成等待只应有界于响应/超时
+        // 的 deadline 契约，同上——清理在口内 FIFO 的排队时延不得放大事务超时窗）。
+        CompletableFuture<Boolean> result = responseFuture
+            .thenApply(result0 -> processResponseFunction.apply(result0))
+            .exceptionally(ex -> handleExceptionFunction.apply(ex));
+        result.whenCompleteAsync((res, ex) -> {
+            if (timeoutTask != null && !timeoutTask.isDone()) {
+                timeoutTask.cancel(true);
+            }
+            serialSource.removeDataListener(listener);
+        }, serialSource.getIoExecutor());
+        return result;
     }
 
     /**
@@ -269,7 +282,7 @@ public class ByteResponseHandlerStrategy<T> {
         }
 
         // 使用 asyncReadDataBytes() 异步获取字节数据
-        // asyncReadDataBytes() 已经在 SerialAsyncExecutor 中执行
+        // asyncReadDataBytes() 已经在端口 IO 车道（serial-io:{port}）中执行
         // 使用 thenCompose（而非 thenComposeAsync）保持在该线程中执行，避免线程切换
         // 这对于测试环境的 Mock 验证很重要
         return serialSource.asyncReadDataBytes()
