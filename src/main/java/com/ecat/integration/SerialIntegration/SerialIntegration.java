@@ -56,7 +56,7 @@ public class SerialIntegration extends IntegrationBase {
      * 事务依赖）。两者幂等且终端态（不自动复活）。
      */
     @Override
-    public void onRelease() {
+    protected void onReleaseImpl() {
         SerialSdkTimers.shutdown();
         SerialIoPool.shutdown();
     }
