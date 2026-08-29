@@ -67,14 +67,40 @@ public class SerialPollingNonBlockingTest {
     }
 
     /**
+     * 异线程持锁构造（36 号守卫后「锁忙」用例的标准前置）：生产中持锁者恒为别的事务线程
+     * （写闸线程/轮询 worker），本测试类的锁忙用例原先以测试线程自持再取——那是同线程
+     * 嵌套取锁（自死锁形态），守卫上线后立即抛。持锁者改为辅助线程取得后直接退出
+     * （不 release：锁状态在端口对象上，与持锁线程存活无关），释放由测试线程按 key 执行。
+     */
+    private String holdLockOnHelperThread(SerialSourcePort port) throws Exception {
+        final String[] held = new String[1];
+        final CountDownLatch holderDone = new CountDownLatch(1);
+        final Throwable[] holderError = new Throwable[1];
+        Thread holder = new Thread(() -> {
+            try {
+                held[0] = port.acquire(10, TimeUnit.SECONDS);
+            } catch (Throwable x) {
+                holderError[0] = x;
+            } finally {
+                holderDone.countDown();
+            }
+        }, "nb-test-lock-holder");
+        holder.setDaemon(true);
+        holder.start();
+        assertTrue("持锁辅助线程必须在期限内返回", holderDone.await(10, TimeUnit.SECONDS));
+        assertNull("持锁辅助线程不应抛异常", holderError[0]);
+        assertNotNull("持锁辅助线程必须取得锁", held[0]);
+        return held[0];
+    }
+
+    /**
      * 契约①端口级：锁忙时 tryAcquire 立即返回 null（非阻塞），且不污染等待队列
      * （释放后下一个 acquire 直接可得，无死 key 残留）。
      */
     @Test
-    public void tryAcquireReturnsNullImmediately_whenLockHeld_andLeavesWaitQueueClean() {
+    public void tryAcquireReturnsNullImmediately_whenLockHeld_andLeavesWaitQueueClean() throws Exception {
         SerialSourcePort port = newPort();
-        String held = port.acquire(1, TimeUnit.SECONDS);
-        assertNotNull("前置：首次取锁应成功", held);
+        String held = holdLockOnHelperThread(port);
 
         long start = System.currentTimeMillis();
         String busy = port.tryAcquire();
@@ -103,8 +129,7 @@ public class SerialPollingNonBlockingTest {
     @Test
     public void executePollingSkipsImmediatelyWithLockBusySkipped_whenLockHeld() throws Exception {
         SerialSourcePort port = newPort();
-        String held = port.acquire(1, TimeUnit.SECONDS);
-        assertNotNull(held);
+        String held = holdLockOnHelperThread(port);
 
         long start = System.currentTimeMillis();
         CompletableFuture<Boolean> future = SerialTransactionStrategy.executePolling(
@@ -139,8 +164,7 @@ public class SerialPollingNonBlockingTest {
     @Test
     public void executeWithLambdaKeepsBoundedWait_whenLockHeld() throws Exception {
         SerialSourcePort port = newPort();
-        String held = port.acquire(1, TimeUnit.SECONDS);
-        assertNotNull(held);
+        String held = holdLockOnHelperThread(port);
 
         long start = System.currentTimeMillis();
         CompletableFuture<Boolean> future = SerialTransactionStrategy.executeWithLambda(
@@ -161,8 +185,7 @@ public class SerialPollingNonBlockingTest {
     @Test
     public void concurrentPollersAllSkipImmediately_whenLockHeld() throws Exception {
         SerialSourcePort port = newPort();
-        String held = port.acquire(1, TimeUnit.SECONDS);
-        assertNotNull(held);
+        String held = holdLockOnHelperThread(port);
 
         SerialSource source = bridgedSource(port);
         int pollers = 4;

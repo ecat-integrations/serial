@@ -10,6 +10,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -161,10 +162,24 @@ public class SerialPollingDomainChainTest {
     // ==================== 锁忙/异常轮：任何终态都重排（永不注销） ====================
 
     @Test
-    public void lockBusyRoundSettlesNormallyAndRearms() {
+    public void lockBusyRoundSettlesNormallyAndRearms() throws Exception {
         SerialSourcePort port = new SerialSourcePort(new SerialInfo("DOMAIN-BUSY-PORT", 9600, 8, 1, 0), 1, null);
-        String held = port.acquire(1, TimeUnit.SECONDS);
-        assertTrue(held != null);
+        // 持锁者异线程（36 号守卫后「锁忙」用例的标准前置）：fake 缝 fire(0) 在测试线程执行
+        // 轮事务——若测试线程自持锁，tryAcquire 即同线程嵌套取锁（守卫 fail-fast 抛，本用例
+        // 变异常轮而非锁忙轮）。辅助线程取得后直接退出（不 release，锁状态与持锁线程存活无关）。
+        final String[] held = new String[1];
+        final CountDownLatch holderDone = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            try {
+                held[0] = port.acquire(10, TimeUnit.SECONDS);
+            } finally {
+                holderDone.countDown();
+            }
+        }, "domain-busy-lock-holder");
+        holder.setDaemon(true);
+        holder.start();
+        assertTrue("持锁辅助线程必须在期限内取得锁", holderDone.await(10, TimeUnit.SECONDS));
+        assertTrue("持锁辅助线程必须取得锁", held[0] != null);
         SerialPolling polling = SerialPolling.on(action -> { }, bridgedSource(port))
                 .round(src -> CompletableFuture.completedFuture(true))
                 .every(PERIOD_MS, TimeUnit.MILLISECONDS)
@@ -176,7 +191,7 @@ public class SerialPollingDomainChainTest {
         assertEquals("锁忙轮按正常结算重排（fixedDelay=结算点+period）", PERIOD_MS,
                 timers.shots.get(1).delayMillis);
         assertTrue("锁忙轮不得注销链", handle.isRunning());
-        port.release(held);
+        port.release(held[0]);
     }
 
     @Test

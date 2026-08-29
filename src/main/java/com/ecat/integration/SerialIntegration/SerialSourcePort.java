@@ -24,6 +24,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * It is shared by multiple SerialSource instances that connect to the same port.
  * Package-private — not exposed to external callers.
  *
+ * <p><b>锁入口使用规则（SDK 调度纪律）</b>：本类的 acquire/tryAcquire 只应有
+ * {@link SerialTransactionStrategy} 的两个事务入口（及 serial-tcp-server 网关这类自管
+ * 收发时序的框架型消费方）调用，集成设备代码不应直接取锁。两个入口是两种调度纪律而非冗余：
+ * <ul>
+ *   <li>命令/写事务 → {@code executeWithLambda}：阻塞排队等锁（waitQueue 有限等待）——
+ *       命令的时效语义是「最终要执行」，等是正确的；</li>
+ *   <li>周期轮询 → {@code executePolling}：tryAcquire 锁忙立即弃本轮（调度三原则
+ *       「过期即弃」）——轮询数据过期即无价值，为等锁 park 只会把饥饿扩散到全系统
+ *       （87 设备停摆事故的 E1/E2 形态）。</li>
+ * </ul>
+ * round/事务临界体内需要追加直发命令时，使用 SDK 注入的 source 直接 send（此时锁已持有，
+ * 参照 gassensor PM3006SDevice 直发惯用法），勿再经事务入口二次取锁——同线程嵌套取锁是
+ * 自死锁形态，由同线程嵌套守卫 fail-fast 立即抛（bug-record-20260829-082100 vaisala
+ * 事故：旧形态静默 park 5h44m 无声失败）。
+ *
  * @author coffee
  */
 public class SerialSourcePort {
@@ -34,6 +49,12 @@ public class SerialSourcePort {
     private String currentKey;
     private volatile long lockAcquireTime;
     private volatile String lockAcquireThread;
+    /**
+     * 持锁线程记账（36 号设计·同线程嵌套取锁守卫）：授予点记 {@code Thread} 引用——
+     * 非线程名/线程 ID 字符串（线程 ID 复用会误判同线程）；release 与幽灵锁收割清 null。
+     * 守卫判据 {@code Thread.currentThread() == lockHolderThread} 即同线程嵌套取锁。
+     */
+    private volatile Thread lockHolderThread;
     private final Queue<String> waitQueue = new LinkedList<>();
 
     /**
@@ -186,11 +207,13 @@ public class SerialSourcePort {
         lock.lock();
         try {
             reapGhostLockIfStale("acquire");
+            assertNoSameThreadNestedAcquire("acquire");
             if (currentKey == null) {
                 currentKey = requestKey;
                 grantGeneration();
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
+                lockHolderThread = Thread.currentThread();
                 return requestKey;
             } else {
                 if (waitQueue.size() < maxWaiters) {
@@ -216,6 +239,7 @@ public class SerialSourcePort {
                             grantGeneration();
                             lockAcquireTime = System.currentTimeMillis();
                             lockAcquireThread = Thread.currentThread().getName();
+                            lockHolderThread = Thread.currentThread();
                             return requestKey;
                         }
                         // 队头不是自己（队列变更，skip），或锁已被快速路径抢占：返回 null 前必须摘除自身
@@ -272,11 +296,13 @@ public class SerialSourcePort {
         lock.lock();
         try {
             reapGhostLockIfStale("acquire");
+            assertNoSameThreadNestedAcquire("tryAcquire");
             if (currentKey == null) {
                 currentKey = requestKey;
                 grantGeneration();
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
+                lockHolderThread = Thread.currentThread();
                 return requestKey;
             }
             long skips = lockBusySkipCount.incrementAndGet();
@@ -305,6 +331,7 @@ public class SerialSourcePort {
                 currentKey = null;
                 lockAcquireTime = 0;
                 lockAcquireThread = null;
+                lockHolderThread = null;
                 if (!waitQueue.isEmpty()) {
                     condition.signal();
                 }
@@ -347,9 +374,41 @@ public class SerialSourcePort {
         currentKey = null;
         lockAcquireTime = 0;
         lockAcquireThread = null;
+        lockHolderThread = null;
         if (!waitQueue.isEmpty()) {
             condition.signal();
         }
+    }
+
+    /**
+     * 同线程嵌套取锁 fail-fast 守卫（36 号设计·方案 D 形态 A）：vaisala 事故
+     * （bug-record-20260829-082100）的 SDK 层加固。事务体经 SerialTransactionStrategy
+     * 的 executeHeld 在发起线程上同步执行——round/事务临界体内再经 executeWithLambda/
+     * executePolling 二次取锁时，等待者与持有者是同一线程（等待 key 与持有 key 同为
+     * 毫秒-线程ID），condition.await 永远等不到自己的 release：旧形态阻塞到超时返 null
+     * （live 实证同一线程静默空转 5h44m，Acquire timeout 日志一直在却无人醒），守卫改为
+     * 微秒级立即抛，错误直达根因。审计结论（36 号 §二）：20 仓全扫不存在合法的同线程
+     * 嵌套取锁，无人依赖可重入。
+     *
+     * <p>位置约束：必须在 {@link #reapGhostLockIfStale} 之后——同线程的陈年幽灵锁应
+     * 先收割后守卫，否则跨阈值的二次取锁会抛而非收割（破坏 acquireReapsGhostLock 契约）。
+     *
+     * <p>命中时锁状态原样不动：等锁者失败不影响既有持有关系（持锁者仍可正常 release）。
+     *
+     * @param entry 入口标识（acquire / tryAcquire，诊断定位用）
+     */
+    private void assertNoSameThreadNestedAcquire(String entry) {
+        Thread holder = lockHolderThread;
+        if (holder == null || holder != Thread.currentThread()) {
+            return;
+        }
+        throw new IllegalStateException("同线程嵌套取锁（自死锁形态，fail-fast）: port=" + getPortName()
+                + ", entry=" + entry
+                + ", 持有者 key=" + currentKey
+                + ", 持锁线程=" + holder.getName()
+                + ", 已持锁 " + (System.currentTimeMillis() - lockAcquireTime) + "ms"
+                + "；round/事务临界体内应使用注入 source 直发，勿再经 executeWithLambda/executePolling 二次取锁"
+                + "（参照 gassensor PM3006SDevice 直发惯用法）；锁状态未变，既有持有关系不受影响");
     }
 
     private String generateRequestKey() {

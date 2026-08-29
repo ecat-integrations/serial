@@ -41,7 +41,21 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
  *   <li>Logs errors (key/duration/exception) for debugging purposes.</li>
  *   <li>Handles exceptions gracefully by returning a failed {@link CompletableFuture}.</li>
  * </ul>
- * 
+ *
+ * <p><b>入口选择规则（SDK 调度纪律，两个入口非冗余）</b>：集成设备代码不应直接调用
+ * {@code SerialSource#acquire/tryAcquire}，按事务的时效语义选入口——
+ * <ul>
+ *   <li>命令/写事务 → {@link #executeWithLambda(SerialSource, Function)}：阻塞排队等锁
+ *       （等待者进 waitQueue 有限等待）。命令的时效语义是「最终要执行」，等一等是正确的。</li>
+ *   <li>周期轮询 → {@link #executePolling(SerialSource, Function)}：tryAcquire 锁忙立即
+ *       放弃本轮（调度三原则「过期即弃」）。轮询数据的时效语义是「过期即无价值」，为等锁
+ *       park 调度线程只会把饥饿扩散到全系统。</li>
+ * </ul>
+ * round/事务临界体内（事务 lambda 在发起线程同步执行、源锁已持有）追加直发命令：使用 SDK
+ * 注入的 {@code source} 直接 send（参照 gassensor PM3006SDevice 直发惯用法），勿再经
+ * 本类入口二次取锁——同线程嵌套取锁是自死锁形态，端口层守卫 fail-fast 立即抛
+ * （bug-record-20260829-082100 vaisala 事故：旧形态静默 park 5h44m）。
+ *
  * @author coffee
  *
  * @see SerialSource

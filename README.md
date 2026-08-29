@@ -140,6 +140,34 @@ ByteResponseHandlerStrategy<byte[]> strategy = new ByteResponseHandlerStrategy<>
 
 **仅用于向后兼容，将在未来版本移除**。新集成请勿使用。
 
+## 事务入口三选一（命令 / 轮询 / round 内直发）
+
+集成设备代码**不应直接调用 `SerialSource` 的 acquire/tryAcquire 取锁**——那是 SDK 事务入口（及自管收发时序的框架型消费方，如 serial-tcp-server 网关）的专用面。按事务的时效语义选入口，两个事务入口是两种调度纪律而非冗余：
+
+| 事务形态 | 入口 | 锁语义 |
+|---|---|---|
+| 命令/写事务 | `SerialTransactionStrategy.executeWithLambda(source, lambda)` | 阻塞排队等锁（waitQueue 有限等待）——命令的时效语义是「最终要执行」，等是正确的 |
+| 周期轮询 | `SerialTransactionStrategy.executePolling(source, lambda)` | `tryAcquire` 锁忙**立即弃本轮**（调度三原则「过期即弃」）——轮询数据过期即无价值，为等锁 park 只会把饥饿扩散到全系统；放弃有记账（`SerialSource.getLockBusySkipCount()` + 限频 warn，禁静默） |
+| round/事务临界体内追加命令 | SDK 注入的 `source` 直接 `asyncSendData(...)` **直发** | 此时锁已持有，**禁再经 executeWithLambda/executePolling 二次取锁** |
+
+- 两入口取锁后共享同一执行链：事务级硬超时（默认由设备配置串口超时 ×10 派生，长事务/标定流程显式传 `transactionTimeoutMs`）+ 完成即 release + 超时强拆端口。返回 future 须异步消费（`whenComplete`），**禁在周期调度任务内 `.get()`/`.join()` 阻塞**——契约细则见 `SerialTransactionStrategy` 类 Javadoc。
+- **同线程嵌套取锁 fail-fast 守卫（2026-08-29 上线）**：round/事务临界体内再经事务入口二次取锁 = 自死锁形态（等待者与持有者是同一线程，`condition.await` 永远等不到自己的 release）。旧形态静默 park 到超时（vaisala 事故 live 实证同线程空转 5h44m，bug-record-20260829-082100）；守卫改为微秒级立即抛 `IllegalStateException`，异常消息含端口/入口/持有者/持锁时长与修复指引（round 内应使用注入 source 直发），锁状态原样不动。20 个 serial 家族仓审计不存在合法的同线程嵌套取锁，无人依赖可重入；设计真相源见 workspace `arch-review-20260815/36-serial-nested-acquire-guard-design.md`。
+- **直发样板**（fleet 定稿形态）：gassensor `PM3006SDevice.readDeviceData`（测量未启动先直发启动命令、成功后经节拍再读）；vaisala `WeatherSensor`；davis `WeatherSensor.wakeDevice`。
+
+## 执行器选择（周期计时与阻塞 IO）
+
+- **纯内存周期任务**（O(1) 提交即返的计时/状态轮换）→ core `getBizScheduler()`：全局共享 2 线程业务计时器，**IO 禁入**——一个阻塞任务会静默饿死全部业务计时。
+- **阻塞 IO**（同步 `.get(timeout)`、DB 查询、文件持久化）→ core 库级 `HostedExecutors.bounded(1, 宿主)` 单飞道承载：池挂宿主（设备/集成/端点），拆卸随宿主移除 sweep 自动 `shutdownNow`，使用者零收尾样板；排队界 64、满拒同步抛 `RejectedExecutionException`。或改全异步链（future 回调驱动），不把阻塞等待放进任何共享池。
+- **车道化样板**：aticloud（被动监听——serial IO 线程 O(1) 投递即返，per-设备 `HostedExecutors.bounded(1, this)` 入站单飞道 FIFO 组帧/处理）；anhui/fuyang/com-hj212-chuzhou-air/env-push-demo（推送 tick——`getBizScheduler` 只做 O(1) 计时提交，per-端点 `HostedExecutors.bounded(1, 集成)` 单飞道承载阻塞体，bugs/fixed/bug-record-20260829-105624）。
+- PeriodicRunner/PeriodicChain/RoundSchedule/HostedExecutors 的 API 面与内置语义真相源：ecat-core `src/main/java/com/ecat/core/Task/runner/README.md`。
+
+## RECONFIGURE 端口重开语义
+
+RECONFIGURE 后设备重 load 时，新 comm 设置经 `SerialSourcePort.applyReconfiguredSettings` 应用，分两档（F-34，bug-record-20260826-001300）：
+
+- **物理参数变化**（波特率/数据位/停止位/校验/流控）：旧 fd 持旧参数无法热改，走 close + reopen 重建端口；共享此端口的全部 source 引用不变，随新 fd 继续工作。重开后 RX 清洗（drain 内核残留 + 清应用缓冲），首读零旧字节。
+- **仅 timeout 变化**：纯软件参数（读 `serialInfo` 不下发 OS），原位替换即生效，不重建端口。
+
 ## SDK 快速上手（主动轮询 SerialPolling，L3 设备仓标准入口）
 
 设备仓的周期采集**只走本 SDK**（L2 传输 SDK 层轮询模式，17 号 v2.1 §2.1）——调度注册/源锁/锁忙跳过/事务级硬超时/异常韧性（永不注销）/统一日志全部内置（连续失败→恢复有断连状态转移行：首败 WARN/恢复 INFO 去重），设备仓的执行词汇只剩 round 函数（每轮读什么）+ 属性灌入：
@@ -157,7 +185,7 @@ this.polling = SerialPolling.on(this, serialSource)                     // this=
 
 - **round 契约**：`Function<SerialSource, ? extends CompletableFuture<?>>`（通配，容纳 `CF<Void>`）；Boolean false=业务失败（统一 warn），异常=传输错误（统一 error，轮询永不注销）；锁忙（LockBusySkippedException）SDK 内部消化不外泄。
 - **生命周期**：`on(this, serialSource)` 的 `this`（DeviceBase 即 RemovalHost）使轮询句柄的 cancel **自动注册到设备移除生命周期**（`start()` 内部 `host.onRemove(handle::cancel)`，18 号设计 §3.3）——设备 stop 的 LIFO sweep 与 `PollingHandle.cancel()` 幂等并存；cancel 为 cancel(false) 语义（不中断在飞事务）。定时为 serial 域自持 `SerialSdkTimers`（daemon 池 `ecat-serial-sched-N`，29 号 v2 S1 起 SDK 不再依赖 core 调度引擎；停机挂 `SerialIntegration.onRelease`，测试缝 `bindForTest`）。
-- **何时用哪个模式**：周期读设备 → 本 SDK；从机/被动接收（biaoqi 型）→ `SerialSource` onFrame/监听器；写命令 → 既有 `executeWriteCommand`/`executeWithLambda` 族（不动）。
+- **何时用哪个模式**：周期读设备 → 本 SDK；从机/被动接收（biaoqi 型）→ `SerialSource` onFrame/监听器；写命令 → `executeWithLambda`（命令属性写闸路径最终落到它，有限等待语义保留，见上文「事务入口三选一」）。
 - 契约细节与五维单测（周期/熔断/锁/超时/异常韧性 + cecep 链式 + 111200 回归）见 `SerialPolling` 类 Javadoc 与 `SerialPollingSdkTest`；迁移操作手册见 workspace `arch-review-20260815/30-transport-sdk-survey/09-migration-handbook-v2.md`。
 
 ---
@@ -210,6 +238,11 @@ sudo rm -f /dev/ttyV{0..39}
 ```
 
 ## 更新日志
+- v3.1.0 (2026-08-29)
+  - 同线程嵌套取锁 fail-fast 守卫（vaisala 事故 SDK 层加固，bug-record-20260829-082100）：round 临界体内二次取锁微秒级抛 ISE，消息含修复指引
+  - 事务入口使用规则定稿：命令/写 → `executeWithLambda`（阻塞排队）；轮询 → `executePolling`（锁忙即弃本轮）；round 内 → 注入 source 直发
+  - RECONFIGURE 物理参数变化 close+reopen 重建端口、timeout-only 原位生效（F-34）
+
 - v1.1.0 (2025-12-27)
   - 引入 `ByteResponseHandlerStrategy`，支持纯二进制数据处理
   - 废弃 `DefaultResponseHandlerStrategy`，计划未来版本移除
