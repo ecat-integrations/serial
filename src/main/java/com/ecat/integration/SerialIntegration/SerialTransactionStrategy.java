@@ -150,6 +150,35 @@ public class SerialTransactionStrategy {
      */
     public static CompletableFuture<Boolean> executeWithLambda(SerialSource source,
             Function<SerialSource, CompletableFuture<Boolean>> lambda, long transactionTimeoutMs) {
+        return executeWithAcquireAction(source, lambda, source::acquire, transactionTimeoutMs);
+    }
+
+    /**
+     * {@link #executeWithLambda(SerialSource, Function, long)} 的等锁时长可配档：
+     * 锁忙时按 {@code lockWait}/{@code lockWaitUnit} 有限等待（默认档经
+     * {@link SerialSource#acquire()} 取端口默认 5s），事务级硬超时仍取设备配置派生值。
+     *
+     * <p>写路径「锁忙仍有限等待」的契约语义不变；本重载供需要显式控制 park 预算的调用方
+     * （如契约测试注入短等待缩短验证时长）。既有调用方零改动。
+     *
+     * @param lockWait     锁忙时的 park 预算
+     * @param lockWaitUnit 预算时间单位
+     */
+    public static CompletableFuture<Boolean> executeWithLambda(SerialSource source,
+            Function<SerialSource, CompletableFuture<Boolean>> lambda,
+            long lockWait, TimeUnit lockWaitUnit) {
+        return executeWithAcquireAction(source, lambda,
+                () -> source.acquire(lockWait, lockWaitUnit), resolveDefaultTransactionTimeoutMs(source));
+    }
+
+    /**
+     * 写路径取锁-执行公共体（3 参重载与等锁可配档重载的共享实现）：取锁动作经
+     * {@code lockAcquirer} 注入（默认档 = 无参 acquire；可配档 = 显式时长 acquire），
+     * 校验/分支/日志语句与既有 3 参实现逐语句一致，既有调用方行为零变化。
+     */
+    private static CompletableFuture<Boolean> executeWithAcquireAction(SerialSource source,
+            Function<SerialSource, CompletableFuture<Boolean>> lambda,
+            java.util.function.Supplier<String> lockAcquirer, long transactionTimeoutMs) {
         if (transactionTimeoutMs <= 0) {
             // 严格模式：非正的事务超时是调用方编程错误（应传入设备真实事务超时；
             // 默认 2 参重载由 resolveDefaultTransactionTimeoutMs 从设备配置派生，恒为正），
@@ -157,7 +186,7 @@ public class SerialTransactionStrategy {
             throw new IllegalArgumentException(
                     "transactionTimeoutMs must be > 0, got: " + transactionTimeoutMs);
         }
-        String key = source.acquire();
+        String key = lockAcquirer.get();
         if (key != null) {
             return executeHeld(source, key, lambda, transactionTimeoutMs);
         } else {

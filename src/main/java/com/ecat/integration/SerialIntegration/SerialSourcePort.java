@@ -188,11 +188,18 @@ public class SerialSourcePort {
     }
 
     /**
+     * 写路径等锁的默认 park 预算（秒）：命令/写事务「最终要执行」的有限等待语义
+     * （{@link #acquire()} 无参入口取本值）。常量提取供契约测试零耗时断言——
+     * 轮询非阻塞化后写路径注入点增多，默认值漂移须可被立即发现。
+     */
+    static final long DEFAULT_ACQUIRE_WAIT_SECONDS = 5;
+
+    /**
      * 尝试获取锁，支持等待队列
      * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
      */
     String acquire() {
-        return acquire(5, TimeUnit.SECONDS);
+        return acquire(DEFAULT_ACQUIRE_WAIT_SECONDS, TimeUnit.SECONDS);
     }
 
     /**

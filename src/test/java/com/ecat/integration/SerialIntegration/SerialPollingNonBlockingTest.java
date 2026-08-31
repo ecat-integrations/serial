@@ -46,8 +46,11 @@ public class SerialPollingNonBlockingTest {
 
     /** 轮询入口的非阻塞上界：远小于默认 5s 等锁 park；留足 CI 慢机余量。 */
     private static final long NON_BLOCKING_BOUND_MS = 2_000;
-    /** 写路径有限等待的 park 下界：证明仍在等锁（取默认 5s 等待的一半以上）。 */
-    private static final long WRITE_WAIT_MIN_MS = 2_000;
+    /** 写路径注入的短等锁预算（经可配档重载显式传入）：主用例不再烧满默认 5s。 */
+    private static final long WRITE_LOCK_WAIT_MS = 300;
+    /** 写路径有限等待的 park 下界：证明仍在等锁（注入 300ms 的一半以上；
+     *  生产默认 5s 的契约面由 {@link #writePathDefaultLockWaitRemainsFiveSeconds()} 常量断言守卫）。 */
+    private static final long WRITE_WAIT_MIN_MS = 250;
 
     /** 真实锁状态机端口（不 openPort，构造零 jSerialComm 副作用）。 */
     private SerialSourcePort newPort() {
@@ -158,8 +161,10 @@ public class SerialPollingNonBlockingTest {
     }
 
     /**
-     * 契约③写路径不回归：锁忙时 executeWithLambda 仍按有限等待 park（默认 5s），
-     * 到点才异常完成——闸内 IO 体对锁的等待语义保留，非阻塞化只作用于轮询入口。
+     * 契约③写路径不回归：锁忙时 executeWithLambda 仍按有限等待 park 后异常完成——
+     * 闸内 IO 体对锁的等待语义保留，非阻塞化只作用于轮询入口。经等锁可配档重载注入
+     * 300ms 短预算缩短验证时长（「等满才异常完成」的语义不变）；生产默认 5s 由下方
+     * 零耗时常量断言单独锁死。
      */
     @Test
     public void executeWithLambdaKeepsBoundedWait_whenLockHeld() throws Exception {
@@ -168,7 +173,8 @@ public class SerialPollingNonBlockingTest {
 
         long start = System.currentTimeMillis();
         CompletableFuture<Boolean> future = SerialTransactionStrategy.executeWithLambda(
-                bridgedSource(port), src -> CompletableFuture.completedFuture(true));
+                bridgedSource(port), src -> CompletableFuture.completedFuture(true),
+                WRITE_LOCK_WAIT_MS, TimeUnit.MILLISECONDS);
         try {
             future.get(15, TimeUnit.SECONDS);
             throw new AssertionError("锁忙时 executeWithLambda 应等待超时后异常完成");
@@ -179,6 +185,17 @@ public class SerialPollingNonBlockingTest {
         assertTrue("写路径应保留有限等待（park 至少 " + WRITE_WAIT_MIN_MS + "ms，实际 " + elapsed + "ms）",
                 elapsed >= WRITE_WAIT_MIN_MS);
         assertTrue(port.release(held));
+    }
+
+    /**
+     * 契约③常量面（零耗时纯断言）：写路径等锁默认预算 = 5s
+     * （{@link SerialSourcePort#DEFAULT_ACQUIRE_WAIT_SECONDS}，{@code acquire()} 无参入口取值）。
+     * 主用例注入 300ms 短预算后，默认值漂移（如有人改小）不会再被任何用例察觉——
+     * 本断言以纯常量锁死生产默认，零等待。
+     */
+    @Test
+    public void writePathDefaultLockWaitRemainsFiveSeconds() {
+        assertEquals(5L, SerialSourcePort.DEFAULT_ACQUIRE_WAIT_SECONDS);
     }
 
     /** 契约①并发形态：多设备同口轮询互相不 park——持锁期间 N 个 tryAcquire 全部立即放弃。 */
