@@ -1,7 +1,5 @@
 package com.ecat.integration.SerialIntegration.bytes;
 
-import com.ecat.core.Utils.LogFactory;
-import com.ecat.core.Utils.Log;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.SerialListenerPools;
 import com.ecat.integration.SerialIntegration.SerialInfo;
@@ -36,8 +34,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  */
 public class ListenerPoolExhaustionReproductionTest {
-
-    private static final Log log = LogFactory.getLogger(ListenerPoolExhaustionReproductionTest.class);
 
     // ==================== 常量配置 ====================
     private static final int POOL_SIZE = 20;  // SerialListenerPools.BYTE_POOL 的配置大小
