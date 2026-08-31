@@ -157,7 +157,7 @@ public class SerialIntegrationFunctionalTest {
                 .thenReturn(CompletableFuture.completedFuture("incomplete"));
 
         ResponseHandlingContext<String> context = new ResponseHandlingContext<>("test");
-        CompletableFuture<Boolean> result = strategy.handleResponse(context);
+        strategy.handleResponse(context); // CompletableFuture<Boolean> result
 
         // 等待足够长的时间让超时发生
         Thread.sleep(100);
@@ -307,7 +307,7 @@ public class SerialIntegrationFunctionalTest {
         );
 
         ResponseHandlingContext<String> context = new ResponseHandlingContext<>("test");
-        CompletableFuture<Boolean> result = strategy.handleResponse(context);
+        strategy.handleResponse(context); // CompletableFuture<Boolean> result
 
         // 验证异常被正确处理
         verify(mockSerialSource, atLeastOnce()).asyncReadData();
@@ -328,7 +328,7 @@ public class SerialIntegrationFunctionalTest {
                 .thenReturn(CompletableFuture.completedFuture(""));
 
         ResponseHandlingContext<String> context = new ResponseHandlingContext<>("test");
-        CompletableFuture<Boolean> result = strategy.handleResponse(context);
+        strategy.handleResponse(context); // CompletableFuture<Boolean> result
 
         // 验证轮询发生了（通过验证mock被调用）
         verify(mockSerialSource, atLeastOnce()).asyncReadData();
@@ -349,7 +349,7 @@ public class SerialIntegrationFunctionalTest {
         );
 
         ResponseHandlingContext<String> context = new ResponseHandlingContext<>("test");
-        CompletableFuture<Boolean> result = strategy.handleResponse(context);
+        strategy.handleResponse(context); // CompletableFuture<Boolean> result
 
         // 验证系统继续尝试
         verify(mockSerialSource, atLeast(2)).asyncReadData();

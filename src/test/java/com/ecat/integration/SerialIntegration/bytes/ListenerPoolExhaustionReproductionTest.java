@@ -481,7 +481,7 @@ public class ListenerPoolExhaustionReproductionTest {
             ctx -> {
                 // 处理响应
                 byte[] responseBytes = ctx.getReceiveBytes();
-                String response = new String(responseBytes);
+                new String(responseBytes); // String response
                 throw new RuntimeException("failured");
                 // return response.contains("ACK");
             },

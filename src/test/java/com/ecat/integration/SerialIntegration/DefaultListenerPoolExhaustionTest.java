@@ -475,7 +475,7 @@ public class DefaultListenerPoolExhaustionTest {
             clientSource,
             ctx -> {
                 // 处理响应
-                String response = ctx.getReceiveBuffer().toString();
+                ctx.getReceiveBuffer().toString(); // String response
                 throw new RuntimeException("failured");
                 // return response.contains("ACK");
             },

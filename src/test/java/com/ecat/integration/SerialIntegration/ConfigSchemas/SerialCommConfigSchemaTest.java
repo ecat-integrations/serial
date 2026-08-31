@@ -227,7 +227,7 @@ public class SerialCommConfigSchemaTest {
 
     @Test
     public void testInitI18n_WithBuilder_RealI18nResolution() {
-        SerialCommConfigSchema provider = SerialCommConfigSchema.builder()
+        SerialCommConfigSchema.builder() // SerialCommConfigSchema provider
             .baudrate(BaudRate.BAUD_115200)
             .build();
         // Builder 创建的 Provider 也需要硬编码 coordinate
