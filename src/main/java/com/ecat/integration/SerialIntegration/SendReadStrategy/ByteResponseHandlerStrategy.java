@@ -271,16 +271,8 @@ public class ByteResponseHandlerStrategy<T> {
             return future;
         }
 
-        // 休眠一段时间，避免过于频繁地读取数据
-        try {
-            Thread.sleep(50);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            CompletableFuture<ByteResponseHandlingContext<T>> future = new CompletableFuture<>();
-            future.completeExceptionally(new InterruptedException("Interrupted during polling"));
-            return future;
-        }
-
+        // 先读，未完成才退避：即时应答一拍组满帧零 sleep；空读/未组满帧时退避 50ms 再递归，
+        // 拍间隔与超时判定（startTime 基准）不变
         // 使用 asyncReadDataBytes() 异步获取字节数据
         // asyncReadDataBytes() 已经在端口 IO 车道（serial-io:{port}）中执行
         // 使用 thenCompose（而非 thenComposeAsync）保持在该线程中执行，避免线程切换
@@ -294,7 +286,21 @@ public class ByteResponseHandlerStrategy<T> {
                    }
                    return context;
                })
-               .thenCompose(buffer -> readDataRecursively(context));
+               .thenCompose(ctx -> {
+                   if (ctx.getFinishedFlag().get()) {
+                       return CompletableFuture.completedFuture(ctx);
+                   }
+                   // 休眠一段时间，避免过于频繁地读取数据（退避点：上一拍未组满帧）
+                   try {
+                       Thread.sleep(50);
+                   } catch (InterruptedException e) {
+                       Thread.currentThread().interrupt();
+                       CompletableFuture<ByteResponseHandlingContext<T>> future = new CompletableFuture<>();
+                       future.completeExceptionally(new InterruptedException("Interrupted during polling"));
+                       return future;
+                   }
+                   return readDataRecursively(context);
+               });
     }
 
     /**
