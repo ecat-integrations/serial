@@ -316,7 +316,9 @@ public final class SerialPolling {
             // 发起段同步异常（tryAcquire 内部错误等）：包 failedFuture 统一处理——
             // 引擎按异常完成记账、周期不注销（16 号 §4.4）；SDK 侧补齐日志与回调。
             log.error("[{}] polling round submission failed", portName, e);
-            markLinkDown("round submission failed: " + e.getMessage());
+            if (linkTimelineEnabled()) {
+                markLinkDown("round submission failed: " + e.getMessage());
+            }
             BiConsumer<Boolean, Throwable> cb = roundCallback;
             if (cb != null) {
                 cb.accept(null, e);
@@ -340,7 +342,9 @@ public final class SerialPolling {
                 return null;
             }
             log.error("[{}] polling round failed (transport/device error), polling continues", portName, ex);
-            markLinkDown("transport/device error: " + ex.getMessage());
+            if (linkTimelineEnabled()) {
+                markLinkDown("transport/device error: " + ex.getMessage());
+            }
             BiConsumer<Boolean, Throwable> cb = roundCallback;
             if (cb != null) {
                 cb.accept(null, ex);
@@ -349,15 +353,34 @@ public final class SerialPolling {
         }
         if (Boolean.FALSE.equals(result)) {
             log.warn("[{}] polling round business failure (round returned false)", portName);
-            markLinkDown("business failure (round returned false)");
+            if (linkTimelineEnabled()) {
+                markLinkDown("business failure (round returned false)");
+            }
         } else {
-            markLinkRecovered();
+            if (linkTimelineEnabled()) {
+                markLinkRecovered();
+            }
         }
         BiConsumer<Boolean, Throwable> cb = roundCallback;
         if (cb != null) {
             cb.accept(result, null);
         }
         return result;
+    }
+
+    /**
+     * 断连时间线翻转门（幽灵 DOWN 行修复）：仅当轮询链仍在调度（或句柄尚未创建）时才允许
+     * markLinkDown/markLinkRecovered 打断连时间线转移行。cancel 不打断在飞轮（PollingHandle
+     * 契约）——已取消链的在飞轮随后被事务级硬超时迟到结算，若照常翻转时间线有两害：
+     * 测试侧在本类全实例共享的 logger 上污染相邻用例的 DOWN/RECOVERED 计数（串扰实锤：
+     * 相邻用例开局冒 DOWN(error: null)）；生产侧设备主动 stop 后数秒仍冒「link DOWN」
+     * 幽灵断发行，误导运维定位。死链不产生时间线翻转——迟到结算的 per-round ERROR/WARN
+     * 证据栈不受本门影响（失败轮本身照打，可 grep 定位根因）。
+     *
+     * @return true = 时间线翻转允许（链在调度 / 句柄未建=未启动即无取消态，按活链放行）
+     */
+    private boolean linkTimelineEnabled() {
+        return handle == null || handle.isRunning();
     }
 
     /**

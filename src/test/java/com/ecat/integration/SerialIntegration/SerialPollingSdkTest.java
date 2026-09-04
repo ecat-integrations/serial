@@ -180,6 +180,36 @@ public class SerialPollingSdkTest {
     }
 
     /**
+     * 条件等待日志事件（AWAIT_MS 上限）：小步轮询 appender 快照直到条件命中——验证
+     * 「事件已发生」，非固定 sleep 同步。日志事件没有 latch 可等（异步线程写入），
+     * 条件轮询是其确定性等待形态（awaitility 同思路，零新依赖）。
+     */
+    private static boolean awaitEvent(
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender,
+            java.util.function.Predicate<ch.qos.logback.classic.spi.ILoggingEvent> condition)
+            throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_MS);
+        while (System.nanoTime() < deadlineNanos) {
+            if (snapshot(appender).stream().anyMatch(condition)) {
+                return true;
+            }
+            Thread.sleep(5L);   // 轮询步长：条件未命中时的再查间隔（非同步手段）
+        }
+        return snapshot(appender).stream().anyMatch(condition);
+    }
+
+    /**
+     * appender 当前事件快照：在 appender 监视器下拷贝——ListAppender（AppenderBase）
+     * 的 doAppend 同锁追加，读写互斥、可见性有保障（裸读并发写有 CME/撕裂风险）。
+     */
+    private static java.util.List<ch.qos.logback.classic.spi.ILoggingEvent> snapshot(
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender) {
+        synchronized (appender) {
+            return new java.util.ArrayList<>(appender.list);
+        }
+    }
+
+    /**
      * comm 熔断退役（W3）的补偿观测：连续失败轮只在<b>首败</b>打一行 WARN「link DOWN」、
      * 断连后的<b>首个成功轮</b>打一行 INFO「link RECOVERED」——per-round ERROR 全栈照打
      * （可 grep 定位根因），转移行给运维一眼可见的连续断连/恢复时间线。
@@ -234,8 +264,17 @@ public class SerialPollingSdkTest {
             long errorLines = appender.list.stream()
                     .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
                     .count();
-            assertEquals("连续失败期 DOWN 行恰一条（去重，首败一次）", 1L, downLines);
-            assertEquals("恢复行恰一条（首个成功轮）", 1L, recoveredLines);
+            // 诊断记录仪（bug-record-20260903-190000 追查）：断言失败时 dump 实际 DOWN/RECOVERED
+            // 时间线（时刻@线程:消息）——DOWN 行消息携带触发原因（传输错误/提交失败/超时字样），
+            // 一眼定位第二条 DOWN 来自哪条 markLinkDown 调用路径。
+            String timeline = appender.list.stream()
+                    .filter(e -> e.getFormattedMessage().contains("link DOWN")
+                            || e.getFormattedMessage().contains("link RECOVERED"))
+                    .map(e -> String.format("  [%d@%s] %s", e.getTimeStamp(), e.getThreadName(),
+                            e.getFormattedMessage()))
+                    .collect(java.util.stream.Collectors.joining("\n", "\n", ""));
+            assertEquals("连续失败期 DOWN 行恰一条（去重，首败一次）。实际时间线：" + timeline, 1L, downLines);
+            assertEquals("恢复行恰一条（首个成功轮）。实际时间线：" + timeline, 1L, recoveredLines);
             assertTrue("per-round ERROR 全栈照打（每失败轮一条，实得 " + errorLines + "）",
                     errorLines >= 3L);
         } finally {
@@ -287,6 +326,79 @@ public class SerialPollingSdkTest {
         } finally {
             restoreTurboFilters(turboFilters);
             pollingLogger.detachAppender(appender);
+        }
+    }
+
+    /**
+     * 幽灵 link DOWN 回归（bug-record-20260903-190000 A 群串扰根因的锁死）：cancel 不打断
+     * 在飞轮（PollingHandle 契约）——已取消链的在飞轮随后被事务级硬超时迟到结算，其
+     * settleRound <b>不得再翻转断连时间线</b>（markLinkDown 打「link DOWN」行）：本类
+     * logger 全实例共享，该行会污染相邻用例的 DOWN 计数（实锤串扰：DOWN(error: null)
+     * 冒入 consecutiveFailures 计数）；生产同害 = 设备主动 stop 后数秒冒幽灵断发行误导运维。
+     * 死链的迟到结算只保留 per-round ERROR 证据栈（失败轮本身照打，可 grep 定位根因）。
+     *
+     * <p>确定性同步：roundInFlight latch 保证 cancel 前置在飞；「结算落地」= 首条 per-round
+     * ERROR 行（awaitEvent 条件轮询）+ onRound 回调 latch（回调点后于 markLinkDown——关闭
+     * 「ERROR 已见而 DOWN 行未打」的观测窗口，红态必红）；全程无固定 sleep 同步。
+     * 事务硬超时收窄为 3ms × 10 = 30ms：迟到结算形态在测内定案（默认 5s 回退窗会把结算
+     * 漏到 tearDown 之后，测不了本断言）。
+     */
+    @Test
+    public void cancelledChainStragglerSettlementDoesNotFlipLinkState() throws Exception {
+        ch.qos.logback.classic.Logger pollingLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SerialPolling.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        ch.qos.logback.classic.Level originalLevel = pollingLogger.getLevel();
+        pollingLogger.setLevel(ch.qos.logback.classic.Level.INFO);
+        pollingLogger.addAppender(appender);
+        java.util.List<ch.qos.logback.classic.turbo.TurboFilter> turboFilters = detachTurboFilters();
+        try {
+            CountDownLatch roundInFlight = new CountDownLatch(1);
+            CountDownLatch settled = new CountDownLatch(1);
+            when(source.getTimeout()).thenReturn(3);   // 事务硬超时 3ms × 10 = 30ms
+
+            handle = SerialPolling.on(device, source)
+                    .round(src -> {
+                        roundInFlight.countDown();
+                        return new CompletableFuture<>();   // 永不完成：悬轮（cancel 后靠硬超时结算）
+                    })
+                    .every(PERIOD_MS, TimeUnit.MILLISECONDS)
+                    .onRound((result, ex) -> {
+                        if (ex != null) {
+                            settled.countDown();
+                        }
+                    })
+                    .start();
+
+            assertTrue("前置：悬轮必须在飞", roundInFlight.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+            handle.cancel();   // 链死；在飞轮按契约不被打断
+            assertFalse("前置：cancel 后链不在调度态", handle.isRunning());
+
+            assertTrue("迟到结算必须落地（per-round ERROR 照打：悬轮被事务硬超时异常完成）",
+                    awaitEvent(appender, e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR
+                            && e.getFormattedMessage().contains("polling round failed")));
+            assertTrue("结算回调必须发生（回调点后于 markLinkDown，DOWN 行若有必已入 appender）",
+                    settled.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+
+            java.util.List<ch.qos.logback.classic.spi.ILoggingEvent> events = snapshot(appender);
+            long downLines = events.stream()
+                    .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .filter(e -> e.getFormattedMessage().contains("link DOWN"))
+                    .count();
+            String timeline = events.stream()
+                    .filter(e -> e.getFormattedMessage().contains("link DOWN")
+                            || e.getFormattedMessage().contains("link RECOVERED"))
+                    .map(e -> String.format("  [%d@%s] %s", e.getTimeStamp(), e.getThreadName(),
+                            e.getFormattedMessage()))
+                    .collect(java.util.stream.Collectors.joining("\n", "\n", ""));
+            assertEquals("已取消链的迟到结算不得打 link DOWN（幽灵断连）。实际时间线：" + timeline,
+                    0L, downLines);
+        } finally {
+            restoreTurboFilters(turboFilters);
+            pollingLogger.detachAppender(appender);
+            pollingLogger.setLevel(originalLevel);
         }
     }
 
