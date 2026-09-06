@@ -93,6 +93,21 @@ public class SerialSourcePort {
     private final List<SerialSource> connectedSources = new CopyOnWriteArrayList<>();
 
     /**
+     * 退役标记（8-2 退役门，bugs/bug-record-20260901-214000 / bug-record-20260901-103824 同根因）：
+     * 最后一个 source 注销（空源分支）时置 true——本对象随即 closePort 并经
+     * {@code integration.removePort} 从集成端口地图除名。此后本对象上的任何 openPort
+     * （recoverWedgedPort 迟到自愈 / doSendWrite 写前自动重开 / applyReconfiguredSettings
+     * 重建）都是迟到重开：物理串口本身随时可重开（新设备注册走地图里的<b>新</b>
+     * SerialSourcePort 对象，正常打开），但已除名对象持有的任何 fd 都将成为无人关闭的
+     * 孤儿——独占物理口使同口新设备 OPEN FAILED 直到 core 重启（lsof 实证）。
+     * 与 {@link #lifecycleLock} 配对关闭 check-then-act 竞态：置位+拆除与 openPort 全程互斥。
+     */
+    private volatile boolean retired = false;
+
+    /** 端口生命周期锁：unregisterSource 空源拆除（置退役门 + close + 除名）与 openPort 互斥。 */
+    private final Object lifecycleLock = new Object();
+
+    /**
      * Package-private constructor. Only SerialIntegration should create instances.
      */
     SerialSourcePort(SerialInfo serialInfo, int maxWaiters, SerialIntegration integration) {
@@ -118,14 +133,20 @@ public class SerialSourcePort {
             log.info("[CLOSE] port={}, identity={}, remaining sources={}, sources={}",
                     getPortName(), source.getIdentity(), connectedSources.size(), formatIdentities());
             if (connectedSources.isEmpty()) {
-                // Last source disconnected — close port and remove from integration map
-                stopPolling();
-                if (serialPort != null && serialPort.isOpen()) {
-                    serialPort.closePort();
-                    log.info("[CLOSED] port={}, last source removed by identity={}", getPortName(), source.getIdentity());
-                }
-                if (integration != null) {
-                    integration.removePort(getPortName());
+                // Last source disconnected — close port and remove from integration map.
+                // 整段拆除与 openPort 同锁互斥（先置退役门再拆除）：若迟到的 recoverWedgedPort/
+                // 写前自动重开先于本分支拿到执行权，会把全新 fd 挂在已除名对象上成为孤儿
+                // （bugs/bug-record-20260901-214000 / bug-record-20260901-103824 同根因）。
+                synchronized (lifecycleLock) {
+                    retired = true;
+                    stopPolling();
+                    if (serialPort != null && serialPort.isOpen()) {
+                        serialPort.closePort();
+                        log.info("[CLOSED] port={}, last source removed by identity={}", getPortName(), source.getIdentity());
+                    }
+                    if (integration != null) {
+                        integration.removePort(getPortName());
+                    }
                 }
             }
         }
@@ -426,39 +447,50 @@ public class SerialSourcePort {
     // ========== Port management ==========
 
     private void openPort(String identity) {
-        if (serialPort != null && serialPort.isOpen()) {
-            log.info("[OPENED] port={}, already opened (requested by identity={})", serialInfo.portName, identity);
-            return;
-        }
-        serialPort = SerialPort.getCommPort(serialInfo.portName);
-        serialPort.setBaudRate(serialInfo.baudrate);
-        serialPort.setNumDataBits(serialInfo.dataBits);
-        serialPort.setNumStopBits(serialInfo.stopBits);
-        serialPort.setParity(serialInfo.parity);
-        serialPort.setFlowControl(serialInfo.flowControl);
+        // 整个开端口流程在 lifecycleLock 下与 unregisterSource 空源拆除互斥：拆除侧先置
+        // retired 再 close/除名，此处入口见 retired 即拒——两个互斥分支关闭「拆除中/拆除后
+        // 仍把新 fd 挂上已除名对象」的 check-then-act 竞态（bug-record 214000/103824）。
+        synchronized (lifecycleLock) {
+            if (retired) {
+                log.warn("[OPEN-REJECTED] port={}, identity={}, 已退役（最后一个 source 已注销），拒绝重开——"
+                                + "本对象已从集成端口地图除名，任何 fd 都将成为孤儿（bug-record 214000/103824）",
+                        serialInfo.portName, identity);
+                return;
+            }
+            if (serialPort != null && serialPort.isOpen()) {
+                log.info("[OPENED] port={}, already opened (requested by identity={})", serialInfo.portName, identity);
+                return;
+            }
+            serialPort = SerialPort.getCommPort(serialInfo.portName);
+            serialPort.setBaudRate(serialInfo.baudrate);
+            serialPort.setNumDataBits(serialInfo.dataBits);
+            serialPort.setNumStopBits(serialInfo.stopBits);
+            serialPort.setParity(serialInfo.parity);
+            serialPort.setFlowControl(serialInfo.flowControl);
 
-        // 非阻塞写升级（§H.2.2）：jSerialComm 的 read/write 超时模式共享同一 fd 的 O_NONBLOCK 标志，
-        // 是「全有或全无」（§B.2），无法只把 write 设非阻塞而保持 read 阻塞。故整端口改 TIMEOUT_NONBLOCKING。
-        // 读路径是事件驱动（DATA_AVAILABLE → continuousReceiveBuffer），不依赖阻塞读（§B.8 实证安全）；
-        // write 反压时返回 -1 并被 jSerialComm 关闭端口（§B.6），由 asyncSendData 显式处理（见下）。
-        serialPort.setComPortTimeouts(SerialPort.TIMEOUT_NONBLOCKING, 0, 0);
+            // 非阻塞写升级（§H.2.2）：jSerialComm 的 read/write 超时模式共享同一 fd 的 O_NONBLOCK 标志，
+            // 是「全有或全无」（§B.2），无法只把 write 设非阻塞而保持 read 阻塞。故整端口改 TIMEOUT_NONBLOCKING。
+            // 读路径是事件驱动（DATA_AVAILABLE → continuousReceiveBuffer），不依赖阻塞读（§B.8 实证安全）；
+            // write 反压时返回 -1 并被 jSerialComm 关闭端口（§B.6），由 asyncSendData 显式处理（见下）。
+            serialPort.setComPortTimeouts(SerialPort.TIMEOUT_NONBLOCKING, 0, 0);
 
-        if (!serialPort.openPort()) {
-            log.error("[OPEN FAILED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
-                    serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
-            return;
-        }
+            if (!serialPort.openPort()) {
+                log.error("[OPEN FAILED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
+                        serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
+                return;
+            }
 
-        // 重开后 RX 清洗（F-43 清洗②）：清内核残留 + 应用层缓冲，重开后首读零旧字节
-        drainAndClearReceiveBuffer("port-open");
+            // 重开后 RX 清洗（F-43 清洗②）：清内核残留 + 应用层缓冲，重开后首读零旧字节
+            drainAndClearReceiveBuffer("port-open");
 
-        if (!isTestMode) {
-            startPolling();
-            log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
-                    serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
-        } else {
-            log.info("[OPENED] port={}, identity={}, test mode, baudrate={}",
-                    serialInfo.portName, identity, serialInfo.baudrate);
+            if (!isTestMode) {
+                startPolling();
+                log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
+                        serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
+            } else {
+                log.info("[OPENED] port={}, identity={}, test mode, baudrate={}",
+                        serialInfo.portName, identity, serialInfo.baudrate);
+            }
         }
     }
 
@@ -909,6 +941,10 @@ public class SerialSourcePort {
      * 写立即失败返回（jSerialComm closePort 线程安全），车道线程得救；随后 {@link #openPort}
      * 重开产出新 fd 供后续事务使用（写路径 {@code asyncSendData} 亦有写前自动重开兜底）。
      * 触发方 = 事务级硬超时（见 SerialTransactionStrategy），即「端口 IO 挂死」的强证据时刻。
+     *
+     * <p>退役门（bug-record 214000/103824）：若最后一个 source 已注销（对象已除名），本方法
+     * 晚到几毫秒的重开是孤儿 fd 的诞生点——{@link #openPort} 入口的 retired 检查会拒绝重开，
+     * 端口保持关闭（已除名对象的正确终态），同口新设备经新对象正常打开。
      *
      * @param reason 触发原因（日志定位用，如 transaction-hard-timeout）
      */

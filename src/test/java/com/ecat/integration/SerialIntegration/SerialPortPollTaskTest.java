@@ -286,11 +286,17 @@ public class SerialPortPollTaskTest {
         realSourceUnderTest.closePort();
         assertNull("last-source close cancels poll task", port.getPollTaskHandle());
         for (int i = 0; i < 3; i++) {
-            SerialSource reopened = new SerialSource(port, "reopen-" + i);
-            port.startPolling();
-            assertNotNull("reopen schedules fresh poll task", port.getPollTaskHandle());
+            // 退役门上线（bug-record 214000/103824）后，最后一个 source 注销即退役本对象——
+            // 同对象重开被拒。生产的重开路径 = integration.register 经 removePort 除名后命中
+            // 新 SerialSourcePort；此处等价复刻：每轮用新端口对象开同一 pty，open/close 契约不变
+            // （重开挂新任务 / 最后一个 source 关闭再取消）。
+            SerialSourcePort reopenedPort = new SerialSourcePort(new SerialInfo(linkA, 9600, 8, 1, 0), 1, null);
+            SerialSource reopened = new SerialSource(reopenedPort, "reopen-" + i);
+            assertTrue("fresh port object should open on live pty", reopenedPort.isPortOpen());
+            reopenedPort.startPolling();
+            assertNotNull("reopen schedules fresh poll task", reopenedPort.getPollTaskHandle());
             reopened.closePort();
-            assertNull("close after reopen cancels poll task again", port.getPollTaskHandle());
+            assertNull("close after reopen cancels poll task again", reopenedPort.getPollTaskHandle());
         }
         assertEquals("no jSerialComm waitForEvent thread after open/close cycles",
                 0, jsSerialCommEventThreadCount());
