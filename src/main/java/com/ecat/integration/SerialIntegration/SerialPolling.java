@@ -13,6 +13,7 @@ import com.ecat.core.Task.runner.PeriodicRunner;
 import com.ecat.core.Task.runner.RoundSchedule;
 import com.ecat.core.Utils.Log;
 import com.ecat.core.Utils.LogFactory;
+import com.ecat.core.Utils.Mdc.DeviceMdcContext;
 
 /**
  * 主动轮询模式 SDK（L2 传输层，17 号 v2.1 §2.1——serial 域轮询的统一入口）。
@@ -302,7 +303,12 @@ public final class SerialPolling {
         this.handle = new ManagedHandle(chain);
         // 结构化生命周期（18 号 §3.3）：销毁动作注册到宿主——L3 作者不接触生命周期概念
         host.onRemove(handle::cancel);
-        chain.start();
+        // 设备归属注入（工单 G）：chain.start 对起链线程 MDC 做全量快照、逐轮恢复——此处把
+        // 宿主设备三键写入快照，轮询轮体及经 MdcExecutorService 派生的 IO 车道线程（CommTrace
+        // TX 埋点所在）即自动携带设备/坐标归属，非设备宿主（测试假宿主）no-op
+        try (DeviceMdcContext.Scope deviceScope = DeviceMdcContext.scopeOf(host)) {
+            chain.start();
+        }
         return this.handle;
     }
 

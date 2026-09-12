@@ -20,13 +20,19 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.MDC;
 
+import com.ecat.core.ConfigEntry.ConfigEntry;
+import com.ecat.core.Device.DeviceBase;
 import com.ecat.core.Device.RemovalHost;
 import com.ecat.core.Task.NamedThreadFactory;
+import com.ecat.core.Utils.Mdc.MdcContext;
 
 /**
  * {@link SerialPolling} SDK 五维生命周期契约（17 号 v2.1 §2.1 + 16 号 §4.4）：
@@ -154,6 +160,66 @@ public class SerialPollingSdkTest {
         firstRound.complete(true);
         assertTrue("fixedRate 完成后下一拍即发射（网格拍 < 1 周期；fixedDelay 语义须 ≥ 1 周期）",
                 laterRound.await(100L, TimeUnit.MILLISECONDS));
+    }
+
+    // ==================== 设备归属注入（工单 G：通讯追踪设备列） ====================
+
+    /**
+     * 设备宿主起链：chain.start 捕获的 MDC 快照含设备三键（device.id/device.name/
+     * integration.coordinate），轮询轮体在调度线程上恢复可见——串口 TX 埋点（asyncSendData
+     * 经 MdcExecutorService 派生的 IO 车道）由此携带设备归属。起链线程自身不得残留设备键。
+     */
+    @Test
+    public void deviceHostStartInjectsDeviceMdcIntoEveryRound() throws Exception {
+        ConfigEntry entry = new ConfigEntry();
+        entry.setCoordinate("com.ecat:integration-serial");
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("name", "串口设备-01");
+        RemovalHost deviceHost = new MinimalDevice(entry, cfg);
+
+        CountDownLatch roundBegan = new CountDownLatch(1);
+        AtomicReference<String> seenDeviceId = new AtomicReference<>();
+        AtomicReference<String> seenDeviceName = new AtomicReference<>();
+        AtomicReference<String> seenCoordinate = new AtomicReference<>();
+        handle = SerialPolling.on(deviceHost, source)
+                .round(src -> {
+                    seenDeviceId.set(MDC.get(MdcContext.DEVICE_ID_KEY));
+                    seenDeviceName.set(MDC.get(MdcContext.DEVICE_NAME_KEY));
+                    seenCoordinate.set(MDC.get(MdcContext.INTEGRATION_COORDINATE_KEY));
+                    roundBegan.countDown();
+                    return CompletableFuture.completedFuture(true);
+                })
+                .every(PERIOD_MS, TimeUnit.MILLISECONDS)
+                .start();
+
+        assertTrue("首轮必须执行", roundBegan.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+        assertEquals("round 线程 MDC 含 device.id", ((DeviceBase) deviceHost).getId(), seenDeviceId.get());
+        assertEquals("round 线程 MDC 含 device.name", "串口设备-01", seenDeviceName.get());
+        assertEquals("round 线程 MDC 含 coordinate", "com.ecat:integration-serial", seenCoordinate.get());
+        assertNull("起链线程（本测试线程）不得残留设备键", MDC.get(MdcContext.DEVICE_ID_KEY));
+    }
+
+    /** 最小设备桩：仅承载 id/name/coordinate，生命周期全 no-op。 */
+    private static final class MinimalDevice extends DeviceBase {
+        MinimalDevice(ConfigEntry gatewayEntry, Map<String, Object> config) {
+            super(gatewayEntry, "serial-sdk-test-unique", config);
+        }
+
+        @Override
+        public void init() {
+        }
+
+        @Override
+        public void start() {
+        }
+
+        @Override
+        public void stop() {
+        }
+
+        @Override
+        public void release() {
+        }
     }
 
     // ==================== 断连状态转移行：首败 WARN / 恢复 INFO / 去重 ====================
