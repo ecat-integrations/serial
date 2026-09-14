@@ -43,13 +43,14 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
  * </ul>
  *
  * <p><b>入口选择规则（SDK 调度纪律，两个入口非冗余）</b>：集成设备代码不应直接调用
- * {@code SerialSource#acquire/tryAcquire}，按事务的时效语义选入口——
+ * {@code SerialSource#acquire/acquirePollingBounded}，按事务的时效语义选入口——
  * <ul>
  *   <li>命令/写事务 → {@link #executeWithLambda(SerialSource, Function)}：阻塞排队等锁
  *       （等待者进 waitQueue 有限等待）。命令的时效语义是「最终要执行」，等一等是正确的。</li>
- *   <li>周期轮询 → {@link #executePolling(SerialSource, Function)}：tryAcquire 锁忙立即
- *       放弃本轮（调度三原则「过期即弃」）。轮询数据的时效语义是「过期即无价值」，为等锁
- *       park 调度线程只会把饥饿扩散到全系统。</li>
+ *   <li>周期轮询 → {@link #executePolling(SerialSource, Function)}：经
+ *       {@code acquirePollingBounded} 取锁（20260913-073600 方案 c）——无竞争快路径直达，
+ *       锁忙时 FIFO 有界等待移交 IO 旁池线程（预算内等到锁 → 本轮完成事务），预算耗尽
+ *       才弃本轮（「过期即弃」保留在预算边界上，调用线程零 park）。</li>
  * </ul>
  * round/事务临界体内（事务 lambda 在发起线程同步执行、源锁已持有）追加直发命令：使用 SDK
  * 注入的 {@code source} 直接 send（参照 gassensor PM3006SDevice 直发惯用法），勿再经
@@ -198,13 +199,21 @@ public class SerialTransactionStrategy {
     }
 
     /**
-     * 轮询事务入口（E2/R3 终态修复，方案 c：acquire 非阻塞化——调度三原则「过期即弃」）。
+     * 3 参 {@link #executePolling(SerialSource, Function, long)} 的默认锁等待预算（毫秒）：
+     * 直调入口的消费方无周期上下文，取 SDK clamp 上界
+     * （同 {@code SerialPolling#lockWaitBudgetMs()} 上限）。
+     */
+    private static final long DEFAULT_LOCK_BUDGET_MS = 500L;
+
+    /**
+     * 轮询事务入口（E2/R3 终态修复，方案 c——20260913-073600 修订：轮询并入 FIFO 有界等待）。
      *
      * <p>与 {@link #executeWithLambda(SerialSource, Function, long)} 的唯一差异在锁忙分支：
-     * 经 {@link SerialSource#tryAcquire()} 非阻塞取锁——锁忙时<b>本周期立即放弃</b>（不 park
-     * 等锁、不占等待队列、不消费 signal），返回以 {@link LockBusySkippedException} 异常完成
-     * 的 future。周期任务的 whenComplete 消费方应把该异常识别为「本轮跳过」而非设备错误。
-     * 放弃在源侧有记账（{@link SerialSource#getLockBusySkipCount()} + 限频 warn）。
+     * 经 {@link SerialSource#acquirePollingBounded(long)} 取锁——无竞争快路径直达；锁忙时
+     * FIFO 有界等待移交 IO 旁池线程（调用线程零 park），预算内等到锁则本轮照常完成事务；
+     * 预算耗尽才以 {@link LockBusySkippedException} 异常完成（真弃轮）。周期任务的
+     * whenComplete 消费方应把该异常识别为「本轮跳过」而非设备错误。真弃轮在源侧有记账
+     * （{@link SerialSource#getLockBusySkipCount()} + 限频 warn，等到锁的轮次不计）。
      *
      * <p><b>完成语义（R4，16 号设计）</b>：本方法把事务 CF 经返回值流出——轮询调用方以
      * round 函数（readData 返回本方法的 CF）接入所属域 SDK 周期链（19 号 v2 设备零调度，
@@ -218,27 +227,49 @@ public class SerialTransactionStrategy {
      * 语义的调用方继续走 {@code executeWithLambda}（闸内 IO 体对锁的等待保留）。
      *
      * <p>取锁成功后的事务体/硬超时/release/端口强拆链路与 {@code executeWithLambda} 完全共享
-     * （{@link #executeHeld}），F-16 的收割/恢复机制不受影响。
+     * （{@link #executeHeld}），F-16 的收割/恢复机制不受影响。锁等待预算取
+     * {@link #DEFAULT_LOCK_BUDGET_MS}。
      *
      * @param source               串口资源
      * @param lambda               在持锁期间执行的事务
      * @param transactionTimeoutMs 事务级硬超时（毫秒），须 &gt; 0
-     * @return 事务结果 future；锁忙时为 {@link LockBusySkippedException} 异常 future（立即完成）
+     * @return 事务结果 future；真弃轮时为 {@link LockBusySkippedException} 异常 future
      */
     public static CompletableFuture<Boolean> executePolling(SerialSource source,
+            Function<SerialSource, CompletableFuture<Boolean>> lambda, long transactionTimeoutMs) {
+        return executePolling(source, DEFAULT_LOCK_BUDGET_MS, lambda, transactionTimeoutMs);
+    }
+
+    /**
+     * 轮询事务入口的预算显式档（SDK 周期链接入面，20260913-073600 方案 c）：锁等待预算由
+     * 调用方按轮询周期 clamp（{@code SerialPolling#lockWaitBudgetMs()}：period÷4 clamp
+     * [200,500]ms）传入——周期短的链预算短（弃轮早、自愈快），周期长的链预算长（公平
+     * 窗口大）。语义同 {@link #executePolling(SerialSource, Function, long)}。
+     *
+     * @param source               串口资源
+     * @param lockBudgetMs         锁忙有界等待预算（毫秒，须 &gt; 0；SDK 侧按轮询周期 clamp）
+     * @param lambda               在持锁期间执行的事务
+     * @param transactionTimeoutMs 事务级硬超时（毫秒），须 &gt; 0
+     * @return 事务结果 future；真弃轮时为 {@link LockBusySkippedException} 异常 future
+     */
+    public static CompletableFuture<Boolean> executePolling(SerialSource source, long lockBudgetMs,
             Function<SerialSource, CompletableFuture<Boolean>> lambda, long transactionTimeoutMs) {
         if (transactionTimeoutMs <= 0) {
             throw new IllegalArgumentException(
                     "transactionTimeoutMs must be > 0, got: " + transactionTimeoutMs);
         }
-        String key = source.tryAcquire();
-        if (key == null) {
-            CompletableFuture<Boolean> skipped = new CompletableFuture<>();
-            skipped.completeExceptionally(new LockBusySkippedException(
-                    "Polling transaction skipped: port lock busy, will retry next cycle"));
-            return skipped;
-        }
-        return executeHeld(source, key, lambda, transactionTimeoutMs);
+        return source.acquirePollingBounded(lockBudgetMs).thenCompose(key -> {
+            if (key == null) {
+                // 真弃轮（预算耗尽/等待队列满/旁池饱和拒绝）：源侧已记账（getLockBusySkipCount
+                // + 限频 warn），此处以专用异常向周期链声明「本轮跳过」，不重复计数
+                CompletableFuture<Boolean> skipped = new CompletableFuture<>();
+                skipped.completeExceptionally(new LockBusySkippedException(
+                        "Polling transaction skipped: lock unavailable within budget " + lockBudgetMs
+                                + "ms, will retry next cycle"));
+                return skipped;
+            }
+            return executeHeld(source, key, lambda, transactionTimeoutMs);
+        });
     }
 
     /**

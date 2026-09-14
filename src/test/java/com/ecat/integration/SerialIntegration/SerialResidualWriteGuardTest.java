@@ -32,7 +32,7 @@ import com.fazecast.jSerialComm.SerialPort;
  * <ol>
  *   <li>硬超时触发时策略层调用 {@code SerialSource.markTransactionAborted()}：端口把
  *       「最低可接受发送代数」抬到当前代 + 1——被掐事务代内的后续 asyncSendData 提交全部拒绝；</li>
- *   <li>下一次 acquire/tryAcquire 授予新代数后，新事务的发送恢复正常（闸门只拦死事务残留）；</li>
+ *   <li>下一次 acquire/acquirePollingBounded 授予新代数后，新事务的发送恢复正常（闸门只拦死事务残留）；</li>
  *   <li>策略层硬超时同时强制异常完成底层 operations future（挂起中的链头确定性终止信号）。</li>
  * </ol>
  *

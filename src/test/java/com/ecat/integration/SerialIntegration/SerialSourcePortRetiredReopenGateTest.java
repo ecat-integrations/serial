@@ -12,6 +12,8 @@ import org.junit.Test;
 
 import com.fazecast.jSerialComm.SerialPort;
 
+import com.ecat.core.CommTrace.ResourceOwner;
+
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -135,15 +137,16 @@ public class SerialSourcePortRetiredReopenGateTest {
             SerialSource src = new SerialSource(oldPort, "dev-1");
             oldPort.unregisterSource(src);                         // 空源 → retired + integration.removePort（真实除名）
 
-            SerialSource fresh = integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500), "dev-new");
+            SerialSource fresh = integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500),
+                    ResourceOwner.device("com.ecat:integration-reopen-gate-test", "entry-new", "dev-new"));
 
             assertNotNull("新注册必须返回新 source", fresh);
             assertNotSame("退役对象已从端口地图除名，新注册必须走新 SerialSourcePort 对象",
                     oldPort, integration.serialPortsGet(PORT));
             assertFalse("新对象 openPort 不受退役门影响（无 [OPEN-REJECTED]），实际日志：\n" + logs.timeline(),
                     logs.has("[OPEN-REJECTED]"));
-            assertTrue("新对象 openPort 走正常流程（fake 口表现为 [OPEN FAILED] identity=dev-new 尝试行），实际日志：\n" + logs.timeline(),
-                    logs.has("identity=dev-new"));
+            assertTrue("新对象 openPort 走正常流程（fake 口表现为含新注册视图 identity 的 [OPEN FAILED] 尝试行），实际日志：\n" + logs.timeline(),
+                    logs.has("dev-new"));
         } finally {
             logs.close();
         }

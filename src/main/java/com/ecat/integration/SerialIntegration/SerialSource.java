@@ -8,6 +8,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
+import com.ecat.core.CommTrace.OwnerLevel;
+import com.ecat.core.CommTrace.ResourceOwner;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 
@@ -27,11 +29,23 @@ public class SerialSource {
     private final String identity;
 
     /**
+     * 本视图的权威归属 owner（io-resource-owner §5.2）：register(Info, owner/host) 注册携带。
+     * null = identity 串直接构造的视图（测试基建形态，锁归因回落线程 MDC/回填现状）。
+     */
+    private volatile ResourceOwner owner;
+
+    /**
      * 获取此 SerialSource 的标识符
      */
     String getIdentity() {
         return identity;
     }
+
+    /** 本视图登记的 owner（账本折叠/精准查询读面用）；LEGACY 注册（identity 串形态）为 null。 */
+    ResourceOwner getOwner() {
+        return owner;
+    }
+
     private final SerialSourcePort sourcePort;
     private final CopyOnWriteArrayList<SerialDataListener> dataListeners = new CopyOnWriteArrayList<>();
 
@@ -44,6 +58,48 @@ public class SerialSource {
         this.identity = identity;
         sourcePort.registerSource(this);
         log.info("SerialSource created for port: " + getPortName() + ", identity: " + identity);
+    }
+
+    /**
+     * 带权威归属的视图构造（io-resource-owner §5.2）：register(Info, owner/host) 与
+     * registerForDevice 共用；identity 由 owner 派生（见 {@link #identityOf}）。
+     */
+    SerialSource(SerialSourcePort sourcePort, ResourceOwner owner) {
+        this.sourcePort = sourcePort;
+        this.identity = identityOf(owner);
+        this.owner = owner;
+        sourcePort.registerSource(this);
+        log.info("SerialSource created for port: " + getPortName() + ", identity: " + identity);
+    }
+
+    /**
+     * identity 串由 owner 派生（§5.2：identity 不再由调用方自由拼）：分层拼接稳定确定——
+     * 同设备重注册必得同串（引用计数/日志键不变量保持）；LEGACY 原样保留 rawIdentity
+     * （迁移期日志可 grep 原串，定位未迁移调用方）。
+     */
+    static String identityOf(ResourceOwner owner) {
+        switch (owner.getLevel()) {
+            case DEVICE:
+                return "DEVICE:" + owner.getCoordinate() + ":" + owner.getEntryId() + ":" + owner.getDeviceId();
+            case ENTRY:
+                return "ENTRY:" + owner.getCoordinate() + ":" + owner.getEntryId();
+            case INTEGRATION:
+                return "INTEGRATION:" + owner.getCoordinate();
+            case LEGACY:
+                return owner.getRawIdentity();
+            default:
+                throw new IllegalStateException("未覆盖的 owner 层级: " + owner.getLevel());
+        }
+    }
+
+    /**
+     * 本视图取锁时注入的权威归属（调用方无感，acquire/acquirePollingBounded 委托时自动携带）：
+     * LEGACY 不参与锁注入——W2 契约下 owner 参数会整组压制线程 MDC 归因，LEGACY 无
+     * 设备身份字段，注入反而丢掉线程 MDC 归属（identity 串直接构造的视图维持此现状）。
+     */
+    ResourceOwner lockOwner() {
+        ResourceOwner current = owner;
+        return current != null && current.getLevel() != OwnerLevel.LEGACY ? current : null;
     }
 
     /**
@@ -106,34 +162,38 @@ public class SerialSource {
     }
 
     /**
-     * 尝试获取锁，支持等待队列
+     * 尝试获取锁，支持等待队列。视图已登记权威归属时自动注入（{@link #lockOwner()}，
+     * 调用方无感）——授予后 TX/RX 捕获点同读该归属作 CommTrace 权威参数。
      * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
      */
     public String acquire() {
-        return sourcePort.acquire();
+        return sourcePort.acquire(lockOwner());
     }
 
     /**
-     * 尝试获取锁，支持等待队列和超时
+     * 尝试获取锁，支持等待队列和超时（owner 注入同 {@link #acquire()}）
      * @param timeout 超时时间
      * @param unit 时间单位
      * @return 锁标识（成功获取/唤醒或进入等待），null表示超时或超出等待队列容量
      */
     public String acquire(long timeout, TimeUnit unit) {
-        return sourcePort.acquire(timeout, unit);
+        return sourcePort.acquire(timeout, unit, lockOwner());
     }
 
     /**
-     * 非阻塞获取锁（轮询专用，E2/R3「过期即弃」）：锁忙立即返回 null、零 park、不占等待队列。
-     * 语义与记账见 {@link SerialSourcePort#tryAcquire()}。
+     * 轮询锁获取契约入口（20260913-073600 方案 c，与 modbus {@code ModbusSource}
+     * 同型）：无竞争快路径直达；锁忙时 FIFO 有界等待移交 IO 旁池线程——调用线程零 park。
+     * 视图已登记权威归属时自动注入（{@link #lockOwner()}，调用方无感）。
+     * 语义与记账见 {@link SerialSourcePort#acquirePollingBounded(ResourceOwner, long)}。
      *
-     * @return 锁标识；锁忙时立即返回 null（本周期放弃，下周期再试）
+     * @param budgetMs 锁等待预算（毫秒，须 &gt; 0；SDK 侧按轮询周期 clamp）
+     * @return 锁标识 CF；null 完成=本周期弃轮（真弃轮在源侧记账）
      */
-    public String tryAcquire() {
-        return sourcePort.tryAcquire();
+    public CompletableFuture<String> acquirePollingBounded(long budgetMs) {
+        return sourcePort.acquirePollingBounded(lockOwner(), budgetMs);
     }
 
-    /** 本端口累计轮询锁忙放弃次数（{@link SerialSourcePort#tryAcquire()} 记账）。 */
+    /** 本端口累计轮询真弃轮次数（有界等待预算耗尽的计数，{@code acquirePollingBounded} 记账）。 */
     public long getLockBusySkipCount() {
         return sourcePort.getLockBusySkipCount();
     }

@@ -12,6 +12,8 @@ import static org.mockito.Mockito.when;
 import com.fazecast.jSerialComm.SerialPort;
 import org.junit.Test;
 
+import com.ecat.core.CommTrace.ResourceOwner;
+
 /**
  * 【RED：F-34 RECONFIGURE 参数静默不生效】bug-record-20260826-001300：
  * RECONFIGURE 改 comm 参数（timeout/baudrate 等）后设备重 load，register() 命中同口
@@ -35,6 +37,11 @@ public class SerialIntegrationReconfigureSettingsTest {
      * 使 reopen 路径在无真实串口的 CI 环境可走到。
      */
     private static final String PORT = "/dev/null";
+    private static final String COORD = "com.ecat:integration-reconfigure-test";
+
+    private static ResourceOwner deviceOwner(String deviceId) {
+        return ResourceOwner.device(COORD, "entry-1", deviceId);
+    }
 
     private SerialIntegration newIntegrationWithOpenPort(SerialInfo info) {
         SerialIntegration integration = new SerialIntegration();
@@ -63,7 +70,7 @@ public class SerialIntegrationReconfigureSettingsTest {
         SerialSourcePort port = integration.serialPortsGet(PORT);
         SerialPort originalSerialPort = port.serialPort;
 
-        integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 2000), "dev-1");
+        integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 2000), deviceOwner("dev-1"));
 
         assertEquals("RECONFIGURE 改 timeout 后 getTimeout 必须返回新值", 2000, port.getTimeout());
         // timeout 是纯软件参数：不得 close 物理端口（无谓 churn）
@@ -79,7 +86,7 @@ public class SerialIntegrationReconfigureSettingsTest {
         SerialSourcePort port = integration.serialPortsGet(PORT);
         SerialPort originalSerialPort = port.serialPort;
 
-        integration.register(new SerialInfo(PORT, 19200, 8, 1, 0, 0, 500), "dev-1");
+        integration.register(new SerialInfo(PORT, 19200, 8, 1, 0, 0, 500), deviceOwner("dev-1"));
 
         verify(originalSerialPort).closePort(); // 物理参数变化必须 close 旧端口（disable/enable 同款重建路径）
         assertEquals("重建后端口必须持有新 baudrate", Integer.valueOf(19200), port.serialInfo.baudrate);
@@ -94,7 +101,7 @@ public class SerialIntegrationReconfigureSettingsTest {
         SerialSourcePort port = integration.serialPortsGet(PORT);
         SerialPort originalSerialPort = port.serialPort;
 
-        integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500), "dev-2");
+        integration.register(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500), deviceOwner("dev-2"));
 
         assertSame("参数未变必须复用同一 SerialSourcePort", port, integration.serialPortsGet(PORT));
         verify(originalSerialPort, never()).closePort();

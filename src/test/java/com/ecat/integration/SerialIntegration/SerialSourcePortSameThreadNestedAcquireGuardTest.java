@@ -14,7 +14,9 @@ import static org.mockito.Mockito.when;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -35,7 +37,9 @@ import com.ecat.core.Task.NamedThreadFactory;
  *
  * <p>契约：
  * <ul>
- *   <li>acquire 与 tryAcquire 两入口同守卫（tryAcquire 嵌套同样自死锁）；</li>
+ *   <li>acquire 与 acquirePollingBounded 快路径两入口同守卫（轮询嵌套同样自死锁）；
+ *       锁忙分支的等待在 IO 旁池线程上执行、天然异线程不触发守卫（由 acquire 超时/
+ *       事务硬超时兜底，见 SerialSourcePort 契约 javadoc 的行为差异声明）；</li>
  *   <li>命中抛 IllegalStateException 且锁状态不因抛出改变（原持有关系完好，异线程
  *       不受影响）；release 后同线程再取合法；</li>
  *   <li>守卫检查点在幽灵锁收割<b>之后</b>——同线程的陈年幽灵锁先收割后授予，不抛
@@ -121,10 +125,17 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
                     message.contains("executeWithLambda/executePolling"));
         }
 
-        // 抛后锁状态未破坏（持锁期间）：异线程 tryAcquire 是锁忙放弃（null）而非误判守卫
+        // 抛后锁状态未破坏（持锁期间）：异线程 acquirePollingBounded 是锁忙 → 旁池有界等待
+        // 预算耗尽返 null（.get 等到 CF 完成即等待者已自摘，不与后续 release 竞态）而非误判守卫
         final String[] crossTry = new String[1];
-        runOnHelperThread("cross-try", () -> crossTry[0] = port.tryAcquire());
-        assertNull("守卫只对同线程命中；异线程锁忙照常立即返 null", crossTry[0]);
+        runOnHelperThread("cross-try", () -> {
+            try {
+                crossTry[0] = port.acquirePollingBounded(null, 50).get(AWAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException | ExecutionException | TimeoutException x) {
+                throw new RuntimeException(x);
+            }
+        });
+        assertNull("守卫只对同线程命中；异线程锁忙照常有界等待预算耗尽返 null", crossTry[0]);
 
         // 原持有关系原样：release 仍真
         assertTrue("守卫命中不得改变锁状态——原 key release 仍有效", port.release(heldKey));
@@ -136,27 +147,30 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
         assertTrue(port.release(crossKey[0]));
     }
 
-    // ==================== ② 同线程嵌套 tryAcquire：同守卫 ====================
+    // ==================== ② 同线程嵌套 acquirePollingBounded 快路径：同守卫 ====================
 
-    /** tryAcquire 入口同样嵌套自死锁（不 park 但持有关系会被无声破坏）：同守卫立即抛。 */
+    /**
+     * acquirePollingBounded 快路径（轮询入口）同样嵌套自死锁：快路径在调用线程上执行，
+     * 守卫同步立即抛（方法抛出而非 CF 异常完成——快路径未到旁池移交点）。
+     */
     @Test
-    public void sameThreadNestedTryAcquireThrows() {
+    public void sameThreadNestedPollingAcquireThrows() {
         String heldKey = port.acquire(AWAIT_MS, TimeUnit.MILLISECONDS);
         assertNotNull(heldKey);
 
         try {
-            port.tryAcquire();
-            fail("同线程嵌套 tryAcquire 必须立即抛");
+            port.acquirePollingBounded(null, 500);
+            fail("同线程嵌套 acquirePollingBounded 快路径必须立即抛");
         } catch (IllegalStateException expected) {
-            assertTrue("消息须标识 tryAcquire 入口: " + expected.getMessage(),
-                    expected.getMessage().contains("tryAcquire"));
+            assertTrue("消息须标识 acquirePollingBounded 快路径入口: " + expected.getMessage(),
+                    expected.getMessage().contains("acquirePollingBounded"));
         }
         assertTrue("抛后锁状态未变", port.release(heldKey));
     }
 
     // ==================== ③ 异线程正常路径不受影响 ====================
 
-    /** 非持锁线程取锁不触发守卫：锁忙照常（tryAcquire null / acquire 超时 null），释放后可得。 */
+    /** 非持锁线程取锁不触发守卫：锁忙照常（acquirePollingBounded 预算耗尽 null / acquire 超时 null），释放后可得。 */
     @Test
     public void crossThreadPathsUnaffected() throws Exception {
         final String[] heldKey = new String[1];
@@ -180,8 +194,10 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
         assertTrue("持锁线程必须在期限内取得锁", held.await(AWAIT_MS, TimeUnit.MILLISECONDS));
         assertNull(holderError[0]);
 
-        // 主线程此刻非持有者：tryAcquire 锁忙 null（正常放弃，非守卫抛）
-        assertNull("异线程锁忙 tryAcquire 照常返 null", port.tryAcquire());
+        // 主线程此刻非持有者：acquirePollingBounded 锁忙 → 旁池有界等待预算耗尽 null
+        // （.get 等 CF 完成即等待者已自摘出队，不与下方 acquire 抢等待容量）
+        assertNull("异线程锁忙 acquirePollingBounded 照常预算耗尽返 null",
+                port.acquirePollingBounded(null, 50).get(AWAIT_MS, TimeUnit.MILLISECONDS));
         // 异线程有限等待照常超时 null（阈值内不收割 + 不抛）
         assertNull("异线程 acquire 阈值内照常超时返 null",
                 port.acquire(50, TimeUnit.MILLISECONDS));
@@ -199,7 +215,7 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
 
     /** 守卫只挡「未释放期间」的嵌套：release 清记账后同线程重取是正常串行事务。 */
     @Test
-    public void reacquireAfterReleaseIsLegal() {
+    public void reacquireAfterReleaseIsLegal() throws Exception {
         String first = port.acquire(AWAIT_MS, TimeUnit.MILLISECONDS);
         assertNotNull(first);
         assertTrue(port.release(first));
@@ -208,8 +224,8 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
         assertNotNull("release 后同线程再取必须合法（守卫不得误伤正常串行事务）", second);
         assertTrue(port.release(second));
 
-        String third = port.tryAcquire();
-        assertNotNull("release 后同线程 tryAcquire 同样合法", third);
+        String third = port.acquirePollingBounded(null, 500).get(AWAIT_MS, TimeUnit.MILLISECONDS);
+        assertNotNull("release 后同线程 acquirePollingBounded 快路径同样合法（无竞争直达）", third);
         port.release(third);
     }
 
@@ -365,7 +381,8 @@ public class SerialSourcePortSameThreadNestedAcquireGuardTest {
         when(source.acquire()).thenAnswer(inv -> port.acquire());
         when(source.acquire(anyLong(), any(TimeUnit.class))).thenAnswer(inv -> port.acquire(
                 inv.getArgument(0, Long.class), inv.getArgument(1, TimeUnit.class)));
-        when(source.tryAcquire()).thenAnswer(inv -> port.tryAcquire());
+        when(source.acquirePollingBounded(anyLong())).thenAnswer(inv -> port.acquirePollingBounded(
+                null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
         when(source.getPortName()).thenReturn(port.getPortName());
         when(source.getTimeout()).thenReturn(port.getTimeout());

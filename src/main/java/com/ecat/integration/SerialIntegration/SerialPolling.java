@@ -7,7 +7,10 @@ import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
+import com.ecat.core.CommTrace.ResourceOwner;
+import com.ecat.core.Device.DeviceBase;
 import com.ecat.core.Device.RemovalHost;
+import com.ecat.core.Integration.IntegrationBase;
 import com.ecat.core.Task.runner.PeriodicChain;
 import com.ecat.core.Task.runner.PeriodicRunner;
 import com.ecat.core.Task.runner.RoundSchedule;
@@ -20,8 +23,8 @@ import com.ecat.core.Utils.Mdc.DeviceMdcContext;
  *
  * <p>应用场景：串口设备的周期采集（约 40 仓共 50 处 {@code scheduleWithFixedDelay +
  * executePolling + thenAccept/exceptionally} 样板，调研 01 §2.2）。设备仓的执行词汇
- * 收敛为「round 函数（读什么）」——调度注册 / 源锁（tryAcquire+锁忙跳过）/ 事务级硬超时 /
- * 异常韧性（永不注销）/ 统一日志全部内置：
+ * 收敛为「round 函数（读什么）」——调度注册 / 源锁（acquirePollingBounded 有界等待，
+ * 预算耗尽才弃轮）/ 事务级硬超时 / 异常韧性（永不注销）/ 统一日志全部内置：
  *
  * <pre>{@code
  * // 设备仓迁移终态（调研 01 §5.3 例 1，zhengxin 14 行 → 3 行；18 号设计 §3.3）
@@ -50,9 +53,9 @@ import com.ecat.core.Utils.Mdc.DeviceMdcContext;
  *       （调度三原则「永不注销」，16 号 §4.4 异常不注销——111200 的修复载体）。</li>
  * </ul>
  *
- * <p><b>锁忙内化</b>：{@link LockBusySkippedException}（executePolling 的 tryAcquire
- * 锁忙信号）在 SDK 内部消化——不外泄到 {@code onRound} 回调、不打错误日志，本轮 CF 以
- * 正常完成结算（周期网格不变，下周期再试）。消费方零感知，调研 01 §4.2 C1 的 35 处
+ * <p><b>锁忙内化</b>：{@link LockBusySkippedException}（executePolling 有界等待预算
+ * 耗尽的弃轮信号）在 SDK 内部消化——不外泄到 {@code onRound} 回调、不打错误日志，本轮
+ * CF 以正常完成结算（周期网格不变，下周期再试）。消费方零感知，调研 01 §4.2 C1 的 35 处
  * {@code isLockBusySkip} exceptionally 样板随之消亡。
  *
  * <p><b>生命周期</b>：{@link #start()} 内部是 serial 仓唯一周期注册点（L2 收口处：
@@ -118,9 +121,10 @@ public final class SerialPolling {
 
     /**
      * round 契约（17 号 v2.1 定稿）：一轮读什么。SDK 把整个 round 包进一次
-     * {@code executePolling} 事务（tryAcquire 非阻塞取锁 + 事务级硬超时 + release 保证），
-     * 多段命令链（{@code thenCompose} 串联多笔 send-read）在单事务内天然串行——
-     * cecep 式「同周期两笔独立事务互踩锁」形态（调研 07 §17）合并为单 round 即消。
+     * {@code executePolling} 事务（acquirePollingBounded 取锁 + 事务级硬超时 +
+     * release 保证），多段命令链（{@code thenCompose} 串联多笔 send-read）在单事务内
+     * 天然串行——cecep 式「同周期两笔独立事务互踩锁」形态（调研 07 §17）合并为单 round
+     * 即消。
      *
      * @param round 一轮事务体（持锁期间执行）；返回 CF 见类 Javadoc 的结果/异常契约
      */
@@ -303,23 +307,58 @@ public final class SerialPolling {
         this.handle = new ManagedHandle(chain);
         // 结构化生命周期（18 号 §3.3）：销毁动作注册到宿主——L3 作者不接触生命周期概念
         host.onRemove(handle::cancel);
+        // 归属咽喉（io-resource-owner §5.2）：起链处从宿主派生 owner 作 MDC 注入源
+        // scopeOf(owner)（读 owner.mdcEntries，设备三键同刻同源——日志本职，长期保留）。
+        // 容忍边界：lambda 假宿主 / 空 entry 设备宿主不派生不抛（MDC 回落宿主路径，
+        // 输出等价）；账本级严格失败在 register(SerialInfo, host)。
+        ResourceOwner owner = tryDeriveOwner(host);
         // 设备归属注入（工单 G）：chain.start 对起链线程 MDC 做全量快照、逐轮恢复——此处把
-        // 宿主设备三键写入快照，轮询轮体及经 MdcExecutorService 派生的 IO 车道线程（CommTrace
-        // TX 埋点所在）即自动携带设备/坐标归属，非设备宿主（测试假宿主）no-op
-        try (DeviceMdcContext.Scope deviceScope = DeviceMdcContext.scopeOf(host)) {
+        // 设备三键写入快照，轮询轮体及经 MdcExecutorService 派生的 IO 车道线程（CommTrace
+        // TX 埋点所在）即自动携带设备/坐标归属；owner 路径（同刻同源）优先，派生失败回落
+        // 宿主路径（非设备宿主——测试假宿主——no-op）
+        try (DeviceMdcContext.Scope deviceScope = owner != null
+                ? DeviceMdcContext.scopeOf(owner) : DeviceMdcContext.scopeOf(host)) {
             chain.start();
         }
         return this.handle;
     }
 
-    /** 单轮发起：executePolling 事务 → 结算（日志/onRound/锁忙内化）。 */
+    /**
+     * 咽喉 owner 派生（容忍版）：宿主为 DeviceBase/IntegrationBase 时经 {@link ResourceOwner#of}
+     * 派生；其余宿主（测试 lambda 假宿主）与派生失败（设备 entry 缺 entryId 的
+     * {@code @Deprecated} Map 构造器路径形态、加载前 coordinate 未定）返回 null 不抛——
+     * MDC 走宿主路径输出等价，严格失败留给账本级 register(SerialInfo, host)（设计把守卫
+     * 放在那里，§5.2）。
+     */
+    private static ResourceOwner tryDeriveOwner(RemovalHost host) {
+        if (!(host instanceof DeviceBase) && !(host instanceof IntegrationBase)) {
+            return null;
+        }
+        try {
+            return ResourceOwner.of(host);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 轮询锁等待预算（毫秒）：period÷4 clamp [200,500]——周期短的链预算短（弃轮早、
+     * 自愈快），周期长的链预算长（共享口公平窗口大）。有界等待发生在 IO 旁池线程，
+     * 预算大小不影响调用线程零 park 边界。包内可见（契约测试断言 clamp 边界用）。
+     */
+    long lockWaitBudgetMs() {
+        return Math.max(200L, Math.min(500L, periodMs / 4));
+    }
+
+    /** 单轮发起：executePolling 事务（锁预算按周期 clamp）→ 结算（日志/onRound/锁忙内化）。 */
     private CompletableFuture<?> beginRound(long transactionTimeoutMs) {
         CompletableFuture<Boolean> transaction;
         try {
             transaction = SerialTransactionStrategy.executePolling(
-                    source, asBooleanRound(round), transactionTimeoutMs);
+                    source, lockWaitBudgetMs(), asBooleanRound(round), transactionTimeoutMs);
         } catch (RuntimeException e) {
-            // 发起段同步异常（tryAcquire 内部错误等）：包 failedFuture 统一处理——
+            // 发起段同步异常（取锁入口编程错误等——acquirePollingBounded 校验失败等形态）：
+            // 包 failedFuture 统一处理——
             // 引擎按异常完成记账、周期不注销（16 号 §4.4）；SDK 侧补齐日志与回调。
             log.error("[{}] polling round submission failed", portName, e);
             if (linkTimelineEnabled()) {

@@ -471,13 +471,15 @@ public class SerialPollingSdkTest {
     // ==================== 锁：busy-skip 内部消化（LockBusySkippedException 不外泄） ====================
 
     /**
-     * 端口锁被外部持有（写命令事务在飞的真实形态）：tryAcquire 锁忙轮被 SDK 内部消化——
-     * onRound 不回调、无错误外泄，调度网格照常推进；锁释放后下一轮即恢复采集。
+     * 端口锁被外部持有（写命令事务在飞的真实形态）：轮询经有界等待预算耗尽真弃轮，被 SDK
+     * 内部消化——onRound 不回调、无错误外泄，调度网格照常推进；锁释放后（预算内等待者被
+     * 授予或下一轮快路径直达）即恢复采集。弃轮判定用确定性事件（skip 记账 ≥1，预算 =
+     * period÷4 clamp = 200ms 必在锁持有期内耗尽），非固定窗猜测。
      */
     @Test
     public void lockBusyRoundIsDigestedWithoutCallbackOrDeregistration() throws Exception {
         String heldKey = port.acquire(1, TimeUnit.SECONDS);
-        assertNotNull("前置：测试线程持锁", heldKey);
+        assertNotNull("前置：测试线程持锁（round 在定时线程发起，旁池等待异线程不触发守卫）", heldKey);
 
         CountDownLatch roundRan = new CountDownLatch(1);
         CountDownLatch successCallback = new CountDownLatch(1);
@@ -497,8 +499,10 @@ public class SerialPollingSdkTest {
                 })
                 .start();
 
-        assertFalse("锁忙轮 round 不得执行（tryAcquire 即弃）",
-                roundRan.await(NEGATIVE_WINDOW_MS, TimeUnit.MILLISECONDS));
+        // 确定性等「首轮预算耗尽真弃轮」事件：证明轮已发起且被有界等待弃掉（非「尚未到拍」假阴性）
+        awaitLockBusySkipCount(1);
+        assertEquals("锁忙轮 round 不得执行（预算耗尽弃轮，round 体从未拿到锁）",
+                1L, roundRan.getCount());
         assertEquals("锁忙轮 onRound 不得回调（LockBusySkippedException 内部消化，不外泄）",
                 0, callbacks.get());
         assertTrue("锁忙轮后轮询不得注销（跳过轮网格推进）", handle.isRunning());
@@ -506,6 +510,17 @@ public class SerialPollingSdkTest {
         assertTrue("释放锁失败", port.release(heldKey));
         assertTrue("锁释放后下一轮必须恢复采集", roundRan.await(AWAIT_MS, TimeUnit.MILLISECONDS));
         assertTrue("恢复轮须回调 (true, null)", successCallback.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+    }
+
+    /** 真弃轮记账事件等待（deadline 轮询：预算耗尽的记账发生在旁池线程，立即读数是竞态）。 */
+    private void awaitLockBusySkipCount(long expected) {
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_MS);
+        while (port.getLockBusySkipCount() < expected) {
+            if (System.nanoTime() > deadlineNanos) {
+                fail("弃轮记账未在 " + AWAIT_MS + "ms 内发生: expected>=" + expected
+                        + ", actual=" + port.getLockBusySkipCount());
+            }
+        }
     }
 
     // ==================== 超时：默认派生事务硬超时（SDK 级覆盖词汇零消费已删） ====================
@@ -613,7 +628,7 @@ public class SerialPollingSdkTest {
     // ==================== cecep 链式双事务：多段 thenCompose 一等公民 ====================
 
     /**
-     * cecep TRAMC500 形态（调研 07 §17：同周期两块读经 thenRun 串行避免 tryAcquire 互踩）：
+     * cecep TRAMC500 形态（调研 07 §17：同周期两块读经 thenRun 串行避免锁互踩）：
      * SDK 把多段链合并为单 round 单事务——段间经 {@code delay()}（interCommandDelayMs，
      * 收编本地 delay() 样板）留隙，单 Boolean 出口。两步构建：round 体无竞态引用 polling。
      */
@@ -872,7 +887,8 @@ public class SerialPollingSdkTest {
         when(source.acquire()).thenAnswer(inv -> port.acquire());
         when(source.acquire(anyLong(), any(TimeUnit.class))).thenAnswer(inv -> port.acquire(
                 inv.getArgument(0, Long.class), inv.getArgument(1, TimeUnit.class)));
-        when(source.tryAcquire()).thenAnswer(inv -> port.tryAcquire());
+        when(source.acquirePollingBounded(anyLong())).thenAnswer(inv -> port.acquirePollingBounded(
+                null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
         when(source.getPortName()).thenReturn(port.getPortName());
         when(source.getTimeout()).thenReturn(port.getTimeout());

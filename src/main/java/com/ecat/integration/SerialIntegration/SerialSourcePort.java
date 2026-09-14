@@ -4,19 +4,23 @@ import com.fazecast.jSerialComm.SerialPort;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import org.slf4j.MDC;
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 import com.ecat.core.CommTrace.CommTraceBuffer;
 import com.ecat.core.CommTrace.CommTraceTransport;
+import com.ecat.core.CommTrace.ResourceOwner;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -24,15 +28,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * It is shared by multiple SerialSource instances that connect to the same port.
  * Package-private — not exposed to external callers.
  *
- * <p><b>锁入口使用规则（SDK 调度纪律）</b>：本类的 acquire/tryAcquire 只应有
+ * <p><b>锁入口使用规则（SDK 调度纪律）</b>：本类的 acquire/acquirePollingBounded 只应有
  * {@link SerialTransactionStrategy} 的两个事务入口（及 serial-tcp-server 网关这类自管
  * 收发时序的框架型消费方）调用，集成设备代码不应直接取锁。两个入口是两种调度纪律而非冗余：
  * <ul>
  *   <li>命令/写事务 → {@code executeWithLambda}：阻塞排队等锁（waitQueue 有限等待）——
  *       命令的时效语义是「最终要执行」，等是正确的；</li>
- *   <li>周期轮询 → {@code executePolling}：tryAcquire 锁忙立即弃本轮（调度三原则
- *       「过期即弃」）——轮询数据过期即无价值，为等锁 park 只会把饥饿扩散到全系统
- *       （87 设备停摆事故的 E1/E2 形态）。</li>
+ *   <li>周期轮询 → {@code executePolling}：经 {@link #acquirePollingBounded(ResourceOwner, long)}
+ *       取锁——无竞争快路径直达，锁忙时 FIFO 有界等待移交 IO 旁池线程（20260913-073600
+ *       方案 c），预算耗尽才弃本轮（「过期即弃」保留在预算边界上）。此前「锁忙立即弃轮」
+ *       的零等待形态在 fixedDelay 相位锁定下使共享口输家分钟级零帧（modbus C2 实证，
+ *       serial 同构风险），已被本契约取代。</li>
  * </ul>
  * round/事务临界体内需要追加直发命令时，使用 SDK 注入的 source 直接 send（此时锁已持有，
  * 参照 gassensor PM3006SDevice 直发惯用法），勿再经事务入口二次取锁——同线程嵌套取锁是
@@ -55,6 +61,14 @@ public class SerialSourcePort {
      * 守卫判据 {@code Thread.currentThread() == lockHolderThread} 即同线程嵌套取锁。
      */
     private volatile Thread lockHolderThread;
+    /**
+     * 当前持锁事务的权威归属（io-resource-owner §4「当前住户」）：acquire/acquirePollingBounded
+     * 授予点经视图自动注入登记（{@code SerialSource.lockOwner()}），release 与幽灵锁收割两路径清除。
+     * TX（doSendWrite 持锁临界区内）与 RX（handleIncomingData 端口共享读线程，永无任务 MDC）
+     * 两捕获点同读此字段作 CommTrace 权威参数——多设备同口的帧归属判官=事务锁。
+     * null = 无 owner 注入（LEGACY 视图/无锁路径，归因回落 MDC/回填现状）。
+     */
+    private volatile ResourceOwner lockAcquireOwner;
     private final Queue<String> waitQueue = new LinkedList<>();
 
     /**
@@ -171,11 +185,27 @@ public class SerialSourcePort {
         return connectedSources;
     }
 
+    /**
+     * 消费方一步得源的原子挂靠（io-resource-owner §9-10 registerForDevice 库内侧）：
+     * 集成端解析（端口地图命中）与追加（connectedSources）之间设备可能恰好被摘——本方法
+     * 在 lifecycleLock 内复查退役门后挂靠，杜绝把消费方源挂到已拆除对象上的半死挂靠。
+     * retired = 设备已摘（本对象已除名），如实返回 null（未注册语义，不另开资源）。
+     */
+    SerialSource attachSourceForDevice(ResourceOwner owner) {
+        synchronized (lifecycleLock) {
+            if (retired) {
+                return null;
+            }
+            // SerialSource 构造内的 registerSource→openPort 会再入 lifecycleLock（可重入，安全）
+            return new SerialSource(this, owner);
+        }
+    }
+
     // ========== Lock management ==========
 
     /**
      * 残留写闸门（F-43 清洗①，bugs/bug-record-20260826-093000 Q1）：per-port 事务代数。
-     * acquire/tryAcquire 授予时递增 {@link #txGeneration} 并刷新 {@link #activeGeneration}；
+     * acquire/acquirePollingBounded 授予时递增 {@link #txGeneration} 并刷新 {@link #activeGeneration}；
      * 硬超时强拆时 {@link #markTransactionAborted()} 把 {@link #minLiveGeneration} 抬到
      * 当前代 + 1——被掐事务内尚未发出的 asyncSendData 提交（代数 < minLive）全部在写口拒绝，
      * 堵「强拆后 delay 定时器到点、剩余命令补发到（可能已重开的）端口与新事务交错」的复活路径
@@ -192,7 +222,7 @@ public class SerialSourcePort {
                 serialInfo.portName, txGeneration.get(), minLiveGeneration);
     }
 
-    /** 授予新事务代数（acquire/tryAcquire 持锁临界区内调用）。 */
+    /** 授予新事务代数（acquire/acquirePollingBounded 持锁临界区内调用）。 */
     private void grantGeneration() {
         activeGeneration = txGeneration.incrementAndGet();
     }
@@ -220,7 +250,7 @@ public class SerialSourcePort {
      * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
      */
     String acquire() {
-        return acquire(DEFAULT_ACQUIRE_WAIT_SECONDS, TimeUnit.SECONDS);
+        return acquire(DEFAULT_ACQUIRE_WAIT_SECONDS, TimeUnit.SECONDS, null);
     }
 
     /**
@@ -231,6 +261,20 @@ public class SerialSourcePort {
      *         或唤醒后锁已被快速路径请求抢占（handed-off race 失败，按未取得总线重试）
      */
     String acquire(long timeout, TimeUnit unit) {
+        return acquire(timeout, unit, null);
+    }
+
+    /** 带权威归属的阻塞取锁（视图入口形态）：授予点登记 {@link #lockAcquireOwner}。 */
+    String acquire(ResourceOwner owner) {
+        return acquire(DEFAULT_ACQUIRE_WAIT_SECONDS, TimeUnit.SECONDS, owner);
+    }
+
+    /**
+     * 尝试获取锁，支持等待队列和超时，授予点登记持锁权威归属（io-resource-owner §4）。
+     * 两个授予点（快速路径 + 等待者队头接管）都登记；owner 为 null = 无注入（LEGACY 视图），
+     * 归因回落线程 MDC/回填现状。
+     */
+    String acquire(long timeout, TimeUnit unit, ResourceOwner owner) {
         String requestKey = generateRequestKey();
         lock.lock();
         try {
@@ -242,6 +286,7 @@ public class SerialSourcePort {
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
                 lockHolderThread = Thread.currentThread();
+                lockAcquireOwner = owner;
                 return requestKey;
             } else {
                 if (waitQueue.size() < maxWaiters) {
@@ -268,6 +313,7 @@ public class SerialSourcePort {
                             lockAcquireTime = System.currentTimeMillis();
                             lockAcquireThread = Thread.currentThread().getName();
                             lockHolderThread = Thread.currentThread();
+                            lockAcquireOwner = owner;
                             return requestKey;
                         }
                         // 队头不是自己（队列变更，skip），或锁已被快速路径抢占：返回 null 前必须摘除自身
@@ -291,57 +337,137 @@ public class SerialSourcePort {
         }
     }
 
-    /** 轮询 tryAcquire 锁忙放弃计数（E2/R3 记账：放弃必须可观测，禁静默）。 */
+    /** 轮询真弃轮计数（E2/R3 记账：有界等待预算耗尽才计，禁静默）。 */
     private final AtomicLong lockBusySkipCount = new AtomicLong();
-    /** 锁忙放弃日志限频时间戳（volatile：锁临界区内读写，ReentrantLock 保证可见性，此字段仅日志用）。 */
+    /** 锁忙放弃日志限频时间戳（锁临界区内读写，ReentrantLock 保证可见性，仅日志用）。 */
     private volatile long lastBusySkipLogAt;
     /** 锁忙放弃日志限频间隔：默认 60s 一条（饱和期 ~30 次/min 的放弃若不限频会刷爆日志）。 */
     static final long BUSY_SKIP_LOG_INTERVAL_MS = 60_000L;
 
-    /** 获取累计锁忙放弃次数（轮询 tryAcquire 因锁忙立即放弃的计数，运行时可观测用）。 */
+    /** 获取累计真弃轮次数（轮询有界等待预算耗尽的计数，运行时可观测用）。 */
     public long getLockBusySkipCount() {
         return lockBusySkipCount.get();
     }
 
+    /** 当前等待队列长度（观测面：契约测试以等待者入队为事件判据；锁内读一致快照）。 */
+    int getWaitingCount() {
+        lock.lock();
+        try {
+            return waitQueue.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /**
-     * 非阻塞获取锁（轮询专用，E2/R3 终态修复：调度三原则「过期即弃」）。
+     * 轮询锁获取契约（20260913-073600 修复，方案 c：轮询并入 FIFO 有界等待——与 modbus
+     * {@code ModbusSource.acquirePollingBounded} 同型）：无竞争快路径直达；锁忙时把 FIFO
+     * 有界等待移交 IO 旁池线程执行——调用线程（SDK 定时线程）零 park，轮询重新与写命令
+     * 同队同公平（此前「锁忙立即弃轮」的零等待形态在 fixedDelay 相位锁定下使共享口输家
+     * 分钟级零帧，是共享口饥饿的根因）。
      *
-     * <p>与 {@link #acquire(long, TimeUnit)} 的本质差异：锁忙时<b>不进 waitQueue、不 park
-     * 等待、不消费 signal</b>，立即返回 null——本周期放弃，下周期再试。由此：
-     * <ul>
-     *   <li>轮询 worker 永不为等锁 park（秒级阻塞事务不再钉死调度 worker，杜绝
-     *       6 worker × 87 设备互相排队的饱和震荡）；</li>
-     *   <li>waitQueue 名额与 signal 唤醒完全留给写命令等有限等待路径，不互相干扰。</li>
-     * </ul>
+     * <p>返回 CF 语义：完成值非 null=锁标识（等待授予发生在旁池线程，事务体随 CF 依赖链
+     * 在同一旁池线程执行，MDC 已恢复到提交时快照）；null=本周期真弃轮（预算耗尽/等待
+     * 队列满/旁池饱和拒绝），源侧记账。等到了锁的轮次不计入
+     * {@link #getLockBusySkipCount()}（观测不说谎）。
      *
-     * <p>锁忙放弃有记账：累计计数 {@link #getLockBusySkipCount()} + 限频 warn 日志（饱和期
-     * 可观测，禁静默）。幽灵锁收割检查与 {@link #acquire(long, TimeUnit)} 同入口复用。
+     * <p><b>同线程嵌套守卫的行为差异（如实声明，非缺陷）</b>：快路径在调用线程上执行，
+     * 守卫照常 fail-fast（round 临界体内经 executePolling 二次取锁立即抛）；锁忙分支的
+     * acquire 在旁池线程上执行，与任何持锁者天然异线程，守卫按线程判定自然不触发——
+     * 该形态的嵌套取锁退化为「队列内等外层释放」，由 acquire 超时/事务硬超时兜底，
+     * 不另设守卫补强。
      *
-     * @return 锁标识；锁忙时立即返回 null（本周期放弃）
+     * @param owner    取锁权威归属（视图入口注入；LEGACY 传 null）
+     * @param budgetMs 锁等待预算（毫秒，须 &gt; 0；SDK 侧按轮询周期 clamp）
+     * @return 锁标识 CF；null 完成=本周期弃轮
      */
-    String tryAcquire() {
+    CompletableFuture<String> acquirePollingBounded(ResourceOwner owner, long budgetMs) {
+        if (budgetMs <= 0) {
+            throw new IllegalArgumentException("acquirePollingBounded 要求 budgetMs > 0: " + budgetMs);
+        }
+        // 快路径：无竞争轮次零等待、零记账（与旧轮询契约的非阻塞授予段行为一致）
+        String fast = acquireUncontended(owner);
+        if (fast != null) {
+            return CompletableFuture.completedFuture(fast);
+        }
+        // 锁忙：等待移交 IO 旁池线程（定时线程零 park），预算内经 acquire 排队等队头交接。
+        // 走域池直接提交面而非 per-port 串行车道——车道 FIFO 单飞会被 park 的等待钉死同口
+        // 全部 IO，且后来的等待者无机会入锁等待队列（FIFO 公平被车道串行化破坏）。
+        // MDC 提交时捕获、旁池任务内恢复——完成点之后的依赖链（事务体→帧捕获）在旁池
+        // 线程上携带设备归属上下文，与快路径的定时线程形态归因一致。
+        Map<String, String> mdcContext = MDC.getCopyOfContextMap();
+        CompletableFuture<String> out = new CompletableFuture<>();
+        try {
+            SerialIoPool.domainExecutor().execute(() -> {
+                Map<String, String> previousMdc = MDC.getCopyOfContextMap();
+                try {
+                    if (mdcContext != null) {
+                        MDC.setContextMap(mdcContext);
+                    }
+                    String key = acquire(budgetMs, TimeUnit.MILLISECONDS, owner);
+                    if (key == null) {
+                        // 真弃轮才记账：预算耗尽/队列满（等到锁的轮次不计，观测不说谎）
+                        recordPollingSkip(budgetMs);
+                    }
+                    out.complete(key);
+                } finally {
+                    if (mdcContext != null) {
+                        if (previousMdc != null) {
+                            MDC.setContextMap(previousMdc);
+                        } else {
+                            MDC.clear();
+                        }
+                    }
+                }
+            });
+        } catch (RejectedExecutionException poolSaturated) {
+            // 旁池饱和（线程+有界队全满）或已停机：本周期弃轮，下一周期再试（源可自愈）
+            recordPollingSkip(budgetMs);
+            return CompletableFuture.completedFuture(null);
+        }
+        return out;
+    }
+
+    /**
+     * 无竞争快路径取锁（旧轮询契约的授予段）：锁忙返回 null，等待/弃轮由调用方
+     * 决定——是否真弃轮取决于等待结果，记账不在此处。
+     */
+    private String acquireUncontended(ResourceOwner owner) {
         String requestKey = generateRequestKey();
         lock.lock();
         try {
             reapGhostLockIfStale("acquire");
-            assertNoSameThreadNestedAcquire("tryAcquire");
+            assertNoSameThreadNestedAcquire("acquirePollingBounded");
             if (currentKey == null) {
                 currentKey = requestKey;
                 grantGeneration();
                 lockAcquireTime = System.currentTimeMillis();
                 lockAcquireThread = Thread.currentThread().getName();
                 lockHolderThread = Thread.currentThread();
+                lockAcquireOwner = owner;
                 return requestKey;
             }
-            long skips = lockBusySkipCount.incrementAndGet();
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 真弃轮记账（E2/R3 可观测性：放弃必须可计数，禁静默）：计数 + 限频 warn。
+     * 持锁方快照在锁内取，避免读到撕裂的 currentKey/时间戳组合。
+     */
+    private void recordPollingSkip(long budgetMs) {
+        long skips = lockBusySkipCount.incrementAndGet();
+        lock.lock();
+        try {
             long now = System.currentTimeMillis();
             if (now - lastBusySkipLogAt >= BUSY_SKIP_LOG_INTERVAL_MS) {
                 lastBusySkipLogAt = now;
-                log.warn("Polling tryAcquire skipped (lock busy): port={}, total skips={}, "
+                log.warn("Polling bounded-acquire budget exhausted ({}ms): port={}, total skips={}, "
                         + "lock currently held by: {} (acquired at {} by thread {})",
-                        getPortName(), skips, currentKey, lockAcquireTime, lockAcquireThread);
+                        budgetMs, getPortName(), skips, currentKey, lockAcquireTime, lockAcquireThread);
             }
-            return null;
         } finally {
             lock.unlock();
         }
@@ -360,6 +486,7 @@ public class SerialSourcePort {
                 lockAcquireTime = 0;
                 lockAcquireThread = null;
                 lockHolderThread = null;
+                lockAcquireOwner = null;
                 if (!waitQueue.isEmpty()) {
                     condition.signal();
                 }
@@ -370,6 +497,11 @@ public class SerialSourcePort {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** 当前持锁事务的权威归属（捕获点读；无锁/无注入为 null）。 */
+    ResourceOwner getLockAcquireOwner() {
+        return lockAcquireOwner;
     }
 
     /**
@@ -403,6 +535,7 @@ public class SerialSourcePort {
         lockAcquireTime = 0;
         lockAcquireThread = null;
         lockHolderThread = null;
+        lockAcquireOwner = null;
         if (!waitQueue.isEmpty()) {
             condition.signal();
         }
@@ -411,19 +544,22 @@ public class SerialSourcePort {
     /**
      * 同线程嵌套取锁 fail-fast 守卫（36 号设计·方案 D 形态 A）：vaisala 事故
      * （bug-record-20260829-082100）的 SDK 层加固。事务体经 SerialTransactionStrategy
-     * 的 executeHeld 在发起线程上同步执行——round/事务临界体内再经 executeWithLambda/
-     * executePolling 二次取锁时，等待者与持有者是同一线程（等待 key 与持有 key 同为
-     * 毫秒-线程ID），condition.await 永远等不到自己的 release：旧形态阻塞到超时返 null
-     * （live 实证同一线程静默空转 5h44m，Acquire timeout 日志一直在却无人醒），守卫改为
-     * 微秒级立即抛，错误直达根因。审计结论（36 号 §二）：20 仓全扫不存在合法的同线程
-     * 嵌套取锁，无人依赖可重入。
+     * 的 executeHeld 在发起线程上同步执行（轮询快路径在定时线程、写路径在业务线程）——
+     * round/事务临界体内再经 executeWithLambda/executePolling 二次取锁时，等待者与
+     * 持有者是同一线程（等待 key 与持有 key 同为毫秒-线程ID），condition.await 永远等
+     * 不到自己的 release：旧形态阻塞到超时返 null（live 实证同一线程静默空转 5h44m，
+     * Acquire timeout 日志一直在却无人醒），守卫改为微秒级立即抛，错误直达根因。
+     * 审计结论（36 号 §二）：20 仓全扫不存在合法的同线程嵌套取锁，无人依赖可重入。
+     * 20260913 方案 c 后：轮询等待授予路径的事务体在 IO 旁池线程执行（见
+     * {@link #acquirePollingBounded(ResourceOwner, long)} 的行为差异声明），该形态的
+     * 嵌套取锁按线程判定自然不触发守卫，由 acquire 超时/事务硬超时兜底。
      *
      * <p>位置约束：必须在 {@link #reapGhostLockIfStale} 之后——同线程的陈年幽灵锁应
      * 先收割后守卫，否则跨阈值的二次取锁会抛而非收割（破坏 acquireReapsGhostLock 契约）。
      *
      * <p>命中时锁状态原样不动：等锁者失败不影响既有持有关系（持锁者仍可正常 release）。
      *
-     * @param entry 入口标识（acquire / tryAcquire，诊断定位用）
+     * @param entry 入口标识（acquire / acquirePollingBounded 快路径，诊断定位用）
      */
     private void assertNoSameThreadNestedAcquire(String entry) {
         Thread holder = lockHolderThread;
@@ -740,8 +876,12 @@ public class SerialSourcePort {
      * @param length 数据长度
      */
     void handleIncomingData(byte[] data, int length) {
-        // 通讯帧捕获：读路径唯一入口（轮询与事件路径共用），独立数据面零 logback 开销
-        CommTraceBuffer.instance().rx(CommTraceTransport.SERIAL, serialInfo.portName, data, length, null, null);
+        // 通讯帧捕获：读路径唯一入口（轮询与事件路径共用），独立数据面零 logback 开销。
+        // 权威归属=当前持锁 owner（io-resource-owner §5.2 捕获点）：本方法在端口共享读线程
+        // 执行，永无任务 MDC——「同口至多一笔在飞」的锁纪律使 RX=持锁者应答结构性成立；
+        // 锁已清的迟到/unsolicited 字节 owner 为 null，落既有 30s 回填→null 如实。
+        CommTraceBuffer.instance().rx(CommTraceTransport.SERIAL, serialInfo.portName, data, length,
+                null, null, lockAcquireOwner);
         bufferLock.lock();
         try {
             // 直接追加字节数组，无需转换
@@ -895,9 +1035,13 @@ public class SerialSourcePort {
             // 把「发不出去」如实告诉调用方，而非伪装成功。
             int written = serialPort.writeBytes(bytes, bytes.length);
             lastSendTimeMs = System.currentTimeMillis();
-            // 通讯帧捕获：写路径唯一出口；写失败只累计通道错误计数（不产生 TX 帧，如实）
+            // 通讯帧捕获：写路径唯一出口；写失败只累计通道错误计数（不产生 TX 帧，如实）。
+            // 权威归属=当前持锁 owner（io-resource-owner §5.2 捕获点）：doSendWrite 在持锁
+            // 临界区内执行，直读 lockAcquireOwner 与锁状态同对象；锁外的手动写路径（如
+            // teledyne sendLine 存量形态）owner 为 null，回落线程 MDC/回填现状（§7 边界）。
             if (written >= 0) {
-                CommTraceBuffer.instance().tx(CommTraceTransport.SERIAL, serialInfo.portName, bytes, null);
+                CommTraceBuffer.instance().tx(CommTraceTransport.SERIAL, serialInfo.portName, bytes,
+                        null, lockAcquireOwner);
             } else {
                 CommTraceBuffer.instance().error(CommTraceTransport.SERIAL, serialInfo.portName);
             }

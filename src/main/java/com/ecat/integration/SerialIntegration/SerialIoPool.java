@@ -96,6 +96,19 @@ public final class SerialIoPool {
     }
 
     /**
+     * 域池直接提交面（绕过 per-port 串行视图，20260913-073600 方案 c）：供「轮询锁忙
+     * 有界等待」这类需要独立占线程 park 的任务卸载——<b>不得</b>走
+     * {@link #executorFor(String)} 的口内串行车道：车道是 FIFO 单飞，等待任务在其上
+     * park 会钉死同口全部 IO（发帧/读/finalize 排在等待之后），且后来的等待者没机会
+     * 入锁等待队列（FIFO 公平被车道串行化破坏）。与 per-port 视图同一底层池、同一
+     * 饱和/停机语义（饱和抛 REE=调用方按弃轮记账，停机抛 REE 终态拒绝）。包内可见：
+     * 消费面是 {@code SerialSourcePort.acquirePollingBounded}（MDC 由其任务体内自带）。
+     */
+    static Executor domainExecutor() {
+        return drainTarget();
+    }
+
+    /**
      * 停机钩子（幂等、终端态）：serial 集成 onRelease 调用。shutdownNow 中断在飞
      * 阻塞 IO（jSerialComm 阻塞点随集成释放整体拆除），此后新提交抛 REE。
      */

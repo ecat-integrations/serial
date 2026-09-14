@@ -65,6 +65,8 @@ public class SerialPollingDomainChainTest {
         SerialTimeoutScheduler.unbind();
         timeoutEnforcer.shutdownNow();
         timers.close();
+        // 锁忙轮经 acquirePollingBounded 消费 SerialIoPool 旁池（真实域池）：测试间复位防泄漏
+        SerialIoPool.resetForTest();
     }
 
     private SerialPolling ready() {
@@ -80,7 +82,8 @@ public class SerialPollingDomainChainTest {
         when(source.acquire()).thenAnswer(inv -> port.acquire());
         when(source.acquire(anyLong(), any(TimeUnit.class))).thenAnswer(inv -> port.acquire(
                 inv.getArgument(0, Long.class), inv.getArgument(1, TimeUnit.class)));
-        when(source.tryAcquire()).thenAnswer(inv -> port.tryAcquire());
+        when(source.acquirePollingBounded(anyLong())).thenAnswer(inv -> port.acquirePollingBounded(
+                null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
         when(source.getPortName()).thenReturn(port.getPortName());
         when(source.getTimeout()).thenReturn(port.getTimeout());
@@ -165,8 +168,9 @@ public class SerialPollingDomainChainTest {
     public void lockBusyRoundSettlesNormallyAndRearms() throws Exception {
         SerialSourcePort port = new SerialSourcePort(new SerialInfo("DOMAIN-BUSY-PORT", 9600, 8, 1, 0), 1, null);
         // 持锁者异线程（36 号守卫后「锁忙」用例的标准前置）：fake 缝 fire(0) 在测试线程执行
-        // 轮事务——若测试线程自持锁，tryAcquire 即同线程嵌套取锁（守卫 fail-fast 抛，本用例
-        // 变异常轮而非锁忙轮）。辅助线程取得后直接退出（不 release，锁状态与持锁线程存活无关）。
+        // 轮事务发起段——若测试线程自持锁，acquirePollingBounded 快路径即同线程嵌套取锁
+        // （守卫 fail-fast 抛，本用例变异常轮而非锁忙轮）。辅助线程取得后直接退出（不
+        // release，锁状态与持锁线程存活无关）。
         final String[] held = new String[1];
         final CountDownLatch holderDone = new CountDownLatch(1);
         Thread holder = new Thread(() -> {
@@ -185,13 +189,39 @@ public class SerialPollingDomainChainTest {
                 .every(PERIOD_MS, TimeUnit.MILLISECONDS)
                 .withNanoClock(nanoClock::get);
         PollingHandle handle = polling.start();
-        timers.fire(0);   // 锁忙轮：tryAcquire 即弃 → CF 瞬时异常完成 → SDK 内化正常结算
+        timers.fire(0);   // 锁忙轮发起：旁池有界等待预算（period÷4 clamp=250ms）耗尽 → 真弃轮
 
+        // 事件已发生才断言（deadline 轮询，无 sleep 猜测）：预算耗尽记账与结算重排都在
+        // 旁池/结算链上异步发生，fire(0) 返回后立即读数是竞态
+        awaitSkipAccounted(port, 1);
+        awaitShots(2);
         assertEquals("锁忙轮结算后必须重排（网格不变，永不注销）", 2, timers.shots.size());
         assertEquals("锁忙轮按正常结算重排（fixedDelay=结算点+period）", PERIOD_MS,
                 timers.shots.get(1).delayMillis);
         assertTrue("锁忙轮不得注销链", handle.isRunning());
         port.release(held[0]);
+    }
+
+    /** 真弃轮记账事件等待（deadline 轮询：预算耗尽的记账发生在旁池线程，立即读数是竞态）。 */
+    private static void awaitSkipAccounted(SerialSourcePort port, long expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (port.getLockBusySkipCount() < expected) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("弃轮记账未在 5s 内发生: expected>=" + expected
+                        + ", actual=" + port.getLockBusySkipCount());
+            }
+        }
+    }
+
+    /** 重排提交事件等待（deadline 轮询：锁忙轮结算与重排在旁池结算链上异步发生）。 */
+    private void awaitShots(int expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (timers.shots.size() < expected) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("重排未在 5s 内提交: expected>=" + expected
+                        + ", actual=" + timers.shots.size());
+            }
+        }
     }
 
     @Test

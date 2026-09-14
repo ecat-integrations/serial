@@ -18,8 +18,9 @@ import com.ecat.core.Task.runner.PeriodicRunner;
  * {@link SerialPolling} 的轮体与 {@link SerialPollSchedule} 网格策略里，对定时器的
  * 全部需求收敛为一种原语——「MDC 包装的到点单发」（core PeriodicRunner 实现）。本类
  * 持有唯一默认池（daemon、命名 {@code ecat-serial-sched-N}），池尺寸按 serial 域现实
- * 负载定 2：域内百口量级（live 观测 ~161 口）轮询的发起段都是 µs 级提交（tryAcquire +
- * 事务 CF 接线，真实串口 IO 走 {@link SerialIoPool}），单发消费者还有事务硬超时执法
+ * 负载定 2：域内百口量级（live 观测 ~161 口）轮询的发起段都是 µs 级提交（锁忙有界
+ * 等待已移交 {@link SerialIoPool} 旁池线程 + 事务 CF 接线，真实串口 IO 同走
+ * {@link SerialIoPool}），单发消费者还有事务硬超时执法
  * /响应超时标记/命令间 {@code delay()} 补全（同为 µs 级）——单条 STPE 线程即可承载
  * 每秒数千次 µs 单发；取 2 条吸收多口相位重合的到拍尖峰，且单条被慢提交钉死时
  * 超时执法/周期链仍在另一条上准点发射（超时执法被钉死=硬超时失效=B5 幽灵锁回归，

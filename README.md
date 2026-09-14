@@ -40,7 +40,7 @@ ByteResponseHandlerStrategy<byte[]> strategy = new ByteResponseHandlerStrategy<>
 
 ## SDK 快速上手（主动轮询 SerialPolling，L3 设备仓标准入口）
 
-设备仓的周期采集**只走本 SDK**（L2 传输 SDK 层轮询模式，17 号 v2.1 §2.1）——调度注册/源锁/锁忙跳过/事务级硬超时/异常韧性（永不注销）/统一日志全部内置（连续失败→恢复有断连状态转移行：首败 WARN/恢复 INFO 去重），设备仓的执行词汇只剩 round 函数（每轮读什么）+ 属性灌入：
+设备仓的周期采集**只走本 SDK**（L2 传输 SDK 层轮询模式，17 号 v2.1 §2.1）——调度注册/源锁（锁忙有界等待，预算耗尽才弃轮）/事务级硬超时/异常韧性（永不注销）/统一日志全部内置（连续失败→恢复有断连状态转移行：首败 WARN/恢复 INFO 去重），设备仓的执行词汇只剩 round 函数（每轮读什么）+ 属性灌入：
 
 ```java
 // 迁移终态（zhengxin 14 行样板 → 3 行；两步构建示例含段间节拍）
@@ -170,12 +170,12 @@ private void handleIncomingData(byte[] data, int length) {
 
 ## 事务入口三选一（命令 / 轮询 / round 内直发）
 
-集成设备代码**不应直接调用 `SerialSource` 的 acquire/tryAcquire 取锁**——那是 SDK 事务入口（及自管收发时序的框架型消费方，如 serial-tcp-server 网关）的专用面。按事务的时效语义选入口，两个事务入口是两种调度纪律而非冗余：
+集成设备代码**不应直接调用 `SerialSource` 的 acquire/acquirePollingBounded 取锁**——那是 SDK 事务入口（及自管收发时序的框架型消费方，如 serial-tcp-server 网关）的专用面。按事务的时效语义选入口，两个事务入口是两种调度纪律而非冗余：
 
 | 事务形态 | 入口 | 锁语义 |
 |---|---|---|
 | 命令/写事务 | `SerialTransactionStrategy.executeWithLambda(source, lambda)` | 阻塞排队等锁（waitQueue 有限等待）——命令的时效语义是「最终要执行」，等是正确的 |
-| 周期轮询 | `SerialTransactionStrategy.executePolling(source, lambda)` | `tryAcquire` 锁忙**立即弃本轮**（调度三原则「过期即弃」）——轮询数据过期即无价值，为等锁 park 只会把饥饿扩散到全系统；放弃有记账（`SerialSource.getLockBusySkipCount()` + 限频 warn，禁静默） |
+| 周期轮询 | `SerialTransactionStrategy.executePolling(source, lambda)` | 经 `acquirePollingBounded` 取锁（2026-09-13 方案 c）：无竞争快路径直达；锁忙时 FIFO 有界等待移交 IO 旁池线程（SDK 按周期 clamp 预算 period÷4 ∈ [200,500]ms，调用线程零 park），预算内等到锁则本轮照常完成——轮询与写命令同队同公平；预算耗尽才弃本轮（「过期即弃」保留在预算边界上），弃轮有记账（`SerialSource.getLockBusySkipCount()` + 限频 warn，等到锁的轮次不计） |
 | round/事务临界体内追加命令 | SDK 注入的 `source` 直接 `asyncSendData(...)` **直发** | 此时锁已持有，**禁再经 executeWithLambda/executePolling 二次取锁** |
 
 - 两入口取锁后共享同一执行链：事务级硬超时（默认由设备配置串口超时 ×10 派生，长事务/标定流程显式传 `transactionTimeoutMs`）+ 完成即 release + 超时强拆端口。返回 future 须异步消费（`whenComplete`），**禁在周期调度任务内 `.get()`/`.join()` 阻塞**——契约细则见 `SerialTransactionStrategy` 类 Javadoc。
@@ -248,11 +248,11 @@ dependencies:
     version: ^3.1.0
 ```
 
-源获取（serialSource 从哪来）：经 serial 集成注册串口，同口多调用方共享底层 `SerialSourcePort`（`SerialIntegration.java:86`）：
+源获取（serialSource 从哪来）：经 serial 集成注册串口（host 收口——设备/集成类传 `this`，归属与销毁随宿主生命周期自动绑定），同口多调用方共享底层 `SerialSourcePort`（`SerialIntegration.java`）：
 
 ```java
 SerialIntegration serial = (SerialIntegration) integrationRegistry.getIntegration("integration-serial");
-SerialSource serialSource = serial.register(serialInfo, "my-integration");
+SerialSource serialSource = serial.register(serialInfo, this);
 ```
 
 ## 更新日志
