@@ -37,6 +37,20 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <systemPropertyVariables>
+            <!-- 测试 JVM 显式声明测试模式：构造期环境判定只认显式信号（栈扫描已废除，
+                 2026-09-18 saimosen v2 运行期重加全离线事故收口）。此前直构真实
+                 SerialSourcePort 的测试与 MultiPortConcurrency 真口功能测试靠栈扫描
+                 命中 junit 进测试模式，改由此属性承接，测试代码零改动；生产 JVM
+                 永不设置此属性 -->
+            <test.mode>true</test.mode>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-assembly-plugin</artifactId>
         <version>3.6.0</version>
         <configuration>

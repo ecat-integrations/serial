@@ -21,6 +21,7 @@ import com.ecat.core.ConfigFlow.ConfigSchemaProvider;
 import com.ecat.core.ConfigFlow.ConfigItem.DynamicEnumConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.NumericConfigItem;
+import com.ecat.core.Utils.platform.PlatformInfo;
 import com.ecat.integration.SerialIntegration.Const;
 import com.fazecast.jSerialComm.SerialPort;
 
@@ -469,10 +470,9 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
     }
 
     /**
-     * Windows 平台判定（真实默认实现）。
+     * Windows 平台判定（真实默认实现，走 ecat-core PlatformInfo 统一平台检测）。
      */
     private static boolean detectWindows() {
-        String osName = System.getProperty("os.name");
-        return osName != null && osName.toLowerCase().contains("win");
+        return PlatformInfo.getInstance().isWindows();
     }
 }

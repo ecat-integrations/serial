@@ -203,6 +203,36 @@ RECONFIGURE 后设备重 load 时，新 comm 设置经 `SerialSourcePort.applyRe
 - [二进制处理示例](src/test/java/com/ecat/integration/SerialIntegration/bytes/ByteCommunicationExample.java)
 - [性能测试](src/test/java/com/ecat/integration/SerialIntegration/bytes/MultiPortConcurrencyByteTest.java)
 
+## 测试编写规范（应答策略双读法与 test.mode 声明）
+
+### 双读法机制与模式选择
+
+应答策略（`ByteResponseHandlerStrategy` / `DefaultResponseHandlerStrategy`）是双读法：**生产=中断驱动监听**（源上挂监听器，应答字节到达即触发），**测试=legacy 轮询**（`asyncReadDataBytes` 轮询读 + 帧判完整回调）。模式在策略构造期一次性定型，**只能由显式信号选择**，按优先级：
+
+1. 源对象 `isTestMode()`（`SerialSourcePort` 构造时读取的显式信号）；
+2. 源对象类名含 `$`（字节码动态生成的代理形态）；
+3. JVM 系统属性 `test.mode=true` 或 `junit`（surefire 为测试 JVM 注入）；
+4. 以上皆无 → 生产（中断）模式。
+
+### 为什么从栈扫描改成显式声明
+
+旧实现在构造期扫描当前线程栈、以栈上是否出现测试框架类名猜「测试环境」——Spring MVC 以反射分发 REST，栈恒含 `sun.reflect` 帧，运行期经 ASM/ADM/REST 创建的设备全部被误判成测试环境、静默降级 legacy 轮询，酿成 2026-09-18 saimosen v2 运行期重加全离线事故（删-加必触发、重启才恢复）。栈形态不属于任何一方的声明，猜测已废除，见 `EnvDetectionExplicitSignalOnlyTest` 回归锁。
+
+### 正确姿势
+
+- **本仓（serial）测试**：本仓 pom 的 surefire 已声明 `test.mode=true`，直构真实 `SerialSourcePort` 的测试与真口功能测试据此进测试模式，测试代码零感知。
+- **消费仓测试（mock 串口源、依赖 legacy 读路径的）**：必须在**消费仓自己的 pom** surefire `systemPropertyVariables` 里声明 `test.mode=true`（与本仓同款）。已落地先例：saimosen / sailhero / semeatech / wmade / tjtongyangkeji / thermofisher（2026-09-18 全量 reactor 6 仓 25 用例因缺此声明翻车后补齐）。
+
+### 为什么 mock 抓不到
+
+消费仓测试普遍 `mock(SerialSource.class)`——mockito-inline 是**直接改写原类字节码**的插桩方式，mock 对象的 `getClass().getName()` 就是原类名，不含 `Mock`/`$` 任何标记，类名信号天然不命中。mock 源若再无 `test.mode` 属性声明，策略即落生产中断模式：mock 上挂监听器是 no-op、stub 的 `asyncReadDataBytes` 永远无人读，测试以 NPE/超时/UnnecessaryStubbing 的形态翻车。
+
+### 禁止事项
+
+- 不得再引入构造期栈扫描、类名子串猜测等「猜环境」手段；
+- 生产 JVM 永不设置 `test.mode`（该属性只应出现在 surefire `systemPropertyVariables`）；
+- 新消费仓遇到同款红灯（mock 派测试 NPE/超时/UnnecessaryStubbing）时，处置路径是**在其 pom 加 test.mode 声明**——不是改测试、更不是改生产代码去感知测试框架。
+
 ## 本地测试环境（socat 虚拟串口对）
 
 本仓测试例（含上方「使用例子」两例）无需真实串口硬件，用 socat 建一对虚拟串口（V0↔V1）即可端到端验证：

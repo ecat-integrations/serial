@@ -11,6 +11,7 @@ import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
 import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.Const;
+import com.ecat.integration.SerialIntegration.SerialTestSignals;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.PooledSerialDataListener;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListenerPool;
@@ -313,24 +314,18 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
      * 检测是否需要使用传统轮询模式
      * 主要用于测试环境检测
      *
+     * <p>只认显式信号（源对象测试模式标记 / mock-代理类名 / test.mode 与 junit 系统
+     * 属性），不扫构造线程栈：ruoyi Spring MVC 以 Method.invoke 反射分发 REST，栈恒含
+     * sun.reflect 帧——栈扫描会把运行期（ASM/ADM/env 页面或 REST）创建的设备策略误判成
+     * 测试环境静默降级 legacy（2026-09-18 saimosen v2 运行期重加全离线事故第一层根因，
+     * 与字节族策略复制同源，须同修）。测试如何正确声明模式（含消费仓 mock 源必须在
+     * pom surefire 声明 test.mode 的原因）见本仓 README「测试编写规范（应答策略双读法
+     * 与 test.mode 声明）」。
+     *
      * @return true 如果需要使用轮询模式
      */
     private boolean detectLegacyModeRequired() {
-        // 1. 检查堆栈中是否包含测试框架
-        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
-        for (StackTraceElement element : stackTrace) {
-            String className = element.getClassName();
-            if (className.contains("junit") ||
-                className.contains("mockito") ||
-                className.contains("test") ||
-                className.contains("hamcrest") ||
-                className.contains("org.gradle") ||
-                className.contains("sun.reflect")) {
-                return true;
-            }
-        }
-
-        // 2. 检查 SerialSource 是否为 Mock 或测试模式
+        // 1. 检查 SerialSource 是否为 Mock 或测试模式
         if (serialSource != null) {
             // 检查 SerialSource 是否标记为测试模式
             if (serialSource.isTestMode()) {
@@ -346,19 +341,17 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
             }
         }
 
-        // 3. 检查系统属性
-        String testMode = System.getProperty("test.mode", "false");
-        if (Boolean.parseBoolean(testMode)) {
+        // 2. 检查系统属性（唯一读取点 SerialTestSignals）
+        if (SerialTestSignals.testModeDeclared()) {
             return true;
         }
 
-        // 4. 检查 JUnit 相关的系统属性
-        String junit = System.getProperty("junit", "");
-        if (!junit.isEmpty()) {
+        // 3. 检查 JUnit 相关的系统属性
+        if (SerialTestSignals.junitPropertyPresent()) {
             return true;
         }
 
-        // 5. 默认使用中断模式（生产环境）
+        // 4. 默认使用中断模式（生产环境）
         return false;
     }
 
