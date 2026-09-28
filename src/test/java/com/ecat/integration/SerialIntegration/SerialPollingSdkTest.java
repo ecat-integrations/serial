@@ -63,7 +63,6 @@ public class SerialPollingSdkTest {
     /** initialDelay 负向观察窗：> 2 个周期（未生效时 ~1 tick 即发射）且 < INITIAL_DELAY_MS。 */
     private static final long DELAY_NEGATIVE_WINDOW_MS = 350L;
     private static final long AWAIT_MS = 5_000L;
-    private static final long INTER_COMMAND_DELAY_MS = 200L;
 
     private java.util.concurrent.ScheduledExecutorService timers;
     private RemovalHost device;
@@ -625,57 +624,6 @@ public class SerialPollingSdkTest {
         assertNull("CF<Void> 的 null 结果须按成功回调（result=null）", secondResult.get());
     }
 
-    // ==================== cecep 链式双事务：多段 thenCompose 一等公民 ====================
-
-    /**
-     * cecep TRAMC500 形态（调研 07 §17：同周期两块读经 thenRun 串行避免锁互踩）：
-     * SDK 把多段链合并为单 round 单事务——段间经 {@code delay()}（interCommandDelayMs，
-     * 收编本地 delay() 样板）留隙，单 Boolean 出口。两步构建：round 体无竞态引用 polling。
-     */
-    @Test
-    public void cecepStyleMultiSegmentChainWithInterCommandDelayIsFirstClass() throws Exception {
-        final SerialPolling polling = SerialPolling.on(device, source)
-                .every(PERIOD_MS, TimeUnit.MILLISECONDS)
-                .interCommandDelayMs(INTER_COMMAND_DELAY_MS);
-
-        CountDownLatch done = new CountDownLatch(1);
-        CountDownLatch segmentOne = new CountDownLatch(1);
-        CountDownLatch segmentTwo = new CountDownLatch(1);
-        final long[] segmentOneEndNanos = new long[1];
-        final long[] segmentTwoStartNanos = new long[1];
-        AtomicReference<Boolean> roundResult = new AtomicReference<>();
-        AtomicReference<Throwable> roundError = new AtomicReference<>();
-
-        handle = polling
-                .round(src -> CompletableFuture.<Boolean>completedFuture(true)
-                        .thenApply(v -> {
-                            segmentOneEndNanos[0] = System.nanoTime();
-                            segmentOne.countDown();
-                            return v;
-                        })
-                        .thenCompose(v -> polling.delay())
-                        .thenCompose(v -> {
-                            segmentTwoStartNanos[0] = System.nanoTime();
-                            segmentTwo.countDown();
-                            return CompletableFuture.completedFuture(true);
-                        }))
-                .onRound((result, ex) -> {
-                    roundResult.set(result);
-                    roundError.set(ex);
-                    done.countDown();
-                })
-                .start();
-
-        assertTrue("链式 round 必须完成", done.await(AWAIT_MS, TimeUnit.MILLISECONDS));
-        assertNull("链式 round 不得异常: " + roundError.get(), roundError.get());
-        assertEquals("单 Boolean 出口（多段链合一 round）", Boolean.TRUE, roundResult.get());
-        long gapMillis = TimeUnit.NANOSECONDS.toMillis(
-                segmentTwoStartNanos[0] - segmentOneEndNanos[0]);
-        assertTrue("两段之间必须实际经过 interCommandDelay（实测 " + gapMillis + "ms ≥ "
-                        + (INTER_COMMAND_DELAY_MS - 50) + "ms）",
-                gapMillis >= INTER_COMMAND_DELAY_MS - 50);
-    }
-
     // ==================== 111200 回归：轮询任务超时后下一轮正常执行 ====================
 
     /**
@@ -805,18 +753,6 @@ public class SerialPollingSdkTest {
     }
 
     // ==================== 构建契约（严格模式） ====================
-
-    /** delay() 未配置 interCommandDelayMs 是编程错误：显式拒绝（非静默零延迟）。 */
-    @Test
-    public void delayWithoutInterCommandDelayConfigIsRejected() {
-        SerialPolling polling = SerialPolling.on(device, source);
-        try {
-            polling.delay();
-            fail("未配置 interCommandDelayMs 时 delay() 必须显式拒绝");
-        } catch (IllegalStateException expected) {
-            // 契约：显式失败而非静默零延迟
-        }
-    }
 
     /** 缺 round / 缺 every / 重复 start（同实例）均为构建契约违背：显式拒绝。 */
     @Test

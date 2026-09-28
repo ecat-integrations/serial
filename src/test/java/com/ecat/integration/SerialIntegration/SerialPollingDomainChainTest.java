@@ -31,7 +31,7 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
  *   <li>fixedDelay：完成点+period 重排（在飞不提前发射，事务完成点起算）；</li>
  *   <li>fixedRate：名义网格推进、在飞跨拍跳过（不滞后补跑）；</li>
  *   <li>过期即弃：到拍滞后超一个整周期 → 本轮丢弃（skips=lag/period+1 推进锚点）；</li>
- *   <li>delay()：命令间留隙经域定时器单发（SdkSchedulerResolver 引擎路径退役）；</li>
+ *   <li>delay(ms, unit)：命令间留隙经域定时器单发（SdkSchedulerResolver 引擎路径退役）；</li>
  *   <li>锁忙轮/异常轮任何终态都重排（永不注销）。</li>
  * </ul>
  */
@@ -239,29 +239,22 @@ public class SerialPollingDomainChainTest {
         assertEquals(PERIOD_MS, timers.shots.get(1).delayMillis);
     }
 
-    // ==================== delay()：域定时器单发 ====================
+    // ==================== delay(ms, unit)：域定时器单发 ====================
 
     @Test
     public void delayRoutesThroughDomainTimers() {
         SerialPolling polling = SerialPolling.on(action -> { }, source)
                 .every(PERIOD_MS, TimeUnit.MILLISECONDS)
-                .interCommandDelayMs(200L)
                 .withNanoClock(nanoClock::get);
 
-        CompletableFuture<Void> delayed = polling.delay();
-        assertEquals("no-arg delay() 经域定时器单发（interCommandDelayMs 配置值）", 1, timers.shots.size());
-        assertEquals(200L, timers.lastShot().delayMillis);
-        assertFalse(delayed.isDone());
+        // 公有糖 delay(ms, unit)：一次性延迟收编入口，走域定时器（MDC 包装单发）
+        CompletableFuture<Void> sugared = polling.delay(50L, TimeUnit.MILLISECONDS);
+        assertEquals(1, timers.shots.size());
+        assertEquals(50L, timers.lastShot().delayMillis);
+        assertFalse("到点前 delay future 不得完成", sugared.isDone());
 
         timers.fire(0);
-        assertTrue("到点后 delay future 完成", delayed.isDone());
-
-        // 公有糖 delay(ms)：一次性延迟收编入口，同样走域定时器
-        CompletableFuture<Void> sugared = polling.delay(50L, TimeUnit.MILLISECONDS);
-        assertEquals(2, timers.shots.size());
-        assertEquals(50L, timers.lastShot().delayMillis);
-        timers.fire(1);
-        assertTrue(sugared.isDone());
+        assertTrue("到点后 delay future 完成", sugared.isDone());
     }
 
     // ==================== cancel：撤销待发拍 ====================

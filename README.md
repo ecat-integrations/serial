@@ -50,7 +50,8 @@ this.polling = SerialPolling.on(this, serialSource)                     // this=
         .onRound((ok, ex) -> absorbOutcome(ok, ex))                     // 可选：轮级观测回调
         .start();                                                       // 域自持定时；handle::cancel 已注册 onRemove
 
-// 轮内命令间节拍（收编各仓本地 delay() 样板）：先 .interCommandDelayMs(300) 再链内 polling.delay()
+// 轮内命令间节拍（收编各仓本地 delay 样板）：round 体内不得留隙，多命令轮改走
+// roundChain().held(...).gap(300)...end()——段间 gap 留隙在源锁临界区外
 ```
 
 - **round 契约**：`Function<SerialSource, ? extends CompletableFuture<?>>`（通配，容纳 `CF<Void>`）；Boolean false=业务失败（统一 warn），异常=传输错误（统一 error，轮询永不注销）；锁忙（LockBusySkippedException）SDK 内部消化不外泄。

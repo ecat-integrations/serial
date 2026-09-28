@@ -66,9 +66,9 @@ import com.ecat.core.Utils.Mdc.DeviceMdcContext;
  * 托管 sweep 与 {@link PollingHandle#cancel()} 幂等并存。
  *
  * <p><b>round 适用边界（避坑）</b>：round() 只承载「一次轮询、过程中无等待、无分段
- * 交互」的单段事务——体内零 delay 的多段命令链（{@code thenCompose} 串联多笔 send-read）
+ * 交互」的单段事务——体内零留隙的多段命令链（{@code thenCompose} 串联多笔 send-read）
  * 是 round 内一等公民。命令间/块间需要等待（设备性能节拍）时<b>必须</b>改用
- * {@link #roundChain()}：round 体内的 {@link #delay()} / {@link #delay(long, TimeUnit)}
+ * {@link #roundChain()}：round 体内的任何留隙（含 {@link #delay(long, TimeUnit)}）
  * 发生在源锁临界区内，整轮持锁时长=各笔 IO+等待总和，会挤爆写命令的有界取锁预算
  * （实测满载链路下写命令秒级超时、整条校准流程失败）。roundChain 每段独立事务，
  * 留隙在源锁临界区之外，写者可在留隙窗取锁。
@@ -100,7 +100,6 @@ public final class SerialPolling {
     private long initialDelayMs;
     /** true = 名义网格 FixedRate 语义（到拍上轮未完成的拍跳过）；默认 fixedDelay 完成点语义。 */
     private boolean fixedRate;
-    private Long interCommandDelayMs;
     private BiConsumer<Boolean, Throwable> roundCallback;
     /** 纳米钟（网格锚点用；默认系统单调钟，测试注入假钟确定性驱动，非消费方 API）。 */
     private LongSupplier nanoClock = System::nanoTime;
@@ -143,8 +142,8 @@ public final class SerialPolling {
      * 即消。
      *
      * <p>适用边界（避坑）：只承载「一次轮询、过程中无等待、无分段交互」的单段事务——
-     * 体内不得出现 {@link #delay()} / {@link #delay(long, TimeUnit)} 留隙（delay 发生在
-     * 源锁临界区内，整轮持锁=各笔 IO+等待总和，挤爆写命令的有界取锁预算）。命令间/
+     * 体内不得留隙（含 {@link #delay(long, TimeUnit)}：留隙发生在源锁临界区内，
+     * 整轮持锁=各笔 IO+等待总和，挤爆写命令的有界取锁预算）。命令间/
      * 块间需等待或节拍交互的多段轮必须改用 {@link #roundChain()}（每段独立事务、
      * 留隙在锁外）。
      *
@@ -165,7 +164,7 @@ public final class SerialPolling {
      * 声明多段轮（与 round() 互斥，二选一）：每段 {@link RoundChain#held} 是一个独立
      * executePolling 事务（独立预算取锁、独立硬超时、完成即释放），相邻段之间
      * {@link RoundChain#gap} 留隙在源锁临界区之外——设备性能要求的命令间节拍不再变成
-     * 持锁时长（单事务 round 形态下体内 delay 留隙把锁持有到轮末，挤爆写命令的有界
+     * 持锁时长（单事务 round 形态下体内留隙把锁持有到轮末，挤爆写命令的有界
      * 等待预算）。段体结果契约与 round() 一致（显式 FALSE=业务失败，其余=成功）。
      */
     public RoundChain roundChain() {
@@ -295,25 +294,6 @@ public final class SerialPolling {
     }
 
     /**
-     * 命令间延迟配置（配合 {@link #delay()} 使用）：收编 sailhero/saimosen
-     * 共 9 文件的本地 {@code delay()} 助手样板（轮内多命令间留隙以适应设备性能）。
-     *
-     * <p><b>避坑</b>：round 体内经 {@link #delay()} 留隙发生在源锁临界区内，整轮持锁=
-     * 各笔 IO+等待总和，挤爆写命令的有界取锁预算——命令间需要节拍的多段轮必须改用
-     * {@link #roundChain()} 的 {@code gap(ms)}（留隙在锁外）。本配置与 {@link #delay()}
-     * 是遗留词汇，随使用它的设备仓迁移 roundChain 后退场，新代码勿再引入。
-     *
-     * @param ms 命令间延迟（毫秒）；0 = 立即完成（显式声明无延迟）
-     */
-    public SerialPolling interCommandDelayMs(long ms) {
-        if (ms < 0) {
-            throw new IllegalArgumentException("interCommandDelayMs 须 >= 0, got: " + ms);
-        }
-        this.interCommandDelayMs = ms;
-        return this;
-    }
-
-    /**
      * 轮次完成回调（替代各仓 thenAccept/exceptionally 样板）。正常完成收
      * {@code (roundResult, null)}（roundResult 语义见类 Javadoc：Boolean 结果或 null）；
      * 传输错误收 {@code (null, ex)}。<b>锁忙跳过不回调</b>（round 未执行，
@@ -341,37 +321,13 @@ public final class SerialPolling {
     }
 
     /**
-     * 命令间延迟单发（须先经 {@link #interCommandDelayMs(long)} 配置）：经域定时器
-     * {@link SerialSdkTimers} 的 MDC 包装单发完成 CF。设备侧两步构建（先建 builder
-     * 再挂 round/start）保证 round 体可无竞态引用本方法。
-     *
-     * <p><b>避坑：不得在 round() 体内以 {@code thenCompose(v -> polling.delay())} 插入
-     * 命令间/块间留隙</b>——delay 发生在源锁临界区内，整轮持锁=各笔 IO+等待总和，
-     * 挤爆写命令的有界取锁预算（实测满载链路下写命令秒级超时）。命令间需等待的多段轮
-     * 必须改用 {@link #roundChain()} 的 {@code gap(ms)}（留隙在锁外，写者可在留隙窗
-     * 取锁）。本方法与 {@link #interCommandDelayMs(long)} 成对，是遗留词汇，随使用它的
-     * 设备仓迁移 roundChain 后退场。
-     *
-     * @return 到点完成的 CF（不失败；调度提交失败抛 RejectedExecutionException——
-     *         域定时器已停机的显式信号）。延迟属在飞轮次的一部分，不打断在飞轮次的
-     *         cancel 语义（RemovalHost 非阻塞契约）对其不额外注册移除动作。
-     */
-    public CompletableFuture<Void> delay() {
-        Long ms = interCommandDelayMs;
-        if (ms == null) {
-            throw new IllegalStateException(
-                    "delay() 须与 .interCommandDelayMs(long) 成对配置后使用");
-        }
-        return delay(ms, TimeUnit.MILLISECONDS);
-    }
-
-    /**
      * 一次性延迟公有糖（29 号 v2 S2 的 B 族收编入口：设备仓散落的「schedule 一次性任务
-     * 延后做事」workload 迁 SDK 时的统一词汇）：经域定时器单发到点完成，延迟值显式传入
-     * （无需 interCommandDelayMs 成对配置）。与 {@link #delay()} 同走
-     * {@link SerialSdkTimers}（MDC 提交时捕获、到拍恢复）。只用于锁外的一次性到点延迟
-     * （如 start 前的动作序列节拍）；round() 体内留隙禁用（避坑同 {@link #delay()}——
-     * 命令间/块间等待走 {@link #roundChain()} 的 {@code gap(ms)}）。
+     * 延后做事」workload 迁 SDK 时的统一词汇）：经域定时器 {@link SerialSdkTimers}
+     * 单发到点完成，延迟值显式传入（MDC 提交时捕获、到拍恢复）。只用于锁外的一次性到点
+     * 延迟（如 start 前的动作序列节拍）；round() 体内留隙禁用——留隙发生在源锁临界区内，
+     * 整轮持锁=各笔 IO+等待总和，挤爆写命令的有界取锁预算（实测满载链路下写命令秒级
+     * 超时），命令间/块间等待走 {@link #roundChain()} 的 {@code gap(ms)}（留隙在锁外，
+     * 写者可在留隙窗取锁）。
      *
      * @param delay 延迟时长，须 &gt;= 0（0=立即完成，显式声明无延迟）
      * @param unit  时间单位
