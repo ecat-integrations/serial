@@ -224,7 +224,11 @@ public class SerialTransactionStrategy {
      * 消费方自行 whenComplete，fire-and-forget 契约不变。
      *
      * <p><b>边界</b>：只供周期轮询任务体使用；写命令（MANUAL_COMMAND 经闸）与需要有限等待
-     * 语义的调用方继续走 {@code executeWithLambda}（闸内 IO 体对锁的等待保留）。
+     * 语义的调用方继续走 {@code executeWithLambda}（闸内 IO 体对锁的等待保留）。本入口把
+     * 整个 lambda 包进单次源锁事务，只适用于「一次轮询、过程中无等待、无分段交互」的
+     * 单段轮体——轮体内含 delay/命令间留隙等待的设备必须改走
+     * {@code SerialPolling#roundChain()}（每段独立事务、留隙在锁外），否则整轮持锁=
+     * 各笔 IO+等待总和，挤爆写命令的有界取锁预算。
      *
      * <p>取锁成功后的事务体/硬超时/release/端口强拆链路与 {@code executeWithLambda} 完全共享
      * （{@link #executeHeld}），F-16 的收割/恢复机制不受影响。锁等待预算取
