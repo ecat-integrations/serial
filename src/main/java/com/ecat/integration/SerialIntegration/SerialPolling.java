@@ -1,5 +1,7 @@
 package com.ecat.integration.SerialIntegration;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -64,7 +66,9 @@ import com.ecat.core.Utils.Mdc.DeviceMdcContext;
  * 托管 sweep 与 {@link PollingHandle#cancel()} 幂等并存。多段命令链（cecep/saimosen
  * 形态）是 round 内一等公民，命令间延迟经 {@link #delay()}（配合
  * {@link #interCommandDelayMs(long)}，收编 9 文件本地 {@code delay()} 样板）或公有糖
- * {@link #delay(long, TimeUnit)}（一次性延迟，B 族收编入口；两者都走域定时器）。
+ * {@link #delay(long, TimeUnit)}（一次性延迟，B 族收编入口；两者都走域定时器）；
+ * 命令间需锁外留隙的多段轮用 {@link #roundChain()}（每段独立事务，留隙在源锁临界区
+ * 之外，体内 delay 留隙则整轮持锁）。
  *
  * @author coffee
  */
@@ -79,6 +83,15 @@ public final class SerialPolling {
     private final String portName;
 
     private Function<SerialSource, ? extends CompletableFuture<?>> round;
+    /**
+     * 多段轮声明（{@link #roundChain()} 链上逐段登记；null = 未声明，单段 round() 形态）。
+     * 声明期单线程构建、运行期只读，无需并发容器。
+     */
+    private List<Function<SerialSource, ? extends CompletableFuture<?>>> chainSegments;
+    /** 与 chainSegments 对齐的段间留隙毫秒（size = 段数-1；end() 校验）。 */
+    private List<Long> chainGaps;
+    /** roundChain() 已起建标志（段尚未声明也锁定与 round() 的互斥——声明不得半途换轨）。 */
+    private boolean chainDeclared;
     private long periodMs;
     /** 首轮延迟（毫秒）；0 = 立即首轮（默认，与存量设备仓行为一致）。 */
     private long initialDelayMs;
@@ -132,8 +145,91 @@ public final class SerialPolling {
         if (round == null) {
             throw new IllegalArgumentException("round 不能为 null");
         }
+        if (chainDeclared) {
+            throw new IllegalStateException("roundChain 已配置，round() 与 roundChain() 互斥");
+        }
         this.round = round;
         return this;
+    }
+
+    /**
+     * 声明多段轮（与 round() 互斥，二选一）：每段 {@link RoundChain#held} 是一个独立
+     * executePolling 事务（独立预算取锁、独立硬超时、完成即释放），相邻段之间
+     * {@link RoundChain#gap} 留隙在源锁临界区之外——设备性能要求的命令间节拍不再变成
+     * 持锁时长（单事务 round 形态下体内 delay 留隙把锁持有到轮末，挤爆写命令的有界
+     * 等待预算）。段体结果契约与 round() 一致（显式 FALSE=业务失败，其余=成功）。
+     */
+    public RoundChain roundChain() {
+        if (round != null) {
+            throw new IllegalStateException("round 已配置，roundChain() 与 round() 互斥");
+        }
+        if (chainDeclared) {
+            throw new IllegalStateException("roundChain 已配置（每轮读什么只能有一个定义）");
+        }
+        chainDeclared = true;
+        return new RoundChain();
+    }
+
+    /**
+     * 多段轮声明链（{@link #roundChain()} 起建）：{@code held(gap held)* end} 的声明序
+     * 由状态机 fail-fast 保证（gap 必须夹在两段之间、不得重复/尾随；end 校验 gap 数 =
+     * 段数-1）。段体契约与 round() 一致；段体显式 FALSE 或异常 ⇒ 中止不追读后续段。
+     * 声明期单线程、运行期只读。
+     */
+    public final class RoundChain {
+
+        /** 声明状态：0=待首段，1=待 gap 或 end（上一声明是 held），2=待 held（上一声明是 gap）。 */
+        private int state;
+        private boolean ended;
+
+        /** 声明一段轮体（独立源锁事务；签名与 round() 一致，迁移=搬函数体）。 */
+        public RoundChain held(Function<SerialSource, ? extends CompletableFuture<?>> segment) {
+            if (segment == null) {
+                throw new IllegalArgumentException("held(null) 不允许");
+            }
+            if (ended) {
+                throw new IllegalStateException("roundChain 已 end()，不得再 held");
+            }
+            if (chainSegments == null) {
+                chainSegments = new ArrayList<>();
+                chainGaps = new ArrayList<>();
+            }
+            chainSegments.add(segment);
+            state = 1;
+            return this;
+        }
+
+        /** 声明与上一段之间的留隙毫秒（锁外节拍；须 &gt; 0——零留隙无意义，别调 gap）。 */
+        public RoundChain gap(long ms) {
+            if (ms <= 0) {
+                throw new IllegalArgumentException("gap(ms) 要求 ms > 0（零留隙无意义）: " + ms);
+            }
+            if (state != 1) {
+                throw new IllegalStateException("gap 必须紧跟在 held 之后且不得连续声明");
+            }
+            chainGaps.add(ms);
+            state = 2;
+            return this;
+        }
+
+        /** 完成多段轮声明，回到 polling 继续周期/启动声明。 */
+        public SerialPolling end() {
+            if (ended) {
+                throw new IllegalStateException("roundChain 只能 end() 一次");
+            }
+            if (chainSegments == null || chainSegments.isEmpty()) {
+                throw new IllegalStateException("end() 前至少声明一段 held(...)");
+            }
+            if (state != 1) {
+                throw new IllegalStateException("end() 前必须以 held(...) 收尾（尾随 gap 无所属段）");
+            }
+            if (chainGaps.size() != chainSegments.size() - 1) {
+                throw new IllegalStateException("gap 数必须 = 段数-1，实际: gaps="
+                        + chainGaps.size() + ", segments=" + chainSegments.size());
+            }
+            ended = true;
+            return SerialPolling.this;
+        }
     }
 
     /**
@@ -288,8 +384,8 @@ public final class SerialPolling {
      * @throws IllegalStateException round/every 未配置、或本实例已 start（一构建一启动）
      */
     public PollingHandle start() {
-        if (round == null) {
-            throw new IllegalStateException("start() 前必须配置 round(Function)");
+        if (round == null && chainSegments == null) {
+            throw new IllegalStateException("start() 前必须配置 round(Function) 或完整 roundChain()");
         }
         if (periodMs <= 0) {
             throw new IllegalStateException("start() 前必须配置 every(period, unit)");
@@ -350,12 +446,14 @@ public final class SerialPolling {
         return Math.max(200L, Math.min(500L, periodMs / 4));
     }
 
-    /** 单轮发起：executePolling 事务（锁预算按周期 clamp）→ 结算（日志/onRound/锁忙内化）。 */
+    /** 单轮发起：executePolling 事务（锁预算按周期 clamp；roundChain 形态走多段折叠）→ 结算（日志/onRound/锁忙内化）。 */
     private CompletableFuture<?> beginRound(long transactionTimeoutMs) {
         CompletableFuture<Boolean> transaction;
         try {
-            transaction = SerialTransactionStrategy.executePolling(
-                    source, lockWaitBudgetMs(), asBooleanRound(round), transactionTimeoutMs);
+            transaction = chainSegments != null
+                    ? executeChain(transactionTimeoutMs)
+                    : SerialTransactionStrategy.executePolling(
+                            source, lockWaitBudgetMs(), asBooleanRound(round), transactionTimeoutMs);
         } catch (RuntimeException e) {
             // 发起段同步异常（取锁入口编程错误等——acquirePollingBounded 校验失败等形态）：
             // 包 failedFuture 统一处理——
@@ -373,6 +471,31 @@ public final class SerialPolling {
             return failed;
         }
         return transaction.handle(this::settleRound);
+    }
+
+    /**
+     * 多段轮折叠（roundChain 形态的轮体）：段一立即执行；相邻段之间经
+     * {@link #delay(long, TimeUnit)} 留隙——留隙窗在源锁临界区之外（上一段事务完成时已在
+     * 策略层 whenComplete 释放源锁，写命令可在窗内取锁；本段到点重新走既有有界取锁排队）。
+     * 段体显式 FALSE（轮契约唯一业务失败标记）或异常 ⇒ 不追读后续段（聚合 CF 以该值/异常
+     * 收尾，分类交 settleRound 统一处理）。gap 单发属在飞轮次的一部分，不注册移除动作。
+     */
+    private CompletableFuture<Boolean> executeChain(long transactionTimeoutMs) {
+        CompletableFuture<Boolean> round = SerialTransactionStrategy.executePolling(
+                source, lockWaitBudgetMs(), asBooleanRound(chainSegments.get(0)), transactionTimeoutMs);
+        for (int i = 1; i < chainSegments.size(); i++) {
+            Function<SerialSource, ? extends CompletableFuture<?>> next = chainSegments.get(i);
+            long gapMs = chainGaps.get(i - 1);
+            round = round.thenCompose(previous -> {
+                if (Boolean.FALSE.equals(previous)) {
+                    return CompletableFuture.completedFuture(Boolean.FALSE);
+                }
+                return delay(gapMs, TimeUnit.MILLISECONDS).thenCompose(gapDone ->
+                        SerialTransactionStrategy.executePolling(source, lockWaitBudgetMs(),
+                                asBooleanRound(next), transactionTimeoutMs));
+            });
+        }
+        return round;
     }
 
     /**
