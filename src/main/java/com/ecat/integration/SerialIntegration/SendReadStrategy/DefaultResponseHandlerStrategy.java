@@ -54,7 +54,8 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
     private final Function<Throwable, Boolean> handleExceptionFunction;
     private final boolean useLegacyMode; // 是否使用传统轮询模式（用于测试兼容）
     private final String portName; // 端口名称，用于线程池隔离
-    private final long timeoutMs;  // 超时时间（毫秒）
+    /** null = 动态读 SerialSource 当前超时（reconfigure 热更新生效）；非 null = 显式固化。 */
+    private final Long explicitTimeoutMs;
 
     // 预定义的超时异常，避免重复创建
     private static final TimeoutException TIMEOUT_EXCEPTION =
@@ -63,6 +64,9 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
     /**
      * Constructs a new DefaultResponseHandlerStrategy with the specified parameters.
      * The strategy automatically detects whether to use interrupt-driven or polling mode based on the environment.
+     * Uses the current timeout from SerialSource.getTimeout(); the source value is re-read at
+     * each response handling invocation, so reconfigured source timeouts take effect without
+     * recreating this strategy.
      *
      * @param serialSource The SerialSource of data to be handled.
      * @param processResponseFunction A function that processes the response handling context and returns a boolean
@@ -78,12 +82,14 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                                           Function<String, String> checkResponseFunction,
                                           Function<Throwable, Boolean> handleExceptionFunction) {
         this(serialSource, processResponseFunction, checkResponseFunction,
-             handleExceptionFunction, defaultTimeout(serialSource));
+             handleExceptionFunction, null);
     }
 
     /**
-     * Constructs a new DefaultResponseHandlerStrategy with custom timeout.
+     * Constructs a new DefaultResponseHandlerStrategy with an explicit fixed timeout.
      * The strategy automatically detects whether to use interrupt-driven or polling mode based on the environment.
+     * Intended for tests that require a short, stable deadline; production callers should use
+     * the 4-argument constructor to follow SerialSource reconfiguration.
      *
      * @param serialSource The SerialSource of data to be handled.
      * @param processResponseFunction A function that processes the response handling context and returns a boolean
@@ -91,8 +97,8 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
      * @param checkResponseFunction A function that checks the response string and returns a modified or validated response string.
      * @param handleExceptionFunction A function that handles exceptions and returns a boolean indicating whether the exception
      *                                was successfully handled.
-     * @param timeoutMs Timeout in milliseconds (must be positive)
-     * @throws IllegalArgumentException if timeoutMs is not positive
+     * @param timeoutMs Timeout in milliseconds; null selects dynamic SerialSource timeout mode
+     * @throws IllegalArgumentException if timeoutMs is not null and not positive
      * @param <T> The type of the response handling context.
      */
     @Deprecated
@@ -100,8 +106,8 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                                           Function<ResponseHandlingContext<T>, Boolean> processResponseFunction,
                                           Function<String, String> checkResponseFunction,
                                           Function<Throwable, Boolean> handleExceptionFunction,
-                                          long timeoutMs) {
-        if (timeoutMs <= 0) {
+                                          Long timeoutMs) {
+        if (timeoutMs != null && timeoutMs <= 0) {
             throw new IllegalArgumentException("timeoutMs must be positive: " + timeoutMs);
         }
         this.serialSource = serialSource;
@@ -109,7 +115,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
         this.checkResponseFunction = checkResponseFunction;
         this.handleExceptionFunction = handleExceptionFunction;
         this.portName = serialSource == null ? "null_serial_source" : serialSource.getPortName(); // 获取端口名称
-        this.timeoutMs = timeoutMs;
+        this.explicitTimeoutMs = timeoutMs;
         // 检测是否需要使用传统模式（测试环境）
         this.useLegacyMode = detectLegacyModeRequired();
     }
@@ -175,7 +181,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                     serialSource.removeDataListener(listener);
                 }
             },
-            this.timeoutMs,
+            currentTimeoutMs(),
             TimeUnit.MILLISECONDS
         );
 
@@ -241,7 +247,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
                 responseFuture.completeExceptionally(TIMEOUT_EXCEPTION);
                 serialSource.removeDataListener(listener);
             },
-            this.timeoutMs,
+            currentTimeoutMs(),
             TimeUnit.MILLISECONDS
         );
 
@@ -274,7 +280,7 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
         }
 
         // 检查是否超时 - 超时时抛出 TimeoutException
-        if (System.currentTimeMillis() - context.getStartTime().get() >= this.timeoutMs) {
+        if (System.currentTimeMillis() - context.getStartTime().get() >= currentTimeoutMs()) {
             CompletableFuture<ResponseHandlingContext<T>> future = new CompletableFuture<>();
             future.completeExceptionally(TIMEOUT_EXCEPTION);
             return future;
@@ -355,8 +361,9 @@ public class DefaultResponseHandlerStrategy<T> implements ResponseHandlerStrateg
         return false;
     }
 
-    private static long defaultTimeout(SerialSource serialSource) {
-        return serialSource != null && serialSource.getTimeout() > 0
-                ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
+    private long currentTimeoutMs() {
+        return explicitTimeoutMs != null ? explicitTimeoutMs
+                : serialSource != null && serialSource.getTimeout() > 0
+                        ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
     }
 }

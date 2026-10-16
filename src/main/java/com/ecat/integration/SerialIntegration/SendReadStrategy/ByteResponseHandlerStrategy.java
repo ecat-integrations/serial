@@ -38,7 +38,8 @@ public class ByteResponseHandlerStrategy<T> {
     private final Function<Throwable, Boolean> handleExceptionFunction;
     private final boolean useLegacyMode;
     private final String portName;
-    private final long timeoutMs;  // 超时时间（毫秒）
+    /** null = 动态读 SerialSource 当前超时（reconfigure 热更新生效）；非 null = 显式固化。 */
+    private final Long explicitTimeoutMs;
 
     // 预定义的超时异常
     private static final TimeoutException TIMEOUT_EXCEPTION =
@@ -47,7 +48,9 @@ public class ByteResponseHandlerStrategy<T> {
     /**
      * Constructs a new ByteResponseHandlerStrategy with the specified parameters.
      * The strategy automatically detects whether to use interrupt-driven or polling mode.
-     * Uses default timeout from SerialSource.getTimeout().
+     * Uses the current timeout from SerialSource.getTimeout(); the source value is re-read at
+     * each response handling invocation, so reconfigured source timeouts take effect without
+     * recreating this strategy.
      *
      * @param serialSource The SerialSource for communication
      * @param processResponseFunction A function that processes the response context and returns success/failure
@@ -60,27 +63,29 @@ public class ByteResponseHandlerStrategy<T> {
             Function<byte[], byte[]> checkResponseFunction,
             Function<Throwable, Boolean> handleExceptionFunction) {
         this(serialSource, processResponseFunction, checkResponseFunction,
-             handleExceptionFunction, defaultTimeout(serialSource));
+             handleExceptionFunction, null);
     }
 
     /**
-     * Constructs a new ByteResponseHandlerStrategy with custom timeout.
+     * Constructs a new ByteResponseHandlerStrategy with an explicit fixed timeout.
+     * Intended for tests that require a short, stable deadline; production callers should use
+     * the 4-argument constructor to follow SerialSource reconfiguration.
      * The strategy automatically detects whether to use interrupt-driven or polling mode.
      *
      * @param serialSource The SerialSource for communication
      * @param processResponseFunction A function that processes the response context and returns success/failure
      * @param checkResponseFunction A function that checks the byte array and returns validated bytes or null
      * @param handleExceptionFunction A function that handles exceptions
-     * @param timeoutMs Timeout in milliseconds (must be positive)
-     * @throws IllegalArgumentException if timeoutMs is not positive
+     * @param timeoutMs Timeout in milliseconds; null selects dynamic SerialSource timeout mode
+     * @throws IllegalArgumentException if timeoutMs is not null and not positive
      */
     public ByteResponseHandlerStrategy(
             SerialSource serialSource,
             Function<ByteResponseHandlingContext<T>, Boolean> processResponseFunction,
             Function<byte[], byte[]> checkResponseFunction,
             Function<Throwable, Boolean> handleExceptionFunction,
-            long timeoutMs) {
-        if (timeoutMs <= 0) {
+            Long timeoutMs) {
+        if (timeoutMs != null && timeoutMs <= 0) {
             throw new IllegalArgumentException("timeoutMs must be positive: " + timeoutMs);
         }
         this.serialSource = serialSource;
@@ -88,7 +93,7 @@ public class ByteResponseHandlerStrategy<T> {
         this.checkResponseFunction = checkResponseFunction;
         this.handleExceptionFunction = handleExceptionFunction;
         this.portName = serialSource == null ? "null_serial_source" : serialSource.getPortName();
-        this.timeoutMs = timeoutMs;
+        this.explicitTimeoutMs = timeoutMs;
         this.useLegacyMode = detectLegacyModeRequired();
     }
 
@@ -154,7 +159,7 @@ public class ByteResponseHandlerStrategy<T> {
                     serialSource.removeDataListener(listener);
                 }
             },
-            this.timeoutMs,
+            currentTimeoutMs(),
             TimeUnit.MILLISECONDS
         );
 
@@ -234,7 +239,7 @@ public class ByteResponseHandlerStrategy<T> {
                 responseFuture.completeExceptionally(TIMEOUT_EXCEPTION);
                 serialSource.removeDataListener(listener);
             },
-            this.timeoutMs,
+            currentTimeoutMs(),
             TimeUnit.MILLISECONDS
         );
 
@@ -265,7 +270,7 @@ public class ByteResponseHandlerStrategy<T> {
         }
 
         // 检查是否超时 - 超时时抛出 TimeoutException
-        if (System.currentTimeMillis() - context.getStartTime().get() >= this.timeoutMs) {
+        if (System.currentTimeMillis() - context.getStartTime().get() >= currentTimeoutMs()) {
             CompletableFuture<ByteResponseHandlingContext<T>> future = new CompletableFuture<>();
             future.completeExceptionally(TIMEOUT_EXCEPTION);
             return future;
@@ -343,8 +348,9 @@ public class ByteResponseHandlerStrategy<T> {
         return false;
     }
 
-    private static long defaultTimeout(SerialSource serialSource) {
-        return serialSource != null && serialSource.getTimeout() > 0
-                ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
+    private long currentTimeoutMs() {
+        return explicitTimeoutMs != null ? explicitTimeoutMs
+                : serialSource != null && serialSource.getTimeout() > 0
+                        ? serialSource.getTimeout() : Const.READ_TIMEOUT_MS;
     }
 }

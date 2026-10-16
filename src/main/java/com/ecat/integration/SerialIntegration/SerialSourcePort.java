@@ -90,7 +90,7 @@ public class SerialSourcePort {
     }
 
     SerialPort serialPort;
-    SerialInfo serialInfo;
+    volatile SerialInfo serialInfo;
     private final SerialIntegration integration;
 
     // Receive-path fields（P1 后：事件驱动 → 轮询；103000 后由自持 serial-io-sweeper 承载，见 SerialPollScheduler）
