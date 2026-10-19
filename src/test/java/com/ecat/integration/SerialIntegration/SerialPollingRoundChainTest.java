@@ -19,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -377,6 +378,103 @@ public class SerialPollingRoundChainTest {
         } catch (IllegalStateException expected) { }
     }
 
+    // ==================== 生命周期：view closed 是 lifecycle skip ====================
+
+    /** closed view 在工厂入口即拒绝：不得进入 builder，更不得注册周期链。 */
+    @Test
+    public void onRejectsClosedSource() {
+        when(source.isViewClosed()).thenReturn(true);
+        try {
+            SerialPolling.on(device, source);
+            fail("closed source 不得创建 SerialPolling");
+        } catch (SerialSourceClosedException expected) {
+            assertNull(handle);
+        }
+    }
+
+    /** on 后、start 前 close：start 复查必须拒绝，不能把终态 view 挂上周期链。 */
+    @Test
+    public void startRejectsSourceClosedBeforeScheduling() {
+        SerialPolling polling = SerialPolling.on(device, source)
+                .roundChain()
+                .held(src -> CompletableFuture.completedFuture(true))
+                .end()
+                .every(PERIOD_MS, TimeUnit.MILLISECONDS);
+        when(source.isViewClosed()).thenReturn(true);
+        try {
+            polling.start();
+            fail("start 前 view 已 close 必须拒绝调度");
+        } catch (SerialSourceClosedException expected) {
+            assertNull(handle);
+        }
+    }
+
+    /**
+     * gap 后 view close：异常折叠天然阻断后续段；closed 根因按 lifecycle skip 结算，
+     * 不触发业务 failure 回调，也不打 link DOWN。requester IO 硬门由 lifecycle 测试锁定。
+     */
+    @Test
+    public void closedViewAfterGapStopsChainWithoutLinkDownOrFailureCallback() throws Exception {
+        ch.qos.logback.classic.Logger pollingLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SerialPolling.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        pollingLogger.addAppender(appender);
+        java.util.List<ch.qos.logback.classic.turbo.TurboFilter> turboFilters = detachTurboFilters();
+
+        CountDownLatch seg1Ran = new CountDownLatch(1);
+        CountDownLatch laterSegmentRan = new CountDownLatch(1);
+        AtomicInteger failureCallbacks = new AtomicInteger();
+        AtomicBoolean viewClosed = new AtomicBoolean();
+        when(source.isViewClosed()).thenAnswer(inv -> viewClosed.get());
+
+        try {
+            handle = SerialPolling.on(device, source)
+                    .roundChain()
+                    .held(src -> {
+                        seg1Ran.countDown();
+                        return CompletableFuture.completedFuture(true);
+                    })
+                    .gap(100L)
+                    .held(src -> {
+                        laterSegmentRan.countDown();
+                        return CompletableFuture.completedFuture(true);
+                    })
+                    .gap(100L)
+                    .held(src -> {
+                        laterSegmentRan.countDown();
+                        return CompletableFuture.completedFuture(true);
+                    })
+                    .end()
+                    .every(PERIOD_MS, TimeUnit.MILLISECONDS)
+                    .onRound((result, ex) -> {
+                        if (ex != null || Boolean.FALSE.equals(result)) {
+                            failureCallbacks.incrementAndGet();
+                        }
+                    })
+                    .start();
+
+            assertTrue(seg1Ran.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+            viewClosed.set(true);
+
+            assertFalse("后续段必须被 lifecycle closed 阻断",
+                    laterSegmentRan.await(NEGATIVE_WINDOW_MS, TimeUnit.MILLISECONDS));
+            assertEquals("lifecycle skip 不得触发业务 failure 回调", 0, failureCallbacks.get());
+            long downLines = appender.list.stream()
+                    .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .filter(e -> e.getFormattedMessage().contains("link DOWN"))
+                    .count();
+            assertEquals("lifecycle skip 不得翻转 link DOWN", 0L, downLines);
+        } finally {
+            if (handle != null) {
+                handle.cancel();
+            }
+            restoreTurboFilters(turboFilters);
+            pollingLogger.detachAppender(appender);
+        }
+    }
+
     // ==================== 装配 ====================
 
     /** 桥接到真实端口的 SerialSource mock：executePolling 的锁状态机/释放穿过真实实现。 */
@@ -389,7 +487,24 @@ public class SerialPollingRoundChainTest {
                 null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
         when(source.getPortName()).thenReturn(port.getPortName());
+        when(source.getIdentity()).thenReturn("round-chain-device");
         when(source.getTimeout()).thenReturn(port.getTimeout());
         return source;
+    }
+
+    private java.util.List<ch.qos.logback.classic.turbo.TurboFilter> detachTurboFilters() {
+        ch.qos.logback.classic.LoggerContext ctx =
+                (ch.qos.logback.classic.LoggerContext) org.slf4j.LoggerFactory.getILoggerFactory();
+        java.util.List<ch.qos.logback.classic.turbo.TurboFilter> saved =
+                new java.util.ArrayList<>(ctx.getTurboFilterList());
+        ctx.getTurboFilterList().clear();
+        return saved;
+    }
+
+    private void restoreTurboFilters(
+            java.util.List<ch.qos.logback.classic.turbo.TurboFilter> filters) {
+        ch.qos.logback.classic.LoggerContext ctx =
+                (ch.qos.logback.classic.LoggerContext) org.slf4j.LoggerFactory.getILoggerFactory();
+        ctx.getTurboFilterList().addAll(filters);
     }
 }

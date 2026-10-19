@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import com.ecat.core.CommTrace.OwnerLevel;
 import com.ecat.core.CommTrace.ResourceOwner;
@@ -48,6 +49,16 @@ public class SerialSource {
 
     private final SerialSourcePort sourcePort;
     private final CopyOnWriteArrayList<SerialDataListener> dataListeners = new CopyOnWriteArrayList<>();
+    /**
+     * owner view 终态标记：closePort 只关闭本视图，不等于物理口关闭。CAS 保证重复
+     * closePort 只注销一次，保住共享物理口的引用计数。
+     */
+    private final AtomicBoolean viewClosed = new AtomicBoolean(false);
+    /**
+     * listener 注册/终态清理互斥：防止 add 已通过 active 检查后，closePort 清空列表，
+     * 注册线程再把 listener 加回终态 view。
+     */
+    private final Object listenerLifecycleLock = new Object();
 
     /**
      * Primary constructor used by SerialIntegration.
@@ -137,7 +148,10 @@ public class SerialSource {
      * @return CompletableFuture<Boolean> 发送结果
      */
     public CompletableFuture<Boolean> asyncSendData(byte[] bytes) {
-        return sourcePort.asyncSendData(bytes);
+        if (isViewClosed()) {
+            return failedFuture(new SerialSourceClosedException("asyncSendData", getPortName(), identity));
+        }
+        return sourcePort.asyncSendData(this, bytes);
     }
 
     /**
@@ -158,26 +172,36 @@ public class SerialSource {
      * @return CompletableFuture<byte[]> 读取的字节数组
      */
     public CompletableFuture<byte[]> asyncReadDataBytes() {
-        return sourcePort.asyncReadDataBytes();
+        if (isViewClosed()) {
+            return failedFuture(new SerialSourceClosedException(
+                    "asyncReadDataBytes", getPortName(), identity));
+        }
+        return sourcePort.asyncReadDataBytes(this);
     }
 
     /**
      * 尝试获取锁，支持等待队列。视图已登记权威归属时自动注入（{@link #lockOwner()}，
      * 调用方无感）——授予后 TX/RX 捕获点同读该归属作 CommTrace 权威参数。
+     * <p>默认等待期间 view 关闭不会被提前唤醒；等待返回后统一复查 terminal 状态。</p>
      * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
      */
     public String acquire() {
-        return sourcePort.acquire(lockOwner());
+        assertViewActive("acquire");
+        return checkClosedAfterAcquire("acquire", sourcePort.acquire(lockOwner()));
     }
 
     /**
      * 尝试获取锁，支持等待队列和超时（owner 注入同 {@link #acquire()}）
+     * <p>view 在等待期间关闭不会被提前唤醒；等待者仍按 timeout/budget 结束，随后统一
+     * 复查 terminal 状态并释放已授予 key。</p>
      * @param timeout 超时时间
      * @param unit 时间单位
      * @return 锁标识（成功获取/唤醒或进入等待），null表示超时或超出等待队列容量
      */
     public String acquire(long timeout, TimeUnit unit) {
-        return sourcePort.acquire(timeout, unit, lockOwner());
+        assertViewActive("acquire");
+        return checkClosedAfterAcquire("acquire",
+                sourcePort.acquire(timeout, unit, lockOwner()));
     }
 
     /**
@@ -188,9 +212,15 @@ public class SerialSource {
      *
      * @param budgetMs 锁等待预算（毫秒，须 &gt; 0；SDK 侧按轮询周期 clamp）
      * @return 锁标识 CF；null 完成=本周期弃轮（真弃轮在源侧记账）
+     * <p>view 在旁池等待期间关闭不会被提前唤醒；预算结束后统一复查 terminal 状态。</p>
      */
     public CompletableFuture<String> acquirePollingBounded(long budgetMs) {
-        return sourcePort.acquirePollingBounded(lockOwner(), budgetMs);
+        if (isViewClosed()) {
+            return failedFuture(new SerialSourceClosedException(
+                    "acquirePollingBounded", getPortName(), identity));
+        }
+        return sourcePort.acquirePollingBounded(lockOwner(), budgetMs).thenApply(key ->
+                checkClosedAfterAcquire("acquirePollingBounded", key));
     }
 
     /** 本端口累计轮询真弃轮次数（有界等待预算耗尽的计数，{@code acquirePollingBounded} 记账）。 */
@@ -259,6 +289,44 @@ public class SerialSource {
     }
 
     /**
+     * 本 owner view 是否已终态关闭。关闭不影响同口其他活跃 view 或物理口引用计数。
+     */
+    public boolean isViewClosed() {
+        return viewClosed.get();
+    }
+
+    /** 本 owner view 是否仍可发起新 IO/取锁/监听注册。 */
+    public boolean isViewActive() {
+        return !isViewClosed();
+    }
+
+    private void assertViewActive(String operation) {
+        if (isViewClosed()) {
+            throw new SerialSourceClosedException(operation, getPortName(), identity);
+        }
+    }
+
+    /**
+     * 取锁等待结束后统一复查视图终态：已关闭时非 null key 先归还原锁再抛；null 也按
+     * closed 失败，避免与 lock busy/队列满混同。
+     */
+    private String checkClosedAfterAcquire(String operation, String key) {
+        if (isViewClosed()) {
+            if (key != null) {
+                sourcePort.release(key);
+            }
+            throw new SerialSourceClosedException(operation, getPortName(), identity);
+        }
+        return key;
+    }
+
+    private static <T> CompletableFuture<T> failedFuture(Throwable cause) {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        future.completeExceptionally(cause);
+        return future;
+    }
+
+    /**
      * 挂死端口自愈（Q-1/A2）：close + reopen 强拆挂死的本地阻塞写，语义见
      * {@link SerialSourcePort#recoverWedgedPort(String)}。由事务级硬超时路径调用
      * （SerialTransactionStrategy），也可供 modbus RTU 等直持串口流的集成在其事务
@@ -309,11 +377,15 @@ public class SerialSource {
      * 添加数据监听器
      */
     public void addDataListener(SerialDataListener listener) {
-        if (listener != null && !dataListeners.contains(listener)) {
-            dataListeners.add(listener);
-            log.debug(getPortName() + " [" + identity + "] added data listener, total listeners: " + dataListeners.size());
-            // 如果发送命令后已经收到了消息，则认为是本次命令的应答，直接将数据发布给监听器
-            sourcePort.deliverBufferedData(listener);
+        synchronized (listenerLifecycleLock) {
+            assertViewActive("addDataListener");
+            if (listener != null && !dataListeners.contains(listener)) {
+                dataListeners.add(listener);
+                log.debug(getPortName() + " [" + identity + "] added data listener, total listeners: " + dataListeners.size());
+                // 如果发送命令后已经收到了消息，则认为是本次命令的应答，直接将数据发布给监听器。
+                // 回调留在同一临界区内：closePort 不能在回放中途清空 listener。
+                sourcePort.deliverBufferedData(listener);
+            }
         }
     }
 
@@ -334,6 +406,7 @@ public class SerialSource {
      *         设备注销场景由 {@link #closePort()} 全量清理覆盖）
      */
     public SerialDataListener onFrame(Consumer<byte[]> frameHandler) {
+        assertViewActive("onFrame");
         if (frameHandler == null) {
             throw new IllegalArgumentException("frameHandler 不能为 null");
         }
@@ -399,8 +472,14 @@ public class SerialSource {
      * If this is the last source, the underlying port will be closed.
      */
     public void closePort() {
-        removeAllDataListeners();
-        sourcePort.unregisterSource(this);
-        log.info("SerialSource closed for port: " + getPortName() + ", identity: " + identity);
+        synchronized (listenerLifecycleLock) {
+            if (!viewClosed.compareAndSet(false, true)) {
+                return;
+            }
+            removeAllDataListeners();
+            sourcePort.unregisterSource(this);
+        }
+        log.info("[VIEW-CLOSED] port={}, identity={}, physical port open={}",
+                getPortName(), identity, !isClosed());
     }
 }

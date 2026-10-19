@@ -131,6 +131,10 @@ public final class SerialPolling {
         if (source == null) {
             throw new IllegalArgumentException("source 不能为 null");
         }
+        if (source.isViewClosed()) {
+            throw new SerialSourceClosedException("SerialPolling.on", source.getPortName(),
+                    source.getIdentity());
+        }
         return new SerialPolling(host, source);
     }
 
@@ -370,6 +374,9 @@ public final class SerialPolling {
         if (handle != null) {
             throw new IllegalStateException("本 SerialPolling 已 start（一构建一启动；重启场景新建构建器）");
         }
+        if (source.isViewClosed()) {
+            throw new SerialSourceClosedException("SerialPolling.start", portName, source.getIdentity());
+        }
         // 事务级硬超时统一由设备配置派生（串口读超时 × 10；SDK 级覆盖词汇已按剃刀删除——零消费）
         long transactionTimeoutMs = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);
         RoundSchedule schedule = fixedRate
@@ -432,6 +439,10 @@ public final class SerialPolling {
                     : SerialTransactionStrategy.executePolling(
                             source, lockWaitBudgetMs(), asBooleanRound(round), transactionTimeoutMs);
         } catch (RuntimeException e) {
+            if (SerialSourceClosedException.isSourceClosed(e)) {
+                log.debug("[{}] polling round skipped: serial source view closed", portName);
+                return CompletableFuture.completedFuture(null);
+            }
             // 发起段同步异常（取锁入口编程错误等——acquirePollingBounded 校验失败等形态）：
             // 包 failedFuture 统一处理——
             // 引擎按异常完成记账、周期不注销（16 号 §4.4）；SDK 侧补齐日志与回调。
@@ -481,6 +492,10 @@ public final class SerialPolling {
      */
     private Object settleRound(Boolean result, Throwable ex) {
         if (ex != null) {
+            if (SerialSourceClosedException.isSourceClosed(ex)) {
+                log.debug("[{}] polling round skipped: serial source view closed", portName);
+                return null;
+            }
             if (LockBusySkippedException.isLockBusySkip(ex)) {
                 // 锁忙是内部信号非错误：本轮跳过、下周期再试；源侧已有记账与限频日志
                 log.debug("[{}] polling round skipped: port lock busy, retry next cycle", portName);

@@ -21,6 +21,15 @@
 ### SerialSource
 串口源，提供发送/接收、监听器管理等功能。
 
+`SerialSource` 是 owner view，不是物理串口本身。`closePort()` 只终态关闭本 view，
+同口其他活跃 view 与底层 `SerialSourcePort` 引用计数不受影响。`isClosed()` 继续表示
+物理口状态；view 状态用 `isViewClosed()` / `isViewActive()` 判断。view 关闭后，新的
+acquire/listener/onFrame 同步抛 `SerialSourceClosedException`，send/read future 则以
+该异常异常完成；已排队但尚未执行 IO task 的请求也会在触碰硬件前拒绝。`release()`、`recoverWedgedPort()`、
+`getSerialPort()`、pause/resume 等清理与诊断/逃生通道保留，供在飞收尾与 Modbus 直持流
+消费方使用。轮询 SDK 将该异常按 lifecycle skip 处理：不打 `link DOWN`、不触发业务失败
+回调；`roundChain` 已开始 gap 后不再执行后续 segment。
+
 ### ByteResponseHandlerStrategy（推荐）
 **主要响应处理策略**，直接处理二进制数据，避免字符串转换兼容性问题。
 
@@ -196,6 +205,19 @@ RECONFIGURE 后设备重 load 时，新 comm 设置经 `SerialSourcePort.applyRe
 
 - **物理参数变化**（波特率/数据位/停止位/校验/流控）：旧 fd 持旧参数无法热改，走 close + reopen 重建端口；共享此端口的全部 source 引用不变，随新 fd 继续工作。重开后 RX 清洗（drain 内核残留 + 清应用缓冲），首读零旧字节。
 - **仅 timeout 变化**：纯软件参数（读 `serialInfo` 不下发 OS），原位替换即生效，不重建端口。
+
+## 生命周期硬门（terminal owner view）
+
+- **关闭即终态**：`closePort()` 内部用 CAS 幂等；重复 close 只执行一次 listener 清理与
+  view 注销，避免把共享物理口的引用计数清成负向语义。
+- **closed ≠ lock busy**：取锁等待返回后统一复查 view。若等待期间 close，非 null key 先
+  release 再抛 `SerialSourceClosedException`；null 结果也按 closed 抛，不归入
+  `LockBusySkippedException`。
+- **排队 IO 防复活**：`SerialSourcePort` 的 requester-aware send/read 入口在 IO task
+  真正执行前复查 view，关闭后不触碰 `doSendWrite`、缓冲区和自动 reopen。硬件写已开始后
+  close 无法撤回已发生字节，这是共享物理资源的不可回退边界。
+- **Modbus 逃生口不变**：`getSerialPort()`、pause/resume、诊断与清理方法不因 viewClosed
+  拒绝；RTU master 共享物理口模型不受本硬门影响。
 
 ---
 

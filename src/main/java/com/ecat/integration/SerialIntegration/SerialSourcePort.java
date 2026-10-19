@@ -811,6 +811,18 @@ public class SerialSourcePort {
         }, ioExecutor());
     }
 
+    private CompletableFuture<byte[]> readFromBufferBytes(SerialSource requester) {
+        return CompletableFuture.supplyAsync(() -> {
+            assertRequesterActive(requester, "asyncReadDataBytes");
+            bufferLock.lock();
+            try {
+                return continuousReceiveBuffer.readAndClear();
+            } finally {
+                bufferLock.unlock();
+            }
+        }, ioExecutor());
+    }
+
     // ========== Port read polling（P1：jSerialComm 事件线程 → 共享调度器轮询） ==========
 
     /**
@@ -993,10 +1005,29 @@ public class SerialSourcePort {
     }
 
     /**
+     * requester-aware 发送入口：owner view 关闭后，即使任务已入队也未开始执行，
+     * IO task 体在真正触碰端口前拒绝。硬件写一旦开始则无法撤回——后续 close 只能
+     * 拒绝更晚的新 IO，这是共享物理资源的不可回退边界。
+     */
+    CompletableFuture<Boolean> asyncSendData(SerialSource requester, byte[] bytes) {
+        final long txTag = activeGeneration;
+        return CompletableFuture.runAsync(() -> {
+            assertRequesterActive(requester, "asyncSendData");
+            doSendWrite(bytes, txTag);
+        }, ioExecutor()).thenApply(v -> true).exceptionally(ex -> {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            throw writeFailure(cause);
+        });
+    }
+
+    /**
      * 写失败类型归一（asyncSendData 两路径共用）：SerialWriteException 原样向上抛
      * （保留写失败语义供调用方识别），其余异常包成通用 RuntimeException（旧行为兼容）。
      */
     private static RuntimeException writeFailure(Throwable cause) {
+        if (cause instanceof SerialSourceClosedException) {
+            return (SerialSourceClosedException) cause;
+        }
         if (cause instanceof SerialWriteException) {
             return (SerialWriteException) cause;
         }
@@ -1070,6 +1101,40 @@ public class SerialSourcePort {
             }, ioExecutor());
         } else {
             return readFromBufferBytes();
+        }
+    }
+
+    /**
+     * requester-aware 读取入口：物理读与缓冲读都在 IO task 体内复查，防止提交后、
+     * 执行前 close 造成 zombie IO。
+     */
+    CompletableFuture<byte[]> asyncReadDataBytes(SerialSource requester) {
+        if (isTestMode) {
+            return CompletableFuture.supplyAsync(() -> {
+                assertRequesterActive(requester, "asyncReadDataBytes");
+                if (serialPort.isOpen()) {
+                    int numRead;
+                    byte[] readBuffer = new byte[serialPort.bytesAvailable()];
+                    numRead = serialPort.readBytes(readBuffer, readBuffer.length);
+                    if (numRead > 0 && numRead < readBuffer.length) {
+                        byte[] result = new byte[numRead];
+                        System.arraycopy(readBuffer, 0, result, 0, numRead);
+                        return result;
+                    }
+                    return readBuffer;
+                }
+                return new byte[0];
+            }, ioExecutor());
+        }
+        return readFromBufferBytes(requester);
+    }
+
+    private void assertRequesterActive(SerialSource requester, String operation) {
+        if (requester == null) {
+            throw new IllegalArgumentException(operation + " requester 不能为 null");
+        }
+        if (requester.isViewClosed()) {
+            throw new SerialSourceClosedException(operation, getPortName(), requester.getIdentity());
         }
     }
 

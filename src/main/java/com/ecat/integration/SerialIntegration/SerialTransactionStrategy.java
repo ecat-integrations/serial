@@ -187,8 +187,17 @@ public class SerialTransactionStrategy {
             throw new IllegalArgumentException(
                     "transactionTimeoutMs must be > 0, got: " + transactionTimeoutMs);
         }
-        String key = lockAcquirer.get();
+        String key;
+        try {
+            key = lockAcquirer.get();
+        } catch (SerialSourceClosedException closed) {
+            return closedFailure(source, "executeWithLambda");
+        }
         if (key != null) {
+            if (source.isViewClosed()) {
+                source.release(key);
+                return closedFailure(source, "executeWithLambda");
+            }
             return executeHeld(source, key, lambda, transactionTimeoutMs);
         } else {
             log.error("Failed to acquire lock");
@@ -272,8 +281,19 @@ public class SerialTransactionStrategy {
                                 + "ms, will retry next cycle"));
                 return skipped;
             }
+            if (source.isViewClosed()) {
+                source.release(key);
+                return closedFailure(source, "executePolling");
+            }
             return executeHeld(source, key, lambda, transactionTimeoutMs);
         });
+    }
+
+    private static CompletableFuture<Boolean> closedFailure(SerialSource source, String operation) {
+        CompletableFuture<Boolean> failed = new CompletableFuture<>();
+        failed.completeExceptionally(new SerialSourceClosedException(
+                operation, source.getPortName(), source.getIdentity()));
+        return failed;
     }
 
     /**
