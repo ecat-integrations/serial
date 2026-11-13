@@ -359,6 +359,65 @@ public class SerialSourcePort {
         }
     }
 
+    // ========== C1 只读观测缝（test-migration-spec-e1-e4 §5；当前为锁面实现的等价映射） ==========
+
+    /**
+     * 命令队列深度观测缝①（只读）：已提交、尚未开始执行的排队命令数，<b>不含在飞命令</b>。
+     * 锁面实现下 = 等待队列 waitQueue 深度的等价映射（等待者即「已提交未授予」的命令，
+     * 被授予即出队）；在飞与否由 {@link #hasInFlight()} 观测——两者<b>成对</b>使用才等价
+     * 覆盖旧 {@link #getWaitingCount()} 语义（单独读深度存在「深度==0 但有命令在途」盲区）。
+     * 真源 = waitQueue 本体（锁内读一致快照），无平行记账；C2 命令队列化后本方法改为
+     * 返回命令队列本体 size，语义边界（不含在飞、以队列为唯一真源）不变。
+     */
+    int getQueueDepth() {
+        lock.lock();
+        try {
+            return waitQueue.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 在飞命令观测缝②（只读）：执行者是否正执行一笔命令。锁面实现下 = 端口锁已被授予
+     * 且未释放（{@code currentKey != null}）。任意采样时刻至多对应一个在飞命令
+     * （「至多一个授予者」不变量的布尔面；越序/窃取中间态的精确判据见
+     * {@link #getGrantedCount()}/{@link #getCompletedCount()} 计数对）。在飞命令的
+     * 归属标识经既有 {@link #getLockAcquireOwner()} 观测，不另设缝。
+     */
+    boolean hasInFlight() {
+        lock.lock();
+        try {
+            return currentKey != null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 授予计数观测缝③左半（只读）：已发生的授予数。真源 = 既有事务代数
+     * {@code txGeneration}（快速路径与等待者队头接管两个授予点均经 grantGeneration()
+     * 递增代数），零新增记账。与 {@link #getCompletedCount()} 构成结果级不变量判据：
+     * {@code granted - completed ∈ {0,1}}（任意时刻至多一个授予未完成）。
+     */
+    long getGrantedCount() {
+        return txGeneration.get();
+    }
+
+    /**
+     * 完成计数观测缝③右半（只读）：已结束的授予数。清零点恰两处——正常 release 与
+     * 幽灵锁收割（与 currentKey 状态清零同临界块递增，单一同步块精确记账，无第二套
+     * 清零路径）；非法 release（key 不匹配）不计数。注意计数对为两次独立读，跨线程
+     * 采样存在撕裂窗口（读 granted 前后恰有完成发生），不变量校验须按
+     * 「completed 先读-后读夹逼 granted」范式容忍撕裂（见 BusArbitrationAtMostOneGranteeTest）。
+     */
+    long getCompletedCount() {
+        return completedTxCount.get();
+    }
+
+    /** 完成计数（观测缝③；见 {@link #getCompletedCount()}）：与 currentKey 清零同临界块递增。 */
+    private final AtomicLong completedTxCount = new AtomicLong();
+
     /**
      * 轮询锁获取契约（20260913-073600 修复，方案 c：轮询并入 FIFO 有界等待——与 modbus
      * {@code ModbusSource.acquirePollingBounded} 同型）：无竞争快路径直达；锁忙时把 FIFO
@@ -487,6 +546,7 @@ public class SerialSourcePort {
                 lockAcquireThread = null;
                 lockHolderThread = null;
                 lockAcquireOwner = null;
+                completedTxCount.incrementAndGet();
                 if (!waitQueue.isEmpty()) {
                     condition.signal();
                 }
@@ -536,6 +596,7 @@ public class SerialSourcePort {
         lockAcquireThread = null;
         lockHolderThread = null;
         lockAcquireOwner = null;
+        completedTxCount.incrementAndGet();
         if (!waitQueue.isEmpty()) {
             condition.signal();
         }
