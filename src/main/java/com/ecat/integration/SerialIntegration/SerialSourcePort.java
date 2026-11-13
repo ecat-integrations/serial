@@ -755,7 +755,10 @@ public class SerialSourcePort {
      * <ul>
      *   <li>物理参数（baudrate/dataBits/stopBits/parity/flowControl）变化：旧 fd 持旧参数
      *       无法热改，走 disable/enable 同款重建路径 stopPolling → closePort → openPort
-     *       （{@link #openPort} 内按新 serialInfo 全量重设参数并重启轮询）；
+     *       （{@link #openPort} 内按新 serialInfo 全量重设参数并重启轮询）。阶段②起重建
+     *       <b>作为一条命令排入本口命令队列</b>（排在在等/在飞事务之后，轮到它才重建，
+     *       设计 §3/S4），配置流线程有界同步等回执，超预算显式抛
+     *       {@link SerialReconfigureException}；
      *       共享此端口的全部 source 引用不变，随新 fd 继续工作；</li>
      *   <li>timeout-only 变化：纯软件参数（{@link #getTimeout()} 读 serialInfo，不下发 OS），
      *       原位替换 SerialInfo 即生效，不重建端口（避免无谓 churn）。</li>
@@ -764,6 +767,30 @@ public class SerialSourcePort {
      * @param newInfo RECONFIGURE 提交的新 SerialInfo（portName 与本端口一致）
      * @param identity 触发方标识（日志定位用）
      */
+    /**
+     * reconfigure 重建命令的有界同步等待预算（毫秒，阶段② reconfigure 入队，设计 §3 选项 a
+     * 「等一等」回执）：重建命令排入本口命令队列后，配置流线程 park 在授予回执 future 上
+     * 等待的最长时长。量级论证=「最长一笔事务硬超时 + fd 重开耗时」：事务级硬超时由设备侧
+     * 显式传入、量级秒级（多步标定流程取高值），队列前方至多若干笔各受自身硬超时约束的
+     * 事务（正常轮转远低于预算）；fd 重开为百毫秒级。60s 覆盖最长合法事务完成 + 队列排空
+     * + 重开；超预算仍等不到执行权 = 前方存在挂死写/幽灵锁等病态形态，显式失败上抛
+     * （{@link SerialReconfigureException}）交 core 分诊链处理，优于无限等待钉死配置流线程。
+     */
+    static final long RECONFIGURE_REBUILD_WAIT_MS = 60_000L;
+
+    /** 重建命令等待预算（{@link #RECONFIGURE_REBUILD_WAIT_MS} 的实例态，红测注入口可缩短）。 */
+    private long reconfigureRebuildWaitMs = RECONFIGURE_REBUILD_WAIT_MS;
+
+    /**
+     * 红测注入口：缩短 reconfigure 重建命令等待预算（仅同包测试使用；生产用默认 60s）。
+     */
+    void setReconfigureRebuildWaitMsForTest(long waitMs) {
+        if (waitMs <= 0) {
+            throw new IllegalArgumentException("reconfigureRebuildWaitMs must be > 0, got: " + waitMs);
+        }
+        this.reconfigureRebuildWaitMs = waitMs;
+    }
+
     void applyReconfiguredSettings(SerialInfo newInfo, String identity) {
         if (serialInfo.settingsMatch(newInfo)) {
             if (serialInfo.timeout != newInfo.timeout) {
@@ -773,14 +800,32 @@ public class SerialSourcePort {
             }
             return;
         }
-        log.warn("[RECONFIGURE-REOPEN] port={}, identity={}, 物理参数变化 [{}] -> [{}]，close+reopen 重建端口",
+        log.warn("[RECONFIGURE-QUEUED] port={}, identity={}, 物理参数变化 [{}] -> [{}]，重建命令入队（排在在等/在飞事务之后）",
                 serialInfo.portName, identity, serialInfo.settingsDescription(), newInfo.settingsDescription());
-        stopPolling();
-        if (serialPort != null && serialPort.isOpen()) {
-            serialPort.closePort();
+        // 阶段② reconfigure 入队（设计 §3/S4）：重建命令经 acquire 占位于本口命令队列——
+        // FIFO 排在全部在等/在飞事务之后，轮到它（release/收割点移交执行权）才 close+reopen，
+        // 一次性消除「reconfigure 线程无锁协调地 close 物理口与在飞事务交错」的历史竞态。
+        // 有界同步等待（选项 a）：慢活（close+openPort）在本调用方线程执行——命令队列只做
+        // 顺序仲裁，不承载慢操作（设计 §6.1）；完成后 inline release 移交队头（Q-1/A2 收尾
+        // 纪律：不排队到执行者自身线程）。
+        String rebuildKey = acquire(reconfigureRebuildWaitMs, TimeUnit.MILLISECONDS, null);
+        if (rebuildKey == null) {
+            throw new SerialReconfigureException("reconfigure 重建命令未在预算(" + reconfigureRebuildWaitMs
+                    + "ms)内获得执行权（等待超时或命令队列满），port=" + serialInfo.portName
+                    + ", identity=" + identity + "——前方事务长期在飞或已挂死，端口状态未动，可重试或走 disable/enable 兜底");
         }
-        serialInfo = newInfo;
-        openPort(identity);
+        try {
+            log.warn("[RECONFIGURE-REOPEN] port={}, identity={}, 重建命令获得执行权，close+reopen 重建端口",
+                    serialInfo.portName, identity);
+            stopPolling();
+            if (serialPort != null && serialPort.isOpen()) {
+                serialPort.closePort();
+            }
+            serialInfo = newInfo;
+            openPort(identity);
+        } finally {
+            release(rebuildKey);
+        }
     }
 
     public SerialPort getSerialPort() {
