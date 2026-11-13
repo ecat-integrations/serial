@@ -320,10 +320,10 @@ public class SerialSourceViewLifecycleTest {
         waiter.start();
         assertTrue(acquired.await(1, TimeUnit.SECONDS));
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (port.getWaitingCount() == 0 && System.nanoTime() < deadline) {
+        while (port.getQueueDepth() == 0 && System.nanoTime() < deadline) {
             Thread.yield();
         }
-        assertEquals(1, port.getWaitingCount());
+        assertEquals(1, port.getQueueDepth());
 
         sourceA.closePort();
         assertTrue(port.release(bKey));
@@ -346,7 +346,7 @@ public class SerialSourceViewLifecycleTest {
                 "closed-view-polling-acquirer");
         poller.start();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (port.getWaitingCount() == 0 && System.nanoTime() < deadline) {
+        while (port.getQueueDepth() == 0 && System.nanoTime() < deadline) {
             Thread.yield();
         }
         sourceA.closePort();

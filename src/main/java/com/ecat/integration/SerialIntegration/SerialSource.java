@@ -122,6 +122,10 @@ public class SerialSource {
 
     /**
      * Backward-compatible constructor — creates an internal SerialSourcePort.
+     *
+     * @param maxWaiters 端口事务命令队列容量（队满=显式拒绝；C2 命令队列化后即准入
+     *                   背压边界；legacy 兼容值沿用调用方现值，生产建口走
+     *                   {@code SerialIntegration.COMMAND_QUEUE_CAPACITY}）
      */
     public SerialSource(SerialInfo serialInfo, int maxWaiters) {
         this.sourcePort = new SerialSourcePort(serialInfo, maxWaiters, null);

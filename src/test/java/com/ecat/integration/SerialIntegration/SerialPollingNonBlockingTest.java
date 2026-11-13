@@ -33,7 +33,7 @@ import com.ecat.core.Task.LockBusySkippedException;
  * <ul>
  *   <li>①入口非阻塞：{@code executePolling} 调用线程毫秒级拿到 future，锁忙时的等待
  *       移交 IO 旁池线程——定时线程零 park（调度安全边界保留）；</li>
- *   <li>②抢占 + 有界等待：锁忙时进入既有 FIFO {@code waitQueue} 排队（budget 内等到锁
+ *   <li>②抢占 + 有界等待：锁忙时进入端口命令队列排队（budget 内等到锁
  *       → 本轮完成事务），与写命令同队同公平；</li>
  *   <li>③真弃轮才记账：预算耗尽/队列满/旁池拒绝才以 {@link LockBusySkippedException}
  *       弃轮并使 {@code getLockBusySkipCount()} 递增——等到锁的轮次不计（观测不说谎）；</li>
@@ -117,9 +117,10 @@ public class SerialPollingNonBlockingTest {
         long elapsed = System.currentTimeMillis() - start;
         assertTrue("入口必须毫秒级返回（耗时 " + elapsed + "ms），等待在旁池不在调用线程",
                 elapsed < NON_BLOCKING_BOUND_MS);
-        assertFalse("锁忙不得立即弃轮（应进入 FIFO 有界等待）", future.isDone());
-        awaitWaitingCount(port, 1);
-        assertEquals("等待者应入等待队列", 1, port.getWaitingCount());
+        assertFalse("锁忙不得立即弃轮（应进入命令队列有界等待）", future.isDone());
+        awaitQueueDepth(port, 1);
+        assertEquals("轮询命令应入队（深度不含在飞）", 1, port.getQueueDepth());
+        assertTrue("成对观测：命令在队的同时持有者在飞", port.hasInFlight());
 
         assertTrue(port.release(held));
         assertTrue("预算内等到锁：本轮必须完成事务（相位锁定饥饿的根治点）",
@@ -173,14 +174,15 @@ public class SerialPollingNonBlockingTest {
         // 不等 first 入队就提交 second，second 可能先入队，FIFO 按入队序授予会让
         // doneAt[1] 先刻（modbus 同型镜像高并行负载下实证翻车）。先等 first 入队，
         // 入队序才确定为 [first, second]，断言测的才是「按入队序授予」这一契约本身
-        awaitWaitingCount(port, 1);
+        awaitQueueDepth(port, 1);
         CompletableFuture<Boolean> second = SerialTransactionStrategy.executePolling(
                 source, src -> {
                     doneAt[1] = System.nanoTime();
                     return CompletableFuture.completedFuture(true);
                 });
-        awaitWaitingCount(port, 2);
-        assertEquals("两个等待者都应入队", 2, port.getWaitingCount());
+        awaitQueueDepth(port, 2);
+        assertEquals("两个轮询命令都应入队（深度不含在飞）", 2, port.getQueueDepth());
+        assertTrue("成对观测：命令在队的同时持有者在飞", port.hasInFlight());
 
         assertTrue(port.release(held));
         assertTrue("队头等待者应先授予完成", first.get(5, TimeUnit.SECONDS));
@@ -209,7 +211,7 @@ public class SerialPollingNonBlockingTest {
         }
         // 事件已发生才 release：容量内 3 个先入队、超容量 1 个在锁仍被持时被拒（队列满）——
         // release 抢先会让等待者走快路径直接授予，「3 等到 + 1 弃轮」的分治退化成竞态
-        awaitWaitingCount(port, MAX_WAITERS);
+        awaitQueueDepth(port, MAX_WAITERS);
         awaitLockBusySkipCount(port, 1);
 
         assertTrue(port.release(held));
@@ -270,15 +272,17 @@ public class SerialPollingNonBlockingTest {
     }
 
     /**
-     * 等待者入队事件等待（deadline 轮询验证事件已发生，超时即失败）：锁忙等待经 IO 旁池
+     * 命令入队事件等待（deadline 轮询验证事件已发生，超时即失败）：锁忙等待经 IO 旁池
      * 异步入队，入口返回后立即读数是竞态——先等「已入队」再断言/再 release。
+     * C2 改锚：旧 getWaitingCount 计数断言锚 {@code getQueueDepth()}，与
+     * {@code hasInFlight()} 成对观测（test-migration-spec-e1-e4 §3.4 硬要求）。
      */
-    private static void awaitWaitingCount(SerialSourcePort port, int expected) {
+    private static void awaitQueueDepth(SerialSourcePort port, int expected) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (port.getWaitingCount() < expected) {
+        while (port.getQueueDepth() < expected) {
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("等待者未在 5s 内入队: expected>=" + expected
-                        + ", actual=" + port.getWaitingCount());
+                throw new AssertionError("命令未在 5s 内入队: expected>=" + expected
+                        + ", actual=" + port.getQueueDepth());
             }
         }
     }

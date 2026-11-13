@@ -70,8 +70,8 @@ public class SerialLockOwnerLifecycleTest {
     }
 
     /**
-     * 锁忙等待授予点（IO 旁池线程上排队等锁）同样登记 owner：等待者经 waitQueue 队头
-     * 接管后，lockAcquireOwner 是等待轮次的 owner 而非 null——多设备同口的归因不因
+     * 锁忙等待授予点（IO 旁池线程上排队等锁）同样登记 owner：等待者经命令队列队头
+     * 移交后，lockAcquireOwner 是等待轮次的 owner 而非 null——多设备同口的归因不因
      * 等待路径断链。持锁者用辅助线程（测试线程自持时快路径是同线程嵌套守卫的
      * fail-fast 形态，无法构造「锁忙等待」前置）。
      */
@@ -111,13 +111,13 @@ public class SerialLockOwnerLifecycleTest {
         assertNull(port.getLockAcquireOwner());
     }
 
-    /** 等待者入队事件等待（deadline 轮询：旁池异步入队，立即读数是竞态）。 */
+    /** 等待命令入队事件等待（deadline 轮询：旁池异步入队，立即读数是竞态；C2 改锚命令队列深度）。 */
     private static void awaitWaitingCount(SerialSourcePort port, int expected) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (port.getWaitingCount() < expected) {
+        while (port.getQueueDepth() < expected) {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("等待者未在 5s 内入队: expected>=" + expected
-                        + ", actual=" + port.getWaitingCount());
+                        + ", actual=" + port.getQueueDepth());
             }
         }
     }

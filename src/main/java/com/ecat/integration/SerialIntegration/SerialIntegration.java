@@ -38,6 +38,14 @@ public class SerialIntegration extends IntegrationBase implements ResourceQuery<
     // 创建路径原子性由 computeIfAbsent 承担（见 register）
     private final Map<String, SerialSourcePort> serialPorts = new ConcurrentHashMap<>();
 
+    /**
+     * 生产端口的命令队列容量（Actor 事务准入设计 §1：有界队列 192 量级，沿用
+     * {@code SerialIoPool.QUEUE_CAPACITY} 的论证口径——每口命令排队上界由共享口设备数
+     * 决定，192 覆盖全口冷启动齐发突发不拒绝；真饱和按队满=显式拒绝（轮询面弃本周期）
+     * 语义背压）。C2 前此处为 1（旧 waitQueue 的单等待者上限）。
+     */
+    static final int COMMAND_QUEUE_CAPACITY = 192;
+
     @Override
     public void onInit() {
     }
@@ -136,7 +144,7 @@ public class SerialIntegration extends IntegrationBase implements ResourceQuery<
         // 安全：lambda 只触新建端口自身的 lifecycleLock（对象未发布无竞争方）；既有
         // [lifecycleLock→removePort] 路径要求端口先入地图，与本处 [地图 bin 锁→新口] 无环
         SerialSourcePort port = serialPorts.computeIfAbsent(serialInfo.portName,
-                k -> new SerialSourcePort(serialInfo, 1, this));
+                k -> new SerialSourcePort(serialInfo, COMMAND_QUEUE_CAPACITY, this));
         return new SerialSource(port, owner);
     }
 

@@ -46,7 +46,7 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
  * {@code SerialSource#acquire/acquirePollingBounded}，按事务的时效语义选入口——
  * <ul>
  *   <li>命令/写事务 → {@link #executeWithLambda(SerialSource, Function)}：阻塞排队等锁
- *       （等待者进 waitQueue 有限等待）。命令的时效语义是「最终要执行」，等一等是正确的。</li>
+ *       （命令队列有限等待）。命令的时效语义是「最终要执行」，等一等是正确的。</li>
  *   <li>周期轮询 → {@link #executePolling(SerialSource, Function)}：经
  *       {@code acquirePollingBounded} 取锁（20260913-073600 方案 c）——无竞争快路径直达，
  *       锁忙时 FIFO 有界等待移交 IO 旁池线程（预算内等到锁 → 本轮完成事务），预算耗尽

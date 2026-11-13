@@ -2,17 +2,15 @@ package com.ecat.integration.SerialIntegration;
 
 import com.fazecast.jSerialComm.SerialPort;
 import com.ecat.integration.SerialIntegration.Listener.SerialDataListener;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.MDC;
@@ -32,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link SerialTransactionStrategy} 的两个事务入口（及 serial-tcp-server 网关这类自管
  * 收发时序的框架型消费方）调用，集成设备代码不应直接取锁。两个入口是两种调度纪律而非冗余：
  * <ul>
- *   <li>命令/写事务 → {@code executeWithLambda}：阻塞排队等锁（waitQueue 有限等待）——
+ *   <li>命令/写事务 → {@code executeWithLambda}：阻塞排队等锁（命令队列有限等待）——
  *       命令的时效语义是「最终要执行」，等是正确的；</li>
  *   <li>周期轮询 → {@code executePolling}：经 {@link #acquirePollingBounded(ResourceOwner, long)}
  *       取锁——无竞争快路径直达，锁忙时 FIFO 有界等待移交 IO 旁池线程（20260913-073600
@@ -45,12 +43,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * 自死锁形态，由同线程嵌套守卫 fail-fast 立即抛（bug-record-20260829-082100 vaisala
  * 事故：旧形态静默 park 5h44m 无声失败）。
  *
+ * <p><b>准入本体（C2 命令队列化，Actor 事务准入设计 §1/§5 阶段①）</b>：每口一条有界
+ * 命令队列（{@link #commandQueue}，容量=构造参数）+ 单点串行授予路径取代旧
+ * 「waitQueue + condition.signal 等待者竞速」形态：授予/清零的全部状态迁移
+ * （{@link #grantUnderLock}/{@link #grantNextUnderLock}/{@link #completeUnderLock}）
+ * 只在 {@code lock} 临界区内发生——release/幽灵锁收割点<b>主动移交队头</b>（确定性 FIFO，
+ * 唤醒后竞速抢锁的 handed-off race 结构性消失），等待者 park 在自己的授予回执 future 上
+ * （准入推进不占任何线程；轮询面的等待按既有契约移交 IO 旁池线程，定时线程零 park）。
+ * 队满=显式拒绝（轮询面=弃本周期语义）；收尾纪律（Q-1/A2）：移交在释放线程上内联完成，
+ * 不向任何执行者/车道线程排队。
+ *
  * @author coffee
  */
 public class SerialSourcePort {
     private static final Log log = LogFactory.getLogger(SerialSourcePort.class);
     private final Lock lock = new ReentrantLock();
-    private final Condition condition = lock.newCondition();
     private final int maxWaiters;
     private String currentKey;
     private volatile long lockAcquireTime;
@@ -69,7 +76,36 @@ public class SerialSourcePort {
      * null = 无 owner 注入（LEGACY 视图/无锁路径，归因回落 MDC/回填现状）。
      */
     private volatile ResourceOwner lockAcquireOwner;
-    private final Queue<String> waitQueue = new LinkedList<>();
+
+    /**
+     * 有界事务命令队列（准入本体，C2 命令队列化）：元素为 {@link AdmissionCommand}
+     * （一笔「请求授予」的占位：key/owner/等待线程/授予回执 future）。入队=offer（队满
+     * 显式拒绝），出队=授予点 poll（release/收割点主动移交队头）或超时方自摘 remove——
+     * 生命周期全部经 JDK 队列原语管理，无平行状态。容量=构造参数 maxWaiters（生产默认
+     * 见 {@code SerialIntegration.COMMAND_QUEUE_CAPACITY}，192 量级，设计 §1）。
+     * 入队/出队/自摘均在 {@code lock} 临界区内，与 currentKey 状态迁移原子配对。
+     */
+    private final ArrayBlockingQueue<AdmissionCommand> commandQueue;
+
+    /**
+     * 准入命令（队列元素）：等待者把「我要一次授予」物化为命令对象入队，park 在
+     * {@link #grantFuture} 上等回执——授予由释放/收割点在 lock 临界区内完成回执
+     * （确定性 FIFO 移交，无唤醒竞速窗口）。{@code granted} 仅在 lock 临界区内读写，
+     * 供超时/中断方区分「已被移交」（授予不得丢失）与「仍在队」（自摘返 null）。
+     */
+    private static final class AdmissionCommand {
+        final String key;
+        final ResourceOwner owner;
+        final Thread waiter;
+        final CompletableFuture<String> grantFuture = new CompletableFuture<>();
+        boolean granted;
+
+        AdmissionCommand(String key, ResourceOwner owner, Thread waiter) {
+            this.key = key;
+            this.owner = owner;
+            this.waiter = waiter;
+        }
+    }
 
     /**
      * 幽灵锁收割阈值：currentKey 持续超过该时长即判定持锁事务已死（release 永久缺失），
@@ -126,6 +162,7 @@ public class SerialSourcePort {
      */
     SerialSourcePort(SerialInfo serialInfo, int maxWaiters, SerialIntegration integration) {
         this.maxWaiters = maxWaiters;
+        this.commandQueue = new ArrayBlockingQueue<>(maxWaiters);
         this.serialInfo = serialInfo;
         this.integration = integration;
         this.isTestMode = detectTestEnvironment();
@@ -257,8 +294,7 @@ public class SerialSourcePort {
      * 尝试获取锁，支持等待队列和超时
      * @param timeout 超时时间
      * @param unit 时间单位
-     * @return 锁标识（成功获取/唤醒或进入等待），null表示超时、超出等待队列容量，
-     *         或唤醒后锁已被快速路径请求抢占（handed-off race 失败，按未取得总线重试）
+     * @return 锁标识（成功获取或命令队列队头移交），null表示超时或命令队列满
      */
     String acquire(long timeout, TimeUnit unit) {
         return acquire(timeout, unit, null);
@@ -271,70 +307,102 @@ public class SerialSourcePort {
 
     /**
      * 尝试获取锁，支持等待队列和超时，授予点登记持锁权威归属（io-resource-owner §4）。
-     * 两个授予点（快速路径 + 等待者队头接管）都登记；owner 为 null = 无注入（LEGACY 视图），
-     * 归因回落线程 MDC/回填现状。
+     * 两个授予点（快速路径 + 释放/收割点队头移交）都登记；owner 为 null = 无注入
+     * （LEGACY 视图），归因回落线程 MDC/回填现状。
+     *
+     * <p>C2 命令队列化：锁忙时入队 {@link AdmissionCommand} 并 park 在授予回执 future 上，
+     * 预算内被释放/收割点确定性移交（FIFO 队头，无唤醒竞速）。
+     *
+     * @param timeout 超时时间
+     * @param unit 时间单位
+     * @return 锁标识（成功获取或队头移交），null表示超时或命令队列满（队满=显式拒绝）
      */
     String acquire(long timeout, TimeUnit unit, ResourceOwner owner) {
         String requestKey = generateRequestKey();
+        AdmissionCommand cmd = new AdmissionCommand(requestKey, owner, Thread.currentThread());
         lock.lock();
         try {
             reapGhostLockIfStale("acquire");
             assertNoSameThreadNestedAcquire("acquire");
             if (currentKey == null) {
-                currentKey = requestKey;
-                grantGeneration();
-                lockAcquireTime = System.currentTimeMillis();
-                lockAcquireThread = Thread.currentThread().getName();
-                lockHolderThread = Thread.currentThread();
-                lockAcquireOwner = owner;
+                grantUnderLock(requestKey, owner, Thread.currentThread());
                 return requestKey;
-            } else {
-                if (waitQueue.size() < maxWaiters) {
-                    waitQueue.add(requestKey);
-                    boolean isAwoken = false;
-                    try {
-                        isAwoken = condition.await(timeout, unit);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        log.warn("Wait interrupted: " + requestKey);
-                        waitQueue.remove(requestKey);
-                        return null;
-                    }
-
-                    if (isAwoken) {
-                        // 接管锁必须同时满足：自己是队头 且 锁确实空闲（currentKey==null 复查不可省：
-                        // release() 发出 signal 之后、等待者重入临界区之前，另一请求可经快速路径
-                        // （currentKey==null 分支）抢先持有；若仍执行 currentKey = requestKey 会无声
-                        // 覆盖其持有权，两个 key 同时自认持锁，RS485 半双工总线上并发收发即帧碰撞。
-                        if (currentKey == null && waitQueue.peek() != null && waitQueue.peek().equals(requestKey)) {
-                            currentKey = requestKey;
-                            waitQueue.poll();
-                            grantGeneration();
-                            lockAcquireTime = System.currentTimeMillis();
-                            lockAcquireThread = Thread.currentThread().getName();
-                            lockHolderThread = Thread.currentThread();
-                            lockAcquireOwner = owner;
-                            return requestKey;
-                        }
-                        // 队头不是自己（队列变更，skip），或锁已被快速路径抢占：返回 null 前必须摘除自身
-                        // key。若残留队头即成死 key——此后每次 signal 唤醒的等待者都因队头不匹配被
-                        // 错误拒绝并同样泄漏，队列只增不减直至 maxWaiters 名额被尸体耗尽。
-                        waitQueue.remove(requestKey);
-                        return null;
-                    } else {
-                        waitQueue.remove(requestKey);
-                        log.warn("Acquire timeout: {}, lock currently held by: {} (acquired at {} by thread {}), waitQueue size: {}",
-                                requestKey, currentKey, lockAcquireTime, lockAcquireThread, waitQueue.size());
-                        return null;
-                    }
-                } else {
-                    log.warn("Max waiters exceeded, request rejected: " + requestKey);
-                    return null;
-                }
+            }
+            if (!commandQueue.offer(cmd)) {
+                log.warn("Command queue full (capacity " + maxWaiters + "), request rejected: " + requestKey);
+                return null;
             }
         } finally {
             lock.unlock();
         }
+        // 等待授予回执：park 在自己的 future 上（准入推进不占线程），移交在释放/收割线程
+        // 上内联完成（Q-1/A2 收尾纪律：不向执行者/车道线程排队）
+        try {
+            return cmd.grantFuture.get(timeout, unit);
+        } catch (java.util.concurrent.TimeoutException e) {
+            return abandonUnlessGranted(cmd, "Acquire timeout");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return abandonUnlessGranted(cmd, "Wait interrupted: " + requestKey);
+        } catch (java.util.concurrent.ExecutionException e) {
+            // 结构不可达：grantFuture 只会被 complete(key)，无异常完成路径——到达即状态机
+            // 缺陷，如实上抛不吞
+            throw new IllegalStateException("Grant future failed unexpectedly: " + requestKey, e.getCause());
+        }
+    }
+
+    /**
+     * 超时/中断方的离队或认领（lock 临界区内）：已被释放/收割点移交（granted）则授予
+     * 不得丢失——返回 key 交由调用方照常 release（与移交的竞速输家，付一次超额等待的
+     * 代价优于丢授予成幽灵锁）；仍在队则自摘占位返回 null（不泄漏、不挡后续队头）。
+     */
+    private String abandonUnlessGranted(AdmissionCommand cmd, String reason) {
+        lock.lock();
+        try {
+            if (cmd.granted) {
+                return cmd.key;
+            }
+            commandQueue.remove(cmd);
+            log.warn(reason + ": {}, lock currently held by: {} (acquired at {} by thread {}), queue depth: {}",
+                    cmd.key, currentKey, lockAcquireTime, lockAcquireThread, commandQueue.size());
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 授予状态迁移（{@code lock} 临界区内调用）：currentKey 的唯一写入口之一，两个授予点
+     * （快速路径 {@link #acquire}/{@link #acquireUncontended} 与释放/收割点队头移交
+     * {@link #grantNextUnderLock}）共用——授予与代数刷新（grantGeneration）同一临界块，
+     * 无第二套授予路径。
+     */
+    private void grantUnderLock(String key, ResourceOwner owner, Thread holderThread) {
+        currentKey = key;
+        grantGeneration();
+        lockAcquireTime = System.currentTimeMillis();
+        lockAcquireThread = holderThread.getName();
+        lockHolderThread = holderThread;
+        lockAcquireOwner = owner;
+    }
+
+    /**
+     * 释放/收割点主动移交队头（{@code lock} 临界区内调用，设计 §2「release 点主动移交
+     * 队头」）：状态清零与队头授予同一不可分割动作——不存在「currentKey==null 且队列
+     * 非空」的可观测中间态，快速路径无需复查队列，等待者无唤醒后竞速窗口（旧
+     * handed-off race 形态的结构性根除）。队头已在超时竞速中离队由 poll 自然跳过。
+     * 在执行清零的线程上内联完成（不向执行者/车道线程排队，Q-1/A2）。
+     */
+    private void grantNextUnderLock() {
+        AdmissionCommand head = commandQueue.poll();
+        if (head == null) {
+            return;
+        }
+        head.granted = true;
+        grantUnderLock(head.key, head.owner, head.waiter);
+        // 回执在临界区内完成：等待者醒来时授予状态已完全就绪；future 无依赖链
+        // （仅 get 等待方），complete 不会在临界区内级联执行任意用户代码
+        head.grantFuture.complete(head.key);
     }
 
     /** 轮询真弃轮计数（E2/R3 记账：有界等待预算耗尽才计，禁静默）。 */
@@ -349,39 +417,28 @@ public class SerialSourcePort {
         return lockBusySkipCount.get();
     }
 
-    /** 当前等待队列长度（观测面：契约测试以等待者入队为事件判据；锁内读一致快照）。 */
-    int getWaitingCount() {
-        lock.lock();
-        try {
-            return waitQueue.size();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    // ========== C1 只读观测缝（test-migration-spec-e1-e4 §5；当前为锁面实现的等价映射） ==========
+    // ========== C1 只读观测缝（test-migration-spec-e1-e4 §5；C2 已切换为命令队列本体真源） ==========
 
     /**
-     * 命令队列深度观测缝①（只读）：已提交、尚未开始执行的排队命令数，<b>不含在飞命令</b>。
-     * 锁面实现下 = 等待队列 waitQueue 深度的等价映射（等待者即「已提交未授予」的命令，
-     * 被授予即出队）；在飞与否由 {@link #hasInFlight()} 观测——两者<b>成对</b>使用才等价
-     * 覆盖旧 {@link #getWaitingCount()} 语义（单独读深度存在「深度==0 但有命令在途」盲区）。
-     * 真源 = waitQueue 本体（锁内读一致快照），无平行记账；C2 命令队列化后本方法改为
-     * 返回命令队列本体 size，语义边界（不含在飞、以队列为唯一真源）不变。
+     * 命令队列深度观测缝①（只读）：已提交、尚未开始执行的排队命令数，<b>不含在飞命令</b>
+     * （C2 兑现 C1 javadoc 承诺：真源 = 命令队列 {@link #commandQueue} 本体 size，锁内
+     * 一致快照，无平行记账——「队列内残留已死命令」可被深度断言抓住）。在飞与否由
+     * {@link #hasInFlight()} 观测——两者<b>成对</b>使用才等价覆盖旧等待者计数语义
+     * （单独读深度存在「深度==0 但有命令在途」盲区）。
      */
     int getQueueDepth() {
         lock.lock();
         try {
-            return waitQueue.size();
+            return commandQueue.size();
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * 在飞命令观测缝②（只读）：执行者是否正执行一笔命令。锁面实现下 = 端口锁已被授予
-     * 且未释放（{@code currentKey != null}）。任意采样时刻至多对应一个在飞命令
-     * （「至多一个授予者」不变量的布尔面；越序/窃取中间态的精确判据见
+     * 在飞命令观测缝②（只读）：执行者是否正执行一笔命令 = 端口锁已被授予且未释放
+     * （{@code currentKey != null}，现有状态单一真源）。任意采样时刻至多对应一个在飞
+     * 命令（「至多一个授予者」不变量的布尔面；越序/窃取中间态的精确判据见
      * {@link #getGrantedCount()}/{@link #getCompletedCount()} 计数对）。在飞命令的
      * 归属标识经既有 {@link #getLockAcquireOwner()} 观测，不另设缝。
      */
@@ -396,9 +453,10 @@ public class SerialSourcePort {
 
     /**
      * 授予计数观测缝③左半（只读）：已发生的授予数。真源 = 既有事务代数
-     * {@code txGeneration}（快速路径与等待者队头接管两个授予点均经 grantGeneration()
-     * 递增代数），零新增记账。与 {@link #getCompletedCount()} 构成结果级不变量判据：
-     * {@code granted - completed ∈ {0,1}}（任意时刻至多一个授予未完成）。
+     * {@code txGeneration}（快速路径与释放/收割点队头移交两个授予点均经
+     * grantGeneration() 递增代数），零新增记账。与 {@link #getCompletedCount()}
+     * 构成结果级不变量判据：{@code granted - completed ∈ {0,1}}（任意时刻至多一个
+     * 授予未完成）。
      */
     long getGrantedCount() {
         return txGeneration.get();
@@ -498,12 +556,7 @@ public class SerialSourcePort {
             reapGhostLockIfStale("acquire");
             assertNoSameThreadNestedAcquire("acquirePollingBounded");
             if (currentKey == null) {
-                currentKey = requestKey;
-                grantGeneration();
-                lockAcquireTime = System.currentTimeMillis();
-                lockAcquireThread = Thread.currentThread().getName();
-                lockHolderThread = Thread.currentThread();
-                lockAcquireOwner = owner;
+                grantUnderLock(requestKey, owner, Thread.currentThread());
                 return requestKey;
             }
             return null;
@@ -533,7 +586,8 @@ public class SerialSourcePort {
     }
 
     /**
-     * 释放锁
+     * 释放锁：状态清零 + <b>主动移交队头</b>（同一临界块内的不可分割动作，设计 §2）
+     *
      * @param releaseKey 要释放的锁标识
      * @return 释放是否成功
      */
@@ -541,15 +595,8 @@ public class SerialSourcePort {
         lock.lock();
         try {
             if (currentKey != null && currentKey.equals(releaseKey)) {
-                currentKey = null;
-                lockAcquireTime = 0;
-                lockAcquireThread = null;
-                lockHolderThread = null;
-                lockAcquireOwner = null;
-                completedTxCount.incrementAndGet();
-                if (!waitQueue.isEmpty()) {
-                    condition.signal();
-                }
+                completeUnderLock();
+                grantNextUnderLock();
                 return true;
             }
             log.warn("Invalid release key: " + releaseKey);
@@ -557,6 +604,19 @@ public class SerialSourcePort {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 授予完成的状态清零（{@code lock} 临界区内调用）：release 与幽灵锁收割共用的唯一
+     * 清零路径（同一状态机，无双路径漂移），与 {@link #completedTxCount} 递增同临界块。
+     */
+    private void completeUnderLock() {
+        currentKey = null;
+        lockAcquireTime = 0;
+        lockAcquireThread = null;
+        lockHolderThread = null;
+        lockAcquireOwner = null;
+        completedTxCount.incrementAndGet();
     }
 
     /** 当前持锁事务的权威归属（捕获点读；无锁/无注入为 null）。 */
@@ -571,10 +631,10 @@ public class SerialSourcePort {
      * 永久幽灵锁：后续所有 acquire 只能超时返回，端口永久瘫痪（live 实证幽灵锁持锁 45min+，
      * WEDGE-RECOVERY 反复触发不收敛）。本方法在 acquire 入口与 recoverWedgedPort 双点检查：
      * 持锁时长超过 {@link #ghostReapThresholdMs} 即按 release 同一状态机强制清零
-     * （currentKey/lockAcquireTime/lockAcquireThread + signal 等待者），杜绝第二套清锁路径漂移。
+     * （currentKey/lockAcquireTime/lockAcquireThread + 主动移交队头），杜绝第二套清锁路径漂移。
      *
-     * <p>必须在已持有 {@code lock} 的临界区内调用。收割不清空 waitQueue：等待者仍按
-     * 队头接管规则被 signal 唤醒，超时者自行摘除（既有语义不变）。
+     * <p>必须在已持有 {@code lock} 的临界区内调用。收割不清空 commandQueue：队头命令由
+     * 移交直接授予（超时竞速输家按 granted 认领，仍在队者自行摘除——既有语义不变）。
      *
      * @param trigger 触发点标识（日志定位用：acquire / wedge-recovery）
      */
@@ -587,19 +647,12 @@ public class SerialSourcePort {
             return;
         }
         log.error("[GHOST-LOCK-REAPED] port={}, trigger={}, 幽灵锁持锁 {}ms 超阈值 {}ms（持锁 key={}, 持锁线程={}），"
-                        + "按 release 同一状态机强制清零，等待者 {} 个被唤醒",
+                        + "按 release 同一状态机强制清零，队头命令 {} 个在队待移交",
                 serialInfo.portName, trigger, heldMs, ghostReapThresholdMs,
-                currentKey, lockAcquireThread, waitQueue.size());
-        // 与 release() 完全一致的状态清零 + 唤醒（同一状态机，无双路径漂移）
-        currentKey = null;
-        lockAcquireTime = 0;
-        lockAcquireThread = null;
-        lockHolderThread = null;
-        lockAcquireOwner = null;
-        completedTxCount.incrementAndGet();
-        if (!waitQueue.isEmpty()) {
-            condition.signal();
-        }
+                currentKey, lockAcquireThread, commandQueue.size());
+        // 与 release() 完全一致的状态清零 + 队头移交（同一状态机，无双路径漂移）
+        completeUnderLock();
+        grantNextUnderLock();
     }
 
     /**
@@ -607,7 +660,7 @@ public class SerialSourcePort {
      * （bug-record-20260829-082100）的 SDK 层加固。事务体经 SerialTransactionStrategy
      * 的 executeHeld 在发起线程上同步执行（轮询快路径在定时线程、写路径在业务线程）——
      * round/事务临界体内再经 executeWithLambda/executePolling 二次取锁时，等待者与
-     * 持有者是同一线程（等待 key 与持有 key 同为毫秒-线程ID），condition.await 永远等
+     * 持有者是同一线程（等待 key 与持有 key 同为毫秒-线程ID），授予回执 future 永远等
      * 不到自己的 release：旧形态阻塞到超时返 null（live 实证同一线程静默空转 5h44m，
      * Acquire timeout 日志一直在却无人醒），守卫改为微秒级立即抛，错误直达根因。
      * 审计结论（36 号 §二）：20 仓全扫不存在合法的同线程嵌套取锁，无人依赖可重入。
