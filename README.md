@@ -43,10 +43,6 @@ ByteResponseHandlerStrategy<byte[]> strategy = new ByteResponseHandlerStrategy<>
 );
 ```
 
-### DefaultResponseHandlerStrategy（已废弃）
-
-**仅用于向后兼容，将在未来版本移除**。新集成请勿使用。
-
 ## SDK 快速上手（主动轮询 SerialPolling，L3 设备仓标准入口）
 
 设备仓的周期采集**只走本 SDK**（L2 传输 SDK 层轮询模式，17 号 v2.1 §2.1）——调度注册/源锁（锁忙有界等待，预算耗尽才弃轮）/事务级硬超时/异常韧性（永不注销）/统一日志全部内置（连续失败→恢复有断连状态转移行：首败 WARN/恢复 INFO 去重），设备仓的执行词汇只剩 round 函数（每轮读什么）+ 属性灌入：
@@ -230,7 +226,7 @@ RECONFIGURE 后设备重 load 时，新 comm 设置经 `SerialSourcePort.applyRe
 
 ### 双读法机制与模式选择
 
-应答策略（`ByteResponseHandlerStrategy` / `DefaultResponseHandlerStrategy`）是双读法：**生产=中断驱动监听**（源上挂监听器，应答字节到达即触发），**测试=legacy 轮询**（`asyncReadDataBytes` 轮询读 + 帧判完整回调）。模式在策略构造期一次性定型，**只能由显式信号选择**，按优先级：
+应答策略（`ByteResponseHandlerStrategy`）是双读法：**生产=中断驱动监听**（源上挂监听器，应答字节到达即触发），**测试=legacy 轮询**（`asyncReadDataBytes` 轮询读 + 帧判完整回调）。模式在策略构造期一次性定型，**只能由显式信号选择**，按优先级：
 
 1. 源对象 `isTestMode()`（`SerialSourcePort` 构造时读取的显式信号）；
 2. 源对象类名含 `$`（字节码动态生成的代理形态）；

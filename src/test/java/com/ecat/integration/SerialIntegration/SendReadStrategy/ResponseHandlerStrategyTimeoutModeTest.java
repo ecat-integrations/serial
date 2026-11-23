@@ -28,31 +28,27 @@ public class ResponseHandlerStrategyTimeoutModeTest {
     @Test
     public void dynamicTimeoutMustFollowSerialSourceCurrentValue() throws Exception {
         SerialSource source = newSerialSource(2000);
-        Object[] strategies = newDynamicStrategies(source);
+        ByteResponseHandlerStrategy<String> strategy = newDynamicStrategy(source);
 
-        List<Long> delays = invokeAndCaptureDelays(strategies);
+        List<Long> delays = invokeAndCaptureDelays(strategy);
         assertEquals(Long.valueOf(2000L), delays.get(0));
-        assertEquals(Long.valueOf(2000L), delays.get(1));
 
         when(source.getTimeout()).thenReturn(50);
-        delays = invokeAndCaptureDelays(strategies);
+        delays = invokeAndCaptureDelays(strategy);
         assertEquals(Long.valueOf(50L), delays.get(0));
-        assertEquals(Long.valueOf(50L), delays.get(1));
     }
 
     @Test
     public void explicitTimeoutMustBeFixed() throws Exception {
         SerialSource source = newSerialSource(2000);
-        Object[] strategies = newExplicitStrategies(source, 500L);
+        ByteResponseHandlerStrategy<String> strategy = newExplicitStrategy(source, 500L);
 
-        List<Long> delays = invokeAndCaptureDelays(strategies);
+        List<Long> delays = invokeAndCaptureDelays(strategy);
         assertEquals(Long.valueOf(500L), delays.get(0));
-        assertEquals(Long.valueOf(500L), delays.get(1));
 
         when(source.getTimeout()).thenReturn(50);
-        delays = invokeAndCaptureDelays(strategies);
+        delays = invokeAndCaptureDelays(strategy);
         assertEquals(Long.valueOf(500L), delays.get(0));
-        assertEquals(Long.valueOf(500L), delays.get(1));
     }
 
     @Test
@@ -60,10 +56,9 @@ public class ResponseHandlerStrategyTimeoutModeTest {
         assertFallbackForNullSource();
 
         SerialSource source = newSerialSource(0);
-        Object[] strategies = newDynamicStrategies(source);
-        List<Long> delays = invokeAndCaptureDelays(strategies);
+        ByteResponseHandlerStrategy<String> strategy = newDynamicStrategy(source);
+        List<Long> delays = invokeAndCaptureDelays(strategy);
         assertEquals(Long.valueOf(Const.READ_TIMEOUT_MS.longValue()), delays.get(0));
-        assertEquals(Long.valueOf(Const.READ_TIMEOUT_MS.longValue()), delays.get(1));
     }
 
     private static SerialSource newSerialSource(int timeout) {
@@ -79,25 +74,17 @@ public class ResponseHandlerStrategyTimeoutModeTest {
         return source;
     }
 
-    private static Object[] newDynamicStrategies(SerialSource source) {
-        return new Object[] {
-            new ByteResponseHandlerStrategy<>(
-                    source, context -> true, bytes -> null, exception -> false),
-            new DefaultResponseHandlerStrategy<>(
-                    source, context -> true, buffer -> null, exception -> false),
-        };
+    private static ByteResponseHandlerStrategy<String> newDynamicStrategy(SerialSource source) {
+        return new ByteResponseHandlerStrategy<>(
+                source, context -> true, bytes -> null, exception -> false);
     }
 
-    private static Object[] newExplicitStrategies(SerialSource source, long timeoutMs) {
-        return new Object[] {
-            new ByteResponseHandlerStrategy<>(
-                    source, context -> true, bytes -> null, exception -> false, timeoutMs),
-            new DefaultResponseHandlerStrategy<>(
-                    source, context -> true, buffer -> null, exception -> false, timeoutMs),
-        };
+    private static ByteResponseHandlerStrategy<String> newExplicitStrategy(SerialSource source, long timeoutMs) {
+        return new ByteResponseHandlerStrategy<>(
+                source, context -> true, bytes -> null, exception -> false, timeoutMs);
     }
 
-    private List<Long> invokeAndCaptureDelays(Object[] strategies) throws Exception {
+    private List<Long> invokeAndCaptureDelays(ByteResponseHandlerStrategy<String> strategy) throws Exception {
         ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
         ScheduledFuture<?> timeoutTask = mock(ScheduledFuture.class);
         List<Long> delays = new ArrayList<>();
@@ -108,38 +95,25 @@ public class ResponseHandlerStrategyTimeoutModeTest {
                 });
         SerialTimeoutScheduler.bind(scheduler);
         try {
-            for (Object strategy : strategies) {
-                invokeInterrupt(strategy);
-            }
+            invokeInterrupt(strategy);
         } finally {
             SerialTimeoutScheduler.unbind();
         }
-        assertEquals(strategies.length, delays.size());
+        assertEquals(1, delays.size());
         return delays;
     }
 
-    private static void invokeInterrupt(Object strategy) throws Exception {
+    private static void invokeInterrupt(ByteResponseHandlerStrategy<String> strategy) throws Exception {
         Method method = strategy.getClass().getDeclaredMethod(
-                "handleResponseInterrupt", interruptContextType(strategy));
+                "handleResponseInterrupt", ByteResponseHandlingContext.class);
         method.setAccessible(true);
-        Object context = strategy instanceof ByteResponseHandlerStrategy
-                ? new ByteResponseHandlingContext<String>("unused")
-                : new ResponseHandlingContext<String>("unused");
-        method.invoke(strategy, context);
-    }
-
-    private static Class<?> interruptContextType(Object strategy) {
-        return strategy instanceof ByteResponseHandlerStrategy
-                ? ByteResponseHandlingContext.class
-                : ResponseHandlingContext.class;
+        method.invoke(strategy, new ByteResponseHandlingContext<String>("unused"));
     }
 
     private static void assertFallbackForNullSource() throws Exception {
-        Object[] strategies = newDynamicStrategies(null);
-        for (Object strategy : strategies) {
-            Method method = strategy.getClass().getDeclaredMethod("currentTimeoutMs");
-            method.setAccessible(true);
-            assertEquals(Const.READ_TIMEOUT_MS.longValue(), method.invoke(strategy));
-        }
+        ByteResponseHandlerStrategy<String> strategy = newDynamicStrategy(null);
+        Method method = strategy.getClass().getDeclaredMethod("currentTimeoutMs");
+        method.setAccessible(true);
+        assertEquals(Const.READ_TIMEOUT_MS.longValue(), method.invoke(strategy));
     }
 }

@@ -127,7 +127,7 @@ public class SerialTransactionStrategyLockLeakTest {
 
     /**
      * 契约：默认（2 参重载）事务硬超时由设备配置的串口超时派生（× {@link SerialTransactionStrategy#TRANSACTION_TIMEOUT_FACTOR}），
-     * 与现有 DefaultResponseHandlerStrategy / ByteResponseHandlerStrategy 的
+     * 与应答策略 {@link com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlerStrategy} 的
      * {@code source.getTimeout() > 0 ? source.getTimeout() : Const.READ_TIMEOUT_MS} 模式一致。
      */
     @Test

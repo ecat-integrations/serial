@@ -1350,13 +1350,10 @@ public class SerialSourcePort {
      */
     private boolean detectTestEnvironment() {
         // 1. 检查系统属性（唯一读取点 SerialTestSignals；端口构造期无源对象可查，
-        //    mock/代理类名等源对象级信号由两族应答策略对端口实例判定）
+        //    mock/代理类名等源对象级信号由应答策略对端口实例判定）
         if (SerialTestSignals.testModeDeclared() || SerialTestSignals.junitPropertyPresent()) {
             return true;
         }
-
-        // 2. 检查是否为 Mock（这个检测在实际创建对象时可能不适用）
-        // 留给 DefaultResponseHandlerStrategy 进行更精确的检测
 
         return false;
     }

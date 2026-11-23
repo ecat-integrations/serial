@@ -137,15 +137,6 @@ public class SerialSource {
     // ========== Delegating methods (→ sourcePort) ==========
 
     /**
-     * @deprecated 推荐使用 {@link #asyncSendData(byte[])} 方法
-     */
-    @Deprecated
-    public CompletableFuture<Boolean> asyncSendData(String data) {
-        byte[] bytes = data != null ? data.getBytes() : new byte[0];
-        return asyncSendData(bytes);
-    }
-
-    /**
      * 新的主力发送数据方法 - 发送字节数组
      * 使用独立的串口通信线程池，避免被其他任务阻塞
      * @param bytes 要发送的字节数组
@@ -156,19 +147,6 @@ public class SerialSource {
             return failedFuture(new SerialSourceClosedException("asyncSendData", getPortName(), identity));
         }
         return sourcePort.asyncSendData(this, bytes);
-    }
-
-    /**
-     * @deprecated 只为兼容其他集成旧测试用例，新的要使用 {@link #asyncReadDataBytes()} 方法
-     */
-    @Deprecated
-    public CompletableFuture<String> asyncReadData() {
-        return asyncReadDataBytes().thenApply(bytes -> {
-            if (bytes != null && bytes.length > 0) {
-                return new String(bytes);
-            }
-            return "";
-        });
     }
 
     /**

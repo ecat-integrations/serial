@@ -7,22 +7,14 @@
 ```
 SerialDataListener (接口)
     ↑
-    ├── PooledSerialDataListener (String 数据)
-    │     └── PoolableListener
-    │
     └── BytePooledSerialDataListener (byte[] 数据)
           └── PoolableListener
 
 GenericSerialDataListenerPool<T extends PoolableListener>
-    ├── STRING_POOL: GenericSerialDataListenerPool<PooledSerialDataListener>
     └── BYTE_POOL: GenericSerialDataListenerPool<BytePooledSerialDataListener>
 
 SerialListenerPools (单例管理类)
-    ├── STRING_POOL
     └── BYTE_POOL
-
-SerialDataListenerPool (便捷访问类)
-    └── 委托给 SerialListenerPools.STRING_POOL
 
 SerialSourceEventAdapter
     └── 将 jSerialComm 事件适配为 SerialDataListener 通知
@@ -38,9 +30,6 @@ SerialSourceEventAdapter
 
 ## 实现类
 
-### PooledSerialDataListener
-字符串数据监听器，用于处理基于 String 的串口通信。
-
 ### BytePooledSerialDataListener
 字节数据监听器，用于处理基于 byte[] 的串口通信。
 
@@ -50,12 +39,8 @@ SerialSourceEventAdapter
 泛型监听器池，使用全局共享池管理监听器实例，避免 CompletableFuture 回调中的跨线程问题。
 
 ### SerialListenerPools
-单例管理类，统一管理字符串和字节两种监听器池：
-- `STRING_POOL`: 管理 PooledSerialDataListener
+单例管理类，统一管理字节监听器池：
 - `BYTE_POOL`: 管理 BytePooledSerialDataListener
-
-### SerialDataListenerPool
-便捷访问类，委托给 SerialListenerPools.STRING_POOL。
 
 ## 事件适配器
 
@@ -63,15 +48,6 @@ SerialSourceEventAdapter
 将 jSerialComm 的 `SerialPortEvent` 适配为 `SerialDataListener` 通知，实现中断驱动模式。
 
 ## 使用方式
-
-### 字符串模式 (DefaultResponseHandlerStrategy)
-```java
-PooledSerialDataListener listener = SerialDataListenerPool.acquire();
-listener.reset(context, responseFuture, serialSource, checkFunction);
-serialSource.addDataListener(listener);
-// ... 数据接收完成后
-SerialDataListenerPool.release(listener);
-```
 
 ### 字节模式 (ByteResponseHandlerStrategy)
 ```java
@@ -86,5 +62,5 @@ SerialListenerPools.BYTE_POOL.release(listener);
 
 1. **对象池模式**: 复用监听器实例，减少 GC 压力
 2. **全局共享池**: 避免跨线程释放问题
-3. **接口隔离**: String 和 byte[] 两种数据类型分别处理
+3. **字节载体**: 串口数据统一以 byte[] 处理，文本协议由调用方显式字符集解码
 4. **类型安全**: 使用泛型确保类型安全

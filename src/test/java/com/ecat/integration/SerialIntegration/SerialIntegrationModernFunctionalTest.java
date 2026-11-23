@@ -1,15 +1,14 @@
 package com.ecat.integration.SerialIntegration;
 
-import com.ecat.integration.SerialIntegration.Listener.SerialDataListenerPool;
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.After;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
-
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
 
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -17,8 +16,8 @@ import static org.mockito.Mockito.*;
 
 /**
  * SerialIntegration 现代 API 功能测试
- * 使用推荐的现代 API，避免 deprecated 方法
- * 
+ * 使用推荐的现代 byte[] API 与显式字符集解码
+ *
  * @author coffee
  */
 public class SerialIntegrationModernFunctionalTest {
@@ -38,28 +37,23 @@ public class SerialIntegrationModernFunctionalTest {
 
         // 只使用现代 API
         when(mockSerialSource.asyncReadDataBytes())
-                .thenReturn(CompletableFuture.completedFuture("".getBytes()));
-    }
-
-    @After
-    public void tearDown() {
-        // 清理资源
-        SerialDataListenerPool.cleanup();
+                .thenReturn(CompletableFuture.completedFuture(new byte[0]));
     }
 
     @Test
     public void testModernAPIUsageBestPractices() {
-        // 演示现代API的最佳实践 - 完全避免 DefaultResponseHandlerStrategy
+        // 演示现代 byte[] API 的最佳实践：读字节、显式字符集解码
         AtomicReference<String> receivedData = new AtomicReference<>();
 
         // 使用推荐的 byte[] API 进行数据读取
         when(mockSerialSource.asyncReadDataBytes())
-                .thenReturn(CompletableFuture.completedFuture("sensor:25.5,30.2,15.8".getBytes()));
+                .thenReturn(CompletableFuture.completedFuture(
+                        "sensor:25.5,30.2,15.8".getBytes(StandardCharsets.US_ASCII)));
 
-        // 直接使用现代 API，不依赖 DefaultResponseHandlerStrategy
+        // 直接使用现代 API 读取并解码
         CompletableFuture<String> dataFuture = mockSerialSource.asyncReadDataBytes()
                 .thenApply(bytes -> {
-                    String data = new String(bytes);
+                    String data = new String(bytes, StandardCharsets.US_ASCII);
                     receivedData.set(data);
                     return data;
                 });
@@ -79,12 +73,13 @@ public class SerialIntegrationModernFunctionalTest {
 
         // 模拟传感器数据
         when(mockSerialSource.asyncReadDataBytes())
-                .thenReturn(CompletableFuture.completedFuture("TEMP:25.5,HUM:60.2,PRES:1013.25".getBytes()));
+                .thenReturn(CompletableFuture.completedFuture(
+                        "TEMP:25.5,HUM:60.2,PRES:1013.25".getBytes(StandardCharsets.US_ASCII)));
 
         // 使用现代 API 处理数据
         CompletableFuture<Boolean> result = mockSerialSource.asyncReadDataBytes()
                 .thenApply(bytes -> {
-                    String data = new String(bytes);
+                    String data = new String(bytes, StandardCharsets.US_ASCII);
                     processedData.set(data);
 
                     // 解析传感器数据
@@ -108,7 +103,8 @@ public class SerialIntegrationModernFunctionalTest {
     public void testTransactionStrategyBasic() throws Exception {
         // 测试基本的SerialTransactionStrategy使用
         when(mockSerialSource.asyncReadDataBytes())
-                .thenReturn(CompletableFuture.completedFuture("test-data".getBytes()));
+                .thenReturn(CompletableFuture.completedFuture(
+                        "test-data".getBytes(StandardCharsets.US_ASCII)));
 
         AtomicBoolean operationCompleted = new AtomicBoolean(false);
 
@@ -120,7 +116,7 @@ public class SerialIntegrationModernFunctionalTest {
 
                     return src.asyncReadDataBytes()
                             .thenApply(bytes -> {
-                                String data = new String(bytes);
+                                String data = new String(bytes, StandardCharsets.US_ASCII);
                                 operationCompleted.set(true);
                                 return data.equals("test-data");
                             });
@@ -149,7 +145,7 @@ public class SerialIntegrationModernFunctionalTest {
                 mockSerialSource,
                 src -> {
                     return src.asyncReadDataBytes()
-                            .thenApply(bytes -> new String(bytes))
+                            .thenApply(bytes -> new String(bytes, StandardCharsets.US_ASCII))
                             .thenApply(str -> true);
                 }
         );
@@ -170,7 +166,7 @@ public class SerialIntegrationModernFunctionalTest {
     @Test
     public void testModernSendDataAPI() throws Exception {
         // 测试现代的数据发送 API
-        byte[] testData = "AT+COMMAND\r\n".getBytes();
+        byte[] testData = "AT+COMMAND\r\n".getBytes(StandardCharsets.US_ASCII);
 
         // 使用现代 API 发送数据
         when(mockSerialSource.asyncSendData(testData))
@@ -183,30 +179,5 @@ public class SerialIntegrationModernFunctionalTest {
 
         // 验证使用了现代 API
         verify(mockSerialSource, times(1)).asyncSendData(testData);
-    }
-
-    @Test
-    public void testResponseHandlingContextFunctionality() {
-        // 测试 ResponseHandlingContext 的功能，但不使用 getNewValue()
-        AtomicReference<String> capturedValue = new AtomicReference<>();
-
-        // 使用外部变量而不是 getNewValue()
-        String testValue = "test-context-value";
-        capturedValue.set(testValue);
-
-        // 验证值被正确捕获
-        assertEquals("Value should be captured correctly", testValue, capturedValue.get());
-
-        // 演示现代做法：使用 AtomicReference 在 lambda 之间传递值
-        AtomicReference<String> lambdaResult = new AtomicReference<>();
-
-        CompletableFuture<String> future = CompletableFuture.completedFuture("sensor-data")
-                .thenApply(data -> {
-                    lambdaResult.set(data.toUpperCase());
-                    return data;
-                });
-
-        assertTrue("Future should complete", future.isDone());
-        assertEquals("Lambda should have processed data", "SENSOR-DATA", lambdaResult.get());
     }
 }

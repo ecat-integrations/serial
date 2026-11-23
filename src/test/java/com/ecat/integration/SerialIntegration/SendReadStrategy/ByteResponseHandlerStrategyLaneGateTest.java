@@ -42,12 +42,11 @@ import com.ecat.integration.SerialIntegration.Listener.SerialListenerPools;
 import com.ecat.integration.SerialIntegration.SerialSource;
 
 /**
- * 字节族响应策略的车道门控回归（bug-record-20260826-123000 / F-47 串口层根因，
- * 字节族孪生位点）。
+ * 字节族响应策略的车道门控回归（bug-record-20260826-123000 / F-47 串口层根因）。
  *
- * <p>与 {@link DefaultResponseHandlerStrategyLaneGateTest} 同型缺陷：返回 future 被
+ * <p>缺陷形态：返回 future 被
  * {@code whenCompleteAsync(清理, 端口车道)} 门控，车道被 join 等待方占住时超时已完成而返回
- * future 永不完成。验证手法与契约同彼处：反射直调 handleResponseInterrupt 绕过 legacy 探测，
+ * future 永不完成。验证手法与契约：反射直调 handleResponseInterrupt 绕过 legacy 探测，
  * 预 park 的单线程车道执行域 + 本地绑定超时调度器 + isDone 轮询等待。
  */
 public class ByteResponseHandlerStrategyLaneGateTest {

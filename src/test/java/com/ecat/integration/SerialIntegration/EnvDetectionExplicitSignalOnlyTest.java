@@ -11,7 +11,6 @@ import java.lang.reflect.Method;
 import org.junit.Test;
 
 import com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlerStrategy;
-import com.ecat.integration.SerialIntegration.SendReadStrategy.DefaultResponseHandlerStrategy;
 import com.fazecast.jSerialComm.SerialPort;
 
 /**
@@ -59,7 +58,7 @@ public class EnvDetectionExplicitSignalOnlyTest {
         withSystemProperty("test.mode", value, assertion);
     }
 
-    /** 模式位读取：两策略类的判定结果都落在构造期定型的私有 useLegacyMode 字段。 */
+    /** 模式位读取：策略类的判定结果落在构造期定型的私有 useLegacyMode 字段。 */
     private static boolean legacyModeOf(Object strategy) throws Exception {
         Field mode = strategy.getClass().getDeclaredField("useLegacyMode");
         mode.setAccessible(true);
@@ -83,11 +82,6 @@ public class EnvDetectionExplicitSignalOnlyTest {
     /** 反射构造工厂：Method.invoke 使栈携带 sun.reflect 帧（复刻 Spring MVC 反射分发形态）。 */
     private static ByteResponseHandlerStrategy<String> newByteStrategyViaReflectiveDispatch(SerialSource source) {
         return new ByteResponseHandlerStrategy<>(source, ctx -> true, bytes -> null, ex -> false, 200L);
-    }
-
-    /** 反射构造工厂（String 族孪生策略，同 {@link #newByteStrategyViaReflectiveDispatch}）。 */
-    private static DefaultResponseHandlerStrategy<String> newDefaultStrategyViaReflectiveDispatch(SerialSource source) {
-        return new DefaultResponseHandlerStrategy<>(source, ctx -> true, text -> null, ex -> false, 200L);
     }
 
     @Test
@@ -115,7 +109,7 @@ public class EnvDetectionExplicitSignalOnlyTest {
         withSystemProperty("junit", "true", () -> withTestMode("false", () -> {
             SerialSourcePort port = new SerialSourcePort(
                     new SerialInfo("ttyUT-ENVPROBE-J", 9600, 8, 1, SerialPort.NO_PARITY), 1, null);
-            assertTrue("junit 系统属性是属性级显式信号，端口应与两族策略一致认进测试模式"
+            assertTrue("junit 系统属性是属性级显式信号，端口应与应答策略一致认进测试模式"
                     + "（属性读取收敛到 SerialTestSignals 时对齐家族契约，此前端口漏认此信号）",
                     port.isTestMode());
         }));
@@ -193,71 +187,6 @@ public class EnvDetectionExplicitSignalOnlyTest {
             ByteResponseHandlerStrategy<String> strategy = new ByteResponseHandlerStrategy<>(
                     mockSource, ctx -> true, bytes -> null, ex -> false, 200L);
             assertTrue("mockito mock 源在测试 JVM 属性信号下必须保持 legacy 轮询模式"
-                    + "（存量 mock 派设备测试的轮询读闸依赖此路径）", legacyModeOf(strategy));
-        });
-    }
-
-    @Test
-    @SuppressWarnings({"deprecation", "unchecked"})
-    public void defaultStrategy_constructedOnRealSourceWithProductionSignal_mustUseInterruptMode() throws Exception {
-        withTestMode("false", () -> {
-            SerialSource source = newRealSourceOnPresetPort();
-            try {
-                // String 族孪生策略虽标记 @Deprecated 仍在生产路径使用，检测逻辑与字节族复制同源，
-                // 须同样锁死（事故调查确认两处栈扫描并存）
-                DefaultResponseHandlerStrategy<String> strategy = new DefaultResponseHandlerStrategy<>(
-                        source, ctx -> true, text -> null, ex -> false, 200L);
-                assertFalse("test.mode=false + 真实源：String 族策略必须是生产（中断）模式",
-                        legacyModeOf(strategy));
-            } finally {
-                source.closePort();
-            }
-        });
-    }
-
-    @Test
-    @SuppressWarnings({"deprecation", "unchecked"})
-    public void defaultStrategy_constructedViaReflectionDispatch_mustUseInterruptMode() throws Exception {
-        withTestMode("false", () -> {
-            SerialSource source = newRealSourceOnPresetPort();
-            try {
-                Method factory = EnvDetectionExplicitSignalOnlyTest.class.getDeclaredMethod(
-                        "newDefaultStrategyViaReflectiveDispatch", SerialSource.class);
-                factory.setAccessible(true);
-                DefaultResponseHandlerStrategy<String> strategy =
-                        (DefaultResponseHandlerStrategy<String>) factory.invoke(null, source);
-                assertFalse("反射分发栈（sun.reflect 帧）不得触发 String 族策略的测试模式判定",
-                        legacyModeOf(strategy));
-            } finally {
-                source.closePort();
-            }
-        });
-    }
-
-    @Test
-    @SuppressWarnings("deprecation")
-    public void defaultStrategy_dollarShapedSourceClass_withoutPropertySignal_mustStayLegacyMode() throws Exception {
-        withTestMode("false", () -> {
-            SerialSource source = newDollarShapedSource();
-            try {
-                DefaultResponseHandlerStrategy<String> strategy = new DefaultResponseHandlerStrategy<>(
-                        source, ctx -> true, text -> null, ex -> false, 200L);
-                assertTrue("类名含 $ 的动态生成源：String 族策略无属性信号时必须保持 legacy"
-                        + "（代理/字节码生成对象的兼容基线）", legacyModeOf(strategy));
-            } finally {
-                source.closePort();
-            }
-        });
-    }
-
-    @Test
-    @SuppressWarnings("deprecation")
-    public void defaultStrategy_mockitoMockSource_underTestJvmProperty_mustStayLegacyMode() throws Exception {
-        withTestMode("true", () -> {
-            SerialSource mockSource = mock(SerialSource.class);
-            DefaultResponseHandlerStrategy<String> strategy = new DefaultResponseHandlerStrategy<>(
-                    mockSource, ctx -> true, text -> null, ex -> false, 200L);
-            assertTrue("mockito mock 源在测试 JVM 属性信号下 String 族策略必须保持 legacy 模式"
                     + "（存量 mock 派设备测试的轮询读闸依赖此路径）", legacyModeOf(strategy));
         });
     }
