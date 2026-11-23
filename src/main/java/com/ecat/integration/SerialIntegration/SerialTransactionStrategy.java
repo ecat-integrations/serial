@@ -89,8 +89,7 @@ public class SerialTransactionStrategy {
     }
 
     /**
-     * 解析默认事务级硬超时（毫秒）：参考现有模式
-     * {@code DefaultResponseHandlerStrategy} / {@code ByteResponseHandlerStrategy}
+     * 解析默认事务级硬超时（毫秒）：沿用 {@code ByteResponseHandlerStrategy} 的既有模式
      * （{@code source.getTimeout() > 0 ? source.getTimeout() : Const.READ_TIMEOUT_MS}）取设备配置的串口超时，
      * 再按 {@link #TRANSACTION_TIMEOUT_FACTOR} 放大以覆盖含多次读的整事务。
      *

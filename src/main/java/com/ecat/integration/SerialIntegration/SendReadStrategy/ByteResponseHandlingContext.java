@@ -5,7 +5,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * ResponseHandlingContext for binary data handling.
+ * Response handling context for byte-based serial communication.
  * Uses ByteArrayOutputStream for efficient byte array operations.
  *
  * @param <T> The type of value being set during the operation
