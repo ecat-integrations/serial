@@ -193,7 +193,8 @@ public class SerialSourcePort {
      */
     String acquire(long timeout, TimeUnit unit, ResourceOwner owner, SerialSource session) {
         long waitMs = Math.max(0L, unit.toMillis(timeout));
-        SerialPortExecutor.Conversation conv = executor.trySubmitHeld(session, owner, waitMs, waitMs);
+        SerialPortExecutor.Conversation conv = executor.trySubmitHeld(session, owner,
+                SerialPortExecutor.Priority.HIGH, waitMs, waitMs);
         if (conv == null) {
             return null;
         }
@@ -269,7 +270,8 @@ public class SerialSourcePort {
         if (budgetMs <= 0) {
             throw new IllegalArgumentException("acquirePollingBounded 要求 budgetMs > 0: " + budgetMs);
         }
-        SerialPortExecutor.Conversation conv = executor.trySubmitHeld(session, owner, budgetMs, budgetMs);
+        SerialPortExecutor.Conversation conv = executor.trySubmitHeld(session, owner,
+                SerialPortExecutor.Priority.NORMAL, budgetMs, budgetMs);
         if (conv == null) {
             // 队满=本周期真弃轮（记账已由执行者完成），CF 以 null 完成（对外行为保持）
             return CompletableFuture.completedFuture(null);

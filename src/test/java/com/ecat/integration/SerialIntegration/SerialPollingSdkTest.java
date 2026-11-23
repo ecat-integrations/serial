@@ -511,6 +511,42 @@ public class SerialPollingSdkTest {
         assertTrue("恢复轮须回调 (true, null)", successCallback.await(AWAIT_MS, TimeUnit.MILLISECONDS));
     }
 
+    /**
+     * 队满跳过内化（serial IO 最小模型 §3.5）：口被占用且对话队列已满时，轮询提交以
+     * {@link PortQueueFullException}（LockBusySkippedException 子类）异常完成——SDK 沿
+     * isLockBusySkip 继承链内部消化为「本轮跳过」，onRound 不回调、链不注销、网格照常
+     * 推进；队满=真弃轮，记账可观测。
+     */
+    @Test
+    public void queueFullRoundIsInternalizedAsSkip() throws Exception {
+        String heldKey = port.acquire(1, TimeUnit.SECONDS);
+        assertNotNull("前置：测试线程占口", heldKey);
+        // 预填对话队列（容量 1）：一条挂起的轮询对话占满队列
+        SerialTransactionStrategy.executePolling(source, src -> new CompletableFuture<>(), 60_000L);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_MS);
+        while (port.queuedConversations() < 1 && System.nanoTime() < deadlineNanos) {
+            Thread.yield();
+        }
+        assertEquals("前置：队列应已填满（容量 1）", 1, port.queuedConversations());
+
+        CountDownLatch roundRan = new CountDownLatch(1);
+        AtomicInteger callbacks = new AtomicInteger();
+        handle = SerialPolling.on(device, source)
+                .round(src -> {
+                    roundRan.countDown();
+                    return CompletableFuture.completedFuture(true);
+                })
+                .every(PERIOD_MS, TimeUnit.MILLISECONDS)
+                .onRound((result, ex) -> callbacks.incrementAndGet())
+                .start();
+        // 队满弃轮是提交点同步事件（skip 记账即时发生）；负向断言用有界窗（round 不执行、不回调）
+        awaitLockBusySkipCount(1);
+        assertFalse("队满轮 round 不得执行（提交即被拒）", roundRan.await(500, TimeUnit.MILLISECONDS));
+        assertEquals("队满轮 onRound 不得回调（跳过语义内部消化，不外泄）", 0, callbacks.get());
+        assertTrue("队满轮后轮询不得注销（下周期再试）", handle.isRunning());
+        assertTrue(port.release(heldKey));
+    }
+
     /** 真弃轮记账事件等待（deadline 轮询：预算耗尽的记账发生在旁池线程，立即读数是竞态）。 */
     private void awaitLockBusySkipCount(long expected) {
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_MS);

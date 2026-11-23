@@ -349,11 +349,14 @@ final class SerialPortExecutor {
     }
 
     /**
-     * 提交 HELD 对话（同步 acquire 的承载）：授予回执经 {@code granted}；
-     * 队满返回 null（acquire 契约「null=超时或队列满」，不抛）。
+     * 提交 HELD 对话（同步 acquire / 轮询有界取口的承载）：授予回执经 {@code granted}；
+     * 队满返回 null（acquire 契约「null=超时或队列满」，不抛）。优先级按入口语义：
+     * acquire=高（§3.5 其余入口），acquirePollingBounded=普通（轮询入口，弃轮走
+     * LockBusySkippedException 记账语义）。
      */
-    Conversation trySubmitHeld(SerialSource session, ResourceOwner owner, long waitMs, long holdTimeoutMs) {
-        Conversation conv = new Conversation(seqGen.incrementAndGet(), session, owner, Priority.HIGH,
+    Conversation trySubmitHeld(SerialSource session, ResourceOwner owner, Priority priority,
+            long waitMs, long holdTimeoutMs) {
+        Conversation conv = new Conversation(seqGen.incrementAndGet(), session, owner, priority,
                 waitMs, holdTimeoutMs, null, true, null, MDC.getCopyOfContextMap());
         try {
             admitAndScheduleWaitTimer(conv);
