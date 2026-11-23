@@ -72,9 +72,12 @@ public class SerialWriteDomainPoolTest {
         SerialIoPool.resetForTest();
     }
 
-    /** 写恒经域池执行（ecat-serial-io-N 线程）——逃逸口退役后无「当前线程直发」旁路。 */
+    /**
+     * 写恒经口执行线程执行（ecat-serial-port-*，IO 发起是口执行线程职责；serial IO 最小
+     * 模型语义）——无任何「调用线程直发」旁路。
+     */
     @Test(timeout = 15000)
-    public void writeAlwaysRoutesThroughDomainPoolWorker() throws Exception {
+    public void writeAlwaysRoutesThroughPortExecutorThread() throws Exception {
         final AtomicReference<String> writerThread = new AtomicReference<>();
         port.serialPort = mockSerialPort(inv -> {
             writerThread.set(Thread.currentThread().getName());
@@ -83,8 +86,8 @@ public class SerialWriteDomainPoolTest {
 
         CompletableFuture<Boolean> ok = port.asyncSendData("ROUTE".getBytes(StandardCharsets.US_ASCII));
         assertTrue("写 future 必须成功完成", ok.get(5, TimeUnit.SECONDS));
-        assertTrue("写必须执行在域池线程 ecat-serial-io-N（无任何旁路直发），实际: " + writerThread.get(),
-                writerThread.get().matches("ecat-serial-io-\\d+"));
+        assertTrue("写必须执行在口执行线程 ecat-serial-port-*（无任何调用线程直发旁路），实际: " + writerThread.get(),
+                writerThread.get().matches("ecat-serial-port-.*-\\d+"));
     }
 
     /**

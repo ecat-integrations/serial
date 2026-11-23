@@ -92,8 +92,8 @@ public class SerialReconfigureQueueWaitTest {
         // 等待窗口（有界负断言）：在飞事务未完成期间，重建命令在队、close 零调用、未返回
         assertFalse("在飞事务未完成时 reconfigure 不得完成（应排队等待）",
                 reconfigureDone.await(300, TimeUnit.MILLISECONDS));
-        assertTrue("重建命令应在命令队列中排队", port.getQueueDepth() == 1);
-        assertTrue("在飞事务仍持有执行权", port.hasInFlight());
+        assertTrue("重建命令应在命令队列中排队", port.queuedConversations() == 1);
+        assertTrue("在飞事务仍持有执行权", port.hasInFlightConversation());
         assertFalse("在飞事务未完成时不得 close 端口", closed.get());
         verify(originalSerialPort, never()).closePort();
 
@@ -105,7 +105,7 @@ public class SerialReconfigureQueueWaitTest {
         verify(originalSerialPort).closePort();
         assertEquals("重建后端口必须持有新 baudrate", Integer.valueOf(19200), port.serialInfo.baudrate);
         assertNotSame("物理参数变化后必须 reopen（serialPort 不得仍是旧对象）", originalSerialPort, port.serialPort);
-        assertTrue("重建命令完成后队列应清空", port.getQueueDepth() == 0);
+        assertTrue("重建命令完成后队列应清空", port.queuedConversations() == 0);
 
         // 无幽灵锁：重建 release 后新 acquire 立即授予
         String nextKey = port.acquire(2, TimeUnit.SECONDS, null);
@@ -149,7 +149,7 @@ public class SerialReconfigureQueueWaitTest {
         // 端口状态原样未动 + 无队列残留
         assertFalse("超时失败不得 close 端口", closed.get());
         assertEquals("超时失败不得替换 serialInfo", Integer.valueOf(9600), port.serialInfo.baudrate);
-        assertEquals("超时的重建命令应自摘离队（无死命令残留）", 0, port.getQueueDepth());
+        assertEquals("超时的重建命令应自摘离队（无死命令残留）", 0, port.queuedConversations());
 
         // 无幽灵锁：release 后新 acquire 立即授予；重建可重试成功（显式失败不产生永久损伤）
         port.release(txKey.get());
@@ -182,7 +182,7 @@ public class SerialReconfigureQueueWaitTest {
         assertEquals("timeout-only 变化必须即时生效", 2000, port.getTimeout());
         assertFalse("timeout-only 不得 close 端口", closed.get());
         assertSame("timeout-only 不得重建端口对象", originalSerialPort, port.serialPort);
-        assertEquals("timeout-only 不入命令队列", 0, port.getQueueDepth());
+        assertEquals("timeout-only 不入命令队列", 0, port.queuedConversations());
 
         port.release(key);
     }

@@ -65,7 +65,7 @@ public class SerialSourcePortRetiredReopenGateTest {
      * 修复前：无 REJECTED、openPort 照常进入（[OPEN FAILED] port= 行）→ 红。
      */
     @Test
-    public void recoverWedgedPortAfterRetirement_isRejected() {
+    public void recoverWedgedPortAfterRetirement_isRejected() throws Exception {
         LogCapture logs = LogCapture.attachTo(SerialSourcePort.class);
         try {
             SerialSourcePort port = newPortWithMockSerial(null);
@@ -73,6 +73,7 @@ public class SerialSourcePortRetiredReopenGateTest {
             port.unregisterSource(src);                            // 空源 → closePort（无 integration，跳过 removePort）
 
             port.recoverWedgedPort("test");                       // 迟到自愈——现场可达序列
+            port.executor().awaitEventLoopForTest();               // 恢复是即发即忘事件：屏障确认拒绝已发生
 
             assertTrue("退役对象上的迟到重开必须被拒（[OPEN-REJECTED] 行），实际日志：\n" + logs.timeline(),
                     logs.has("[OPEN-REJECTED]"));
@@ -85,13 +86,14 @@ public class SerialSourcePortRetiredReopenGateTest {
 
     /** 行为锁 a：仍有 source 时不退役——recoverWedgedPort 照常重开（无 REJECTED）。 */
     @Test
-    public void recoverWedgedPort_withSourceAttached_stillReopens() {
+    public void recoverWedgedPort_withSourceAttached_stillReopens() throws Exception {
         LogCapture logs = LogCapture.attachTo(SerialSourcePort.class);
         try {
             SerialSourcePort port = newPortWithMockSerial(null);
             new SerialSource(port, "dev-1");                       // 有源端口
 
             port.recoverWedgedPort("test");
+            port.executor().awaitEventLoopForTest();   // 恢复是即发即忘事件：屏障确认已处理，不泄漏相邻测试
 
             assertFalse("有源端口的 wedge 自愈重开不受退役门影响（无 [OPEN-REJECTED]），实际日志：\n" + logs.timeline(),
                     logs.has("[OPEN-REJECTED]"));

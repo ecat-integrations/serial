@@ -14,6 +14,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import com.ecat.integration.SerialIntegration.SerialSdkTimers;
+import com.ecat.integration.SerialIntegration.SerialInfo;
 import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.SerialTransactionStrategy;
 
@@ -105,11 +106,9 @@ public class SerialTimeoutSchedulerBindingTest {
         injected = newNamedSingleDaemon("binding-seam-tx");
         SerialTimeoutScheduler.bind(injected);
 
-        SerialSource source = org.mockito.Mockito.mock(SerialSource.class);
-        org.mockito.Mockito.when(source.getIoExecutor())
-                .thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        org.mockito.Mockito.when(source.acquire()).thenReturn("key");
-        org.mockito.Mockito.when(source.getTimeout()).thenReturn(50);
+        // 真实独立源（standalone 公共构造器）：deadline 执法在执行者内经 SerialTimeoutScheduler
+        // 提交——注入缝即真实链路（mock 源不经过执行者，测不到绑定面）
+        SerialSource source = new SerialSource(new SerialInfo("/dev/ttyTXBIND", 9600, 8, 1, 0, 0, 50));
         CompletableFuture<Boolean> neverCompleting = new CompletableFuture<>();
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy

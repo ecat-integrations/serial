@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import com.ecat.core.CommTrace.OwnerLevel;
 import com.ecat.core.CommTrace.ResourceOwner;
 import com.ecat.core.Utils.LogFactory;
@@ -163,46 +164,58 @@ public class SerialSource {
 
     /**
      * 尝试获取锁，支持等待队列。视图已登记权威归属时自动注入（{@link #lockOwner()}，
-     * 调用方无感）——授予后 TX/RX 捕获点同读该归属作 CommTrace 权威参数。
+     * 调用方无感）——授予后在飞对话的 CommTrace 权威参数。
      * <p>默认等待期间 view 关闭不会被提前唤醒；等待返回后统一复查 terminal 状态。</p>
-     * @return 锁标识（成功获取或进入等待），null表示无法获取且超出等待队列容量
+     * @return 锁标识（成功获取），null表示超时或队列满
      */
     public String acquire() {
         assertViewActive("acquire");
-        return checkClosedAfterAcquire("acquire", sourcePort.acquire(lockOwner()));
+        return checkClosedAfterAcquire("acquire", sourcePort.acquire(lockOwner(), this));
     }
 
     /**
-     * 尝试获取锁，支持等待队列和超时（owner 注入同 {@link #acquire()}）
-     * <p>view 在等待期间关闭不会被提前唤醒；等待者仍按 timeout/budget 结束，随后统一
+     * 尝试获取锁，支持等待队列和超时（owner 注入同 {@link #acquire()}；HELD 持有上限
+     * 同取 {@code timeout}——持有者线程死掉不会锁死口）。
+     * <p>view 在等待期间关闭不会被提前唤醒；等待者仍按 timeout 结束，随后统一
      * 复查 terminal 状态并释放已授予 key。</p>
      * @param timeout 超时时间
      * @param unit 时间单位
-     * @return 锁标识（成功获取/唤醒或进入等待），null表示超时或超出等待队列容量
+     * @return 锁标识（成功授予），null表示超时或队列满
      */
     public String acquire(long timeout, TimeUnit unit) {
         assertViewActive("acquire");
         return checkClosedAfterAcquire("acquire",
-                sourcePort.acquire(timeout, unit, lockOwner()));
+                sourcePort.acquire(timeout, unit, lockOwner(), this));
     }
 
     /**
-     * 轮询锁获取契约入口（20260913-073600 方案 c，与 modbus {@code ModbusSource}
-     * 同型）：无竞争快路径直达；锁忙时 FIFO 有界等待移交 IO 旁池线程——调用线程零 park。
-     * 视图已登记权威归属时自动注入（{@link #lockOwner()}，调用方无感）。
-     * 语义与记账见 {@link SerialSourcePort#acquirePollingBounded(ResourceOwner, long)}。
+     * 轮询锁获取契约入口（对外行为保持）：有界优先级队列上的普通优先级 HELD 对话——
+     * 队列等待预算（budgetMs）内被授予则完成锁标识，预算耗尽/队满/退役取消完成 null
+     * （=本周期真弃轮，源侧记账）。视图已登记权威归属时自动注入（{@link #lockOwner()}）。
      *
      * @param budgetMs 锁等待预算（毫秒，须 &gt; 0；SDK 侧按轮询周期 clamp）
      * @return 锁标识 CF；null 完成=本周期弃轮（真弃轮在源侧记账）
-     * <p>view 在旁池等待期间关闭不会被提前唤醒；预算结束后统一复查 terminal 状态。</p>
+     * <p>view 在排队等待期间关闭不会被提前唤醒；预算结束后统一复查 terminal 状态。</p>
      */
     public CompletableFuture<String> acquirePollingBounded(long budgetMs) {
         if (isViewClosed()) {
             return failedFuture(new SerialSourceClosedException(
                     "acquirePollingBounded", getPortName(), identity));
         }
-        return sourcePort.acquirePollingBounded(lockOwner(), budgetMs).thenApply(key ->
+        return sourcePort.acquirePollingBounded(lockOwner(), budgetMs, this).thenApply(key ->
                 checkClosedAfterAcquire("acquirePollingBounded", key));
+    }
+
+    /**
+     * 设备事务体入队（SerialTransactionStrategy 两入口承载）：作为一场对话提交到本源
+     * 端口的执行者——高优先级（命令/写）或普通优先级（轮询），排队等待预算与事务级
+     * 硬超时显式传入。队列满抛 {@link PortQueueFullException}；视图已关闭抛
+     * {@link SerialSourceClosedException}。
+     */
+    CompletableFuture<Boolean> submitTransaction(Function<SerialSource, CompletableFuture<Boolean>> lambda,
+            SerialPortExecutor.Priority priority, long waitMs, long execTimeoutMs) {
+        assertViewActive("submitTransaction");
+        return sourcePort.submitTransaction(this, lockOwner(), priority, waitMs, execTimeoutMs, lambda);
     }
 
     /** 本端口累计轮询真弃轮次数（有界等待预算耗尽的计数，{@code acquirePollingBounded} 记账）。 */
@@ -321,10 +334,10 @@ public class SerialSource {
     }
 
     /**
-     * 标记当前事务已被硬超时强拆（F-43 清洗①）：端口残留写闸门生效，被掐事务代内的后续
-     * asyncSendData 提交（delay 定时器到点后的补发命令）一律拒绝，堵与新事务交错的复活路径
-     * （bugs/bug-record-20260826-093000 Q1）。由事务级硬超时路径调用
-     * （SerialTransactionStrategy），下一次 acquire 授予新代后自动放行。
+     * 标记当前事务已被硬超时强拆：执行者强拆当前在飞对话（其 future 以超时异常完成）并
+     * 进入排空——排空窗内被掐事务的残留补发（写与响应两侧）全部拒绝/丢弃，堵与新事务
+     * 交错的复活路径（bugs/bug-record-20260826-093000 Q1 的事故面，由「严格串行 + 排空」
+     * 承接）。由事务级硬超时路径调用。
      */
     public void markTransactionAborted() {
         sourcePort.markTransactionAborted();

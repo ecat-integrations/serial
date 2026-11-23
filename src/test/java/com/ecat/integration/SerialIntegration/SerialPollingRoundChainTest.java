@@ -486,6 +486,18 @@ public class SerialPollingRoundChainTest {
         when(source.acquirePollingBounded(anyLong())).thenAnswer(inv -> port.acquirePollingBounded(
                 null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
+        when(source.submitTransaction(any(), any(), anyLong(), anyLong()))
+                .thenAnswer(inv -> {
+                    // 桥接保留真实视图契约：closed view 拒绝提交（与 SerialSource.assertViewActive 同语义）
+                    SerialSource self = (SerialSource) inv.getMock();
+                    if (self.isViewClosed()) {
+                        throw new SerialSourceClosedException("submitTransaction", port.getPortName(), "bridged");
+                    }
+                    return port.submitTransaction(self, null,
+                            inv.getArgument(1, SerialPortExecutor.Priority.class),
+                            inv.getArgument(2, Long.class), inv.getArgument(3, Long.class),
+                            inv.getArgument(0, java.util.function.Function.class));
+                });
         when(source.getPortName()).thenReturn(port.getPortName());
         when(source.getIdentity()).thenReturn("round-chain-device");
         when(source.getTimeout()).thenReturn(port.getTimeout());

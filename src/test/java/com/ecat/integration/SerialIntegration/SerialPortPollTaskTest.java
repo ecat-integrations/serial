@@ -461,9 +461,9 @@ public class SerialPortPollTaskTest {
     // ==================== ⑤ 生产路径承载线程（103000：数据面自持 sweeper） ====================
 
     /**
-     * 生产路径（未 bind）轮询必须跑在自持单线程 serial-io-sweeper 上：
-     * 数据投递与业务引擎 worker 分离——103000 归因证明共享引擎被阻塞任务钉死时
-     * 端口轮询随之停摆（Mode B），自持线程还原 Mode A。
+     * 生产路径（未 bind）轮询读取必须跑在自持单线程 serial-io-sweeper 上（103000：数据面
+     * 自持 sweeper，线程账 48 口共 1 根）；帧处理交付经事件化到每口的串行执行者线程
+     * （serial IO 最小模型：RX 单点串行，缓冲私有）。
      */
     @Test
     public void productionPath_pollRunsOnSweeperThread_singleThreadForAllPorts() throws Exception {
@@ -498,9 +498,11 @@ public class SerialPortPollTaskTest {
             assertTrue("payload must be delivered via production scheduler",
                     delivered.await(AWAIT_SECONDS, TimeUnit.SECONDS));
 
-            // 交付线程必须是 sweeper 本尊（枚举线程名，不断言调度器内部结构）
-            assertEquals("production polling must run on serial-io-sweeper thread",
-                    Collections.singleton("serial-io-sweeper"), deliveryThreads);
+            // 交付线程 = 该口的串行执行者线程（RX 事件化到口执行线程：帧处理单点串行）；
+            // 轮询读取本体仍在共享 sweeper 上（下方 sweeper 线程数断言）
+            assertTrue("delivery must run on the port executor thread (ecat-serial-port-*), actual: "
+                            + deliveryThreads,
+                    deliveryThreads.stream().allMatch(t -> t.matches("ecat-serial-port-.*-\\d+")));
 
             // 第二个端口同挂生产调度器：仍只有一条 sweeper 线程（48 口共 1 根的线程账）
             SerialSourcePort portB = portWithMockSerialPort();

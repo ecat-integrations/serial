@@ -48,12 +48,14 @@ public class SerialSourcePortCommTraceTest {
     }
 
     @Test
-    public void incomingDataCapturedAsRxFrame() {
+    public void incomingDataCapturedAsRxFrame() throws Exception {
         SerialSourcePort port = newPort();
         byte[] frame = new byte[]{0x01, 0x03, 0x02, 0x12, 0x34};
         long since = CommTraceBuffer.instance().latestSeq();
 
         port.handleIncomingData(frame, frame.length);
+        // RX 已事件化到口执行线程：屏障确认事件已处理再断言（禁 sleep 猜测）
+        port.executor().awaitEventLoopForTest();
 
         List<CommTraceEvent> events = CommTraceBuffer.instance().query(
                 new CommTraceFilter(CommTraceTransport.SERIAL, TEST_PORT, null, null, null), 10, since);

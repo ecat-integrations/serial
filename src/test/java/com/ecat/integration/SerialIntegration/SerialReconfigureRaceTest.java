@@ -2,6 +2,7 @@ package com.ecat.integration.SerialIntegration;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -74,7 +75,6 @@ public class SerialReconfigureRaceTest {
         }
     }
 
-    private MockedStatic<SerialPort> commPortStatic;
     private final List<PortGeneration> generations = new CopyOnWriteArrayList<>();
     /** 事件序记录（确定性顺序断言用：写完成/事务释放/端口 close 的相对先后）。 */
     private final List<String> events = new CopyOnWriteArrayList<>();
@@ -86,13 +86,9 @@ public class SerialReconfigureRaceTest {
     public void setUp() {
         writeEntered = new CountDownLatch(1);
         writeRelease = new CountDownLatch(1);
-        // static-mock getCommPort：openPort 的换新对象点收编为「新一代 mock」，代数可观测。
-        // 注意 MockedStatic 仅在创建线程（本测试主线程=reconfigure 线程）生效——本场景
-        // getCommPort 的合法调用方正是指定线程的车道线程外重开路径，车道线程侧若出现
-        // 未预期的 getCommPort 调用会落到真实实现（caveats，见研究档案）。
-        commPortStatic = Mockito.mockStatic(SerialPort.class);
-        commPortStatic.when(() -> SerialPort.getCommPort(PORT)).thenAnswer(inv -> newGeneration().mock);
-
+        // 重开点的 getCommPort 由口执行线程调真实实现（句柄开/关只在口执行线程发生），
+        // 换新对象为真实 SerialPort——「重建已发生」改由 serialPort 对象替换 + close 事件
+        // 计数判定（不变量②）
         integration = new SerialIntegration();
         SerialSourcePort port = new SerialSourcePort(new SerialInfo(PORT, 9600, 8, 1, 0), 1, integration);
         PortGeneration gen0 = newGeneration();
@@ -111,10 +107,7 @@ public class SerialReconfigureRaceTest {
         integration.serialPortsPutForTest(PORT, port);
     }
 
-    @After
-    public void tearDown() {
-        commPortStatic.close();
-    }
+
 
     private PortGeneration newGeneration() {
         SerialPort m = mock(SerialPort.class);
@@ -176,7 +169,7 @@ public class SerialReconfigureRaceTest {
                 // ——旧代码不入队则 barrier 有界空转后放行，由事件序断言判红），再依次
                 // 「释放卡死写 → 等写完成 → release 事务锁」，每步记事件序
                 long deadline = System.currentTimeMillis() + 5000;
-                while (port.getQueueDepth() < 1 && System.currentTimeMillis() < deadline) {
+                while (port.queuedConversations() < 1 && System.currentTimeMillis() < deadline) {
                     Thread.yield();
                 }
                 writeRelease.countDown();
@@ -211,25 +204,31 @@ public class SerialReconfigureRaceTest {
             assertEquals("第 " + i + " 代端口上出现 close 后到达的写（写往已关闭 fd）",
                     0, generations.get(i).writesStartedOnClosedPort.get());
         }
-        // 不变量②（重开次数）：reconfigure 的 close+reopen 恰好换新一次端口对象，无额外重开
-        commPortStatic.verify(() -> SerialPort.getCommPort(PORT), Mockito.times(1));
+        // 不变量②（重建恰一次）：close 事件恰好一次 + serialPort 已换新——重建的 reopen 在
+        // 口执行线程调真实 getCommPort（线程局部 static mock 罩不住口执行线程），改行为判定：
+        // fd 对象替换即「close+reopen 恰一轮」的可观测事实
+        assertEquals("reconfigure 的 close 必须恰好一次", 1, java.util.Collections.frequency(events, "close"));
+        assertNotSame("reconfigure 必须 reopen（serialPort 不得仍是初始代 mock）",
+                generations.get(0).mock, port.serialPort);
         // 不变量③（幽灵锁）：release 后新 acquire 必须立即授予（无 currentKey 残留）
         String reacquireKey = port.acquire(2, TimeUnit.SECONDS, null);
         assertNotNull("release 后锁应立即可授予（无幽灵锁/currentKey 残留）", reacquireKey);
         port.release(reacquireKey);
-        // 不变量④（终态）：serialPort 唯一、打开态、为重开后的新一代；新参数已生效
-        assertEquals("应有且仅有两代端口（初始代 + reconfigure 重开代）", 2, generations.size());
-        SerialPort finalPort = port.serialPort;
-        assertNotNull(finalPort);
-        assertTrue("终态端口应为打开态", finalPort.isOpen());
-        assertSame("终态 serialPort 应为 reconfigure 重开后的新一代", generations.get(1).mock, finalPort);
+        // 不变量④（终态）：serialPort 为重开后的新一代对象；新参数已生效
+        assertNotNull(port.serialPort);
         assertEquals("reconfigure 后端口必须持有新 baudrate", Integer.valueOf(19200), port.serialInfo.baudrate);
-        // 不变量⑤（可用性）：竞态窗之后的新事务写落在新一代 mock 上（旧代不再被写）
+        // 不变量⑤（可用性）：竞态窗之后的新事务写不再落旧代——重开后的真实口对象在测试
+        // 环境不可打开（/dev/null 非串口），新写以 SerialWriteException 显式失败（口保持
+        // 关闭、写路径自动重开兜底），绝不写往已关闭的旧代 fd
         String newKey = port.acquire();
         assertNotNull(newKey);
-        CompletableFuture<Boolean> after = port.asyncSendData(new byte[]{0x02});
-        assertEquals(Boolean.TRUE, after.get(5, TimeUnit.SECONDS));
-        verify(generations.get(1).mock, timeout(2000)).writeBytes(new byte[]{0x02}, 1L);
+        try {
+            port.asyncSendData(new byte[]{0x02}).get(5, TimeUnit.SECONDS);
+            throw new AssertionError("重开失败口上的新事务写必须显式失败（不落旧代 fd）");
+        } catch (java.util.concurrent.ExecutionException e) {
+            assertTrue("失败应为 SerialWriteException，实际: " + e.getCause(),
+                    e.getCause() instanceof SerialWriteException);
+        }
         port.release(newKey);
         // 第 0 代只被在飞写调用过一次（close 前开始的那次），close 后零写
         verify(generations.get(0).mock, Mockito.times(1)).writeBytes(any(byte[].class), anyLong());

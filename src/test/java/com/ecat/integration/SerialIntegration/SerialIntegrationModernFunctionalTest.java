@@ -29,8 +29,25 @@ public class SerialIntegrationModernFunctionalTest {
     public void setUp() {
         MockitoAnnotations.openMocks(this);
         // 设置 mock 的基本行为
-        when(mockSerialSource.acquire()).thenReturn("test-key");
-        when(mockSerialSource.release(anyString())).thenReturn(true);
+        // 新模型提交缝：事务体入队语义由 stub 内联（执行事务体并回投其 future）——
+        // 本类只固化「策略消费事务体 future」的功能面，端口仲裁由执行者契约测试覆盖
+        when(mockSerialSource.submitTransaction(any(), any(), anyLong(), anyLong()))
+                .thenAnswer(inv -> {
+                    java.util.function.Function<SerialSource, CompletableFuture<Boolean>> body = inv.getArgument(0);
+                    CompletableFuture<Boolean> out = new CompletableFuture<>();
+                    try {
+                        body.apply(mockSerialSource).whenComplete((r, x) -> {
+                            if (x != null) {
+                                out.completeExceptionally(x);
+                            } else {
+                                out.complete(r);
+                            }
+                        });
+                    } catch (Throwable t) {
+                        out.completeExceptionally(t);
+                    }
+                    return out;
+                });
         when(mockSerialSource.isTestMode()).thenReturn(true);
         when(mockSerialSource.getTimeout()).thenReturn(500);
         when(mockSerialSource.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
@@ -111,9 +128,6 @@ public class SerialIntegrationModernFunctionalTest {
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
                 mockSerialSource,
                 src -> {
-                    // 验证锁已被获取
-                    verify(src, times(1)).acquire();
-
                     return src.asyncReadDataBytes()
                             .thenApply(bytes -> {
                                 String data = new String(bytes, StandardCharsets.US_ASCII);
@@ -127,9 +141,6 @@ public class SerialIntegrationModernFunctionalTest {
         // isDone() 可能在回调被安排到线程池后就返回 true，但回调可能还没执行
         assertTrue("Result should be true", result.join());
         assertTrue("Operation should have been completed", operationCompleted.get());
-
-        // 验证锁被释放
-        verify(mockSerialSource, times(1)).release(anyString());
 
         // 验证只使用了现代 API
         verify(mockSerialSource, times(1)).asyncReadDataBytes();
@@ -150,7 +161,7 @@ public class SerialIntegrationModernFunctionalTest {
                 }
         );
 
-        // 验证异常被处理
+        // 验证异常被处理（事务体同步异常→对话异常完成；口仲裁与收尾由执行者契约测试覆盖）
         try {
             result.get();
             fail("Should have thrown exception");
@@ -158,9 +169,6 @@ public class SerialIntegrationModernFunctionalTest {
             assertTrue("Should be caused by RuntimeException",
                       e.getCause() instanceof RuntimeException);
         }
-
-        // 验证锁被正确释放
-        verify(mockSerialSource, times(1)).release(anyString());
     }
 
     @Test

@@ -39,12 +39,13 @@ public class SerialIntegration extends IntegrationBase implements ResourceQuery<
     private final Map<String, SerialSourcePort> serialPorts = new ConcurrentHashMap<>();
 
     /**
-     * 生产端口的命令队列容量（Actor 事务准入设计 §1：有界队列 192 量级，沿用
-     * {@code SerialIoPool.QUEUE_CAPACITY} 的论证口径——每口命令排队上界由共享口设备数
-     * 决定，192 覆盖全口冷启动齐发突发不拒绝；真饱和按队满=显式拒绝（轮询面弃本周期）
-     * 语义背压）。C2 前此处为 1（旧 waitQueue 的单等待者上限）。
+     * 生产端口的对话队列容量（serial IO 最小模型 §3.5：有界优先级队列默认容量 3，每端口
+     * 可经 {@code SerialSource(SerialInfo, int)} 构造参数覆盖）。队列只做突发平滑——排队
+     * 对话各有 deadline 上界（轮询=预算弃轮、命令=等锁预算失败），容量是背压边界不是
+     * 吞吐参数：满 = 显式拒绝（轮询弃本轮、命令同步抛 {@code PortQueueFullException}），
+     * 下一周期/下次重试自愈。
      */
-    static final int COMMAND_QUEUE_CAPACITY = 192;
+    static final int COMMAND_QUEUE_CAPACITY = 3;
 
     @Override
     public void onInit() {

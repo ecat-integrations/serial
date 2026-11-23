@@ -1,149 +1,160 @@
 package com.ecat.integration.SerialIntegration;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.timeout;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import com.fazecast.jSerialComm.SerialPort;
 
 /**
- * F-43 清洗①（bugs/bug-record-20260826-093000 Q1「复活路径」）的 TDD 单测。
+ * 残留写防线回归单测（serial IO 最小模型语义：事务代数闸门退役，防线 = 「严格串行 +
+ * 异常结束排空 + 排空窗拒写」）。
  *
- * <p>问题形态（F-42 受控实验实证）：事务硬超时强拆（release + recoverWedgedPort）后，被掐
- * 事务的设备命令链仍活着——读超时被设备 {@code handleException} 吞成 false、独立 delay
- * 定时器到点后，剩余命令仍会写往（可能已重开的）端口，与新事务交错（sim 实证：被掐轮的
- * {@code fpmset} 在强拆 18s 后落 sim，早于下一轮首命令）。
+ * <p>事故面（bugs/bug-record-20260826-093000 Q1，F-42 受控实验）：被硬超时强拆的事务，
+ * 其体内尚未发出的 asyncSendData 提交（delay 定时器到点后的补发命令）若落口，会与新
+ * 事务的收发交错——写侧在排空/恢复窗被显式拒绝，响应侧由排空丢弃，两半合起来才是
+ * 完整的残留防线。排空静默确认后写路径自动放行（对应旧「新事务授予新代后闸门放行」
+ * 语义位）；正常收场不排空，后续写零拒绝窗。
  *
- * <p>修复契约（发送侧残留写闸门，per-port 事务代数）：
- * <ol>
- *   <li>硬超时触发时策略层调用 {@code SerialSource.markTransactionAborted()}：端口把
- *       「最低可接受发送代数」抬到当前代 + 1——被掐事务代内的后续 asyncSendData 提交全部拒绝；</li>
- *   <li>下一次 acquire/acquirePollingBounded 授予新代数后，新事务的发送恢复正常（闸门只拦死事务残留）；</li>
- *   <li>策略层硬超时同时强制异常完成底层 operations future（挂起中的链头确定性终止信号）。</li>
- * </ol>
+ * <p>确定性手段：定时全经 {@link FakeSerialTimers} 手动驱动（排空静默计时器按延迟值
+ * 精确点火），零真实时钟等待；事件面用执行者屏障 {@code awaitEventLoopForTest} 确认
+ * 已发生。端口不经 registerSource（注册会触发真实 getCommPort 覆盖 mock），对话直接
+ * 提交到端口执行者。
  *
  * @author coffee
  */
 public class SerialResidualWriteGuardTest {
 
+    private static final String PORT = "/dev/ttyRESIDUAL";
+    /** 排空静默测试值（毫秒）：同时是静默计时器在 FakeSerialTimers 里的识别延迟。 */
+    private static final long TEST_DRAIN_SILENCE_MS = 50L;
+
     private SerialSourcePort port;
     private SerialPort serialPort;
+    private FakeSerialTimers timers;
+    private final AtomicInteger writeCount = new AtomicInteger();
 
     @Before
     public void setUp() {
+        timers = new FakeSerialTimers();
         serialPort = mock(SerialPort.class);
         when(serialPort.isOpen()).thenReturn(true);
         when(serialPort.bytesAvailable()).thenReturn(0);
         when(serialPort.writeBytes(any(byte[].class), anyLong())).thenAnswer(inv -> {
-            byte[] b = inv.getArgument(0);
-            return b.length;
+            writeCount.incrementAndGet();
+            return inv.<byte[]>getArgument(0).length;
         });
-        port = new SerialSourcePort(new SerialInfo("/dev/ttyTEST0", 9600, 8, 1, 0), 5, null);
+        port = new SerialSourcePort(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500), 3, null);
         port.serialPort = serialPort;
+        port.executor().setDrainSilenceMsForTest(TEST_DRAIN_SILENCE_MS);
+    }
+
+    @After
+    public void tearDown() {
+        timers.close();
     }
 
     /**
-     * 【RED：Q1 残留写】持有锁的事务被硬超时强拆（markTransactionAborted）后，
-     * 同一代数的后续 asyncSendData 必须被拒绝——修复前写会照发到端口。
+     * 【残留写拒绝】对话被强拆（markTransactionAborted → 异常收场 + 排空）后，被掐对话
+     * 的残留补发写请求在排空窗内到达 → SerialWriteException 显式拒绝，不落口。
      */
     @Test
-    public void residualWriteRejected_afterTransactionAborted() throws Exception {
-        String key = port.acquire();
-        assertNotNull("测试前置：取得锁", key);
-        // 合法事务内发送：正常执行
-        port.asyncSendData(new byte[]{0x01}).get(5, TimeUnit.SECONDS);
-        verify(serialPort, timeout(2000)).writeBytes(any(byte[].class), anyLong());
+    public void writeRejectedDuringDrainWindow() throws Exception {
+        CompletableFuture<Boolean> conv = submitHangingConversation();
+        awaitEventLoop();
 
-        // 硬超时强拆：release + markTransactionAborted（策略层顺序）
         port.markTransactionAborted();
-        port.release(key);
+        awaitEventLoop();
 
-        // 被掐事务的残留命令（delay 到点后补发）必须被拒绝
         try {
-            port.asyncSendData(new byte[]{0x02}).get(5, TimeUnit.SECONDS);
-            fail("残留写应被拒绝（异常完成），实际正常完成");
+            port.asyncSendData(new byte[]{0x01}).get(2, TimeUnit.SECONDS);
+            fail("排空窗内的残留写必须被拒绝");
         } catch (ExecutionException e) {
-            assertTrue("拒绝原因应为 SerialWriteException，实际: " + e.getCause(),
+            assertTrue("拒绝应为 SerialWriteException，实际: " + e.getCause(),
                     e.getCause() instanceof SerialWriteException);
         }
-        // 写口只被合法命令调用过一次（0x01），残留命令 0x02 未落端口
-        verify(serialPort, never()).writeBytes(new byte[]{0x02}, 1L);
+        assertTrue("对话 future 应已被强拆异常完成", conv.isCompletedExceptionally());
+        assertEquals("拒绝窗内的写不得落口", 0, writeCount.get());
     }
 
     /**
-     * 闸门不得误伤新事务：强拆后下一次 acquire 授予新代数，新事务发送恢复正常。
+     * 【放行】排空静默确认（计时器手动到拍）后口回到 IDLE，写路径自动放行。
      */
     @Test
-    public void newTransactionWriteAllowed_afterReacquire() throws Exception {
-        String deadKey = port.acquire();
+    public void writeAllowedAfterDrainCompletes() throws Exception {
+        submitHangingConversation();
+        awaitEventLoop();
         port.markTransactionAborted();
-        port.release(deadKey);
+        awaitEventLoop();
 
-        String freshKey = port.acquire();
-        assertNotNull("强拆后端口锁应可重新授予", freshKey);
-        port.asyncSendData(new byte[]{0x03}).get(5, TimeUnit.SECONDS);
-        verify(serialPort, timeout(2000)).writeBytes(new byte[]{0x03}, 1L);
-        port.release(freshKey);
+        fireDrainSilenceTimer();
+
+        port.asyncSendData(new byte[]{0x02}).get(2, TimeUnit.SECONDS);
+        awaitEventLoop();
+        assertEquals("排空结束后写应真实落口", 1, writeCount.get());
     }
 
     /**
-     * 事务从未中止时（正常运行）发送不受闸门影响：连续两个事务均正常发送。
+     * 【正常收场不排空】对话正常完成（无强拆）→ 不进排空 → 后续写立即可落口，
+     * 无拒绝窗（正常应答不应付出任何防线路由代价）。
      */
     @Test
-    public void sequentialTransactionsNotAffected_withoutAbort() throws Exception {
-        String k1 = port.acquire();
-        port.asyncSendData(new byte[]{0x0A}).get(5, TimeUnit.SECONDS);
-        port.release(k1);
-        String k2 = port.acquire();
-        port.asyncSendData(new byte[]{0x0B}).get(5, TimeUnit.SECONDS);
-        port.release(k2);
-        verify(serialPort, timeout(2000)).writeBytes(new byte[]{0x0A}, 1L);
-        verify(serialPort, timeout(2000)).writeBytes(new byte[]{0x0B}, 1L);
+    public void normalCompletionKeepsWriteAllowedWithoutDrain() throws Exception {
+        CompletableFuture<Boolean> conv = port.submitTransaction(null, null,
+                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                src -> CompletableFuture.completedFuture(Boolean.TRUE));
+        assertNotNull(conv);
+        assertEquals(Boolean.TRUE, conv.get(2, TimeUnit.SECONDS));
+        awaitEventLoop();
+
+        port.asyncSendData(new byte[]{0x03}).get(2, TimeUnit.SECONDS);
+        awaitEventLoop();
+        assertEquals("正常收场后写应直接落口", 1, writeCount.get());
+    }
+
+    // ==================== helpers ====================
+
+    /** 提交一个永不完成的对话体（悬挂事务形态），返回对话 future。 */
+    private CompletableFuture<Boolean> submitHangingConversation() {
+        CompletableFuture<Boolean> conv = port.submitTransaction(null, null,
+                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                src -> new CompletableFuture<>());
+        assertNotNull(conv);
+        return conv;
     }
 
     /**
-     * 【RED：Q1 链头强拆】硬超时竞速胜出时，底层 operations future 必须被强制异常完成
-     * ——被掐事务的挂起链头收到确定性终止信号（修复前 operations 永不完成）。
+     * 点燃排空静默计时器（按延迟值识别：markTransactionAborted 后进入排空挂载的
+     * 静默计时，delay = TEST_DRAIN_SILENCE_MS），等执行者处理完对应事件后断言 IDLE。
      */
-    @Test
-    public void underlyingOperationsForceFailed_onHardTimeout() throws Exception {
-        CompletableFuture<Boolean> operations = new CompletableFuture<>();
-        CompletableFuture<Boolean> withTimeout = SerialTransactionStrategy.withHardTimeout(operations, 150L);
-        try {
-            withTimeout.get(3, TimeUnit.SECONDS);
-            fail("硬超时后包装 future 应异常完成");
-        } catch (ExecutionException e) {
-            assertTrue("应为 TimeoutException，实际: " + e.getCause(),
-                    e.getCause() instanceof java.util.concurrent.TimeoutException);
+    private void fireDrainSilenceTimer() throws Exception {
+        int silenceIdx = -1;
+        for (int i = 0; i < timers.shots.size(); i++) {
+            if (timers.shots.get(i).delayMillis == TEST_DRAIN_SILENCE_MS) {
+                silenceIdx = i;
+            }
         }
-        assertTrue("底层 operations future 应已被强制异常完成",
-                operations.isCompletedExceptionally());
+        assertTrue("排空静默计时器应已挂载（当前在排空态）", silenceIdx >= 0);
+        timers.fire(silenceIdx);
+        awaitEventLoop();
+        assertEquals("静默确认后口应回到 IDLE", SerialPortExecutor.PortState.IDLE, port.executor().state());
     }
 
-    /**
-     * 策略层契约：事务硬超时触发时调用 {@code SerialSource.markTransactionAborted()}
-     * （与 release/recoverWedgedPort 同一恢复链）。
-     */
-    @Test
-    public void strategyMarksTransactionAborted_onHardTimeout() {
-        SerialSource source = mock(SerialSource.class);
-        when(source.acquire()).thenReturn("key-abort");
-        SerialTransactionStrategy.executeWithLambda(
-                source, src -> new CompletableFuture<>(), 150L);
-        verify(source, timeout(2000).times(1)).markTransactionAborted();
+    private void awaitEventLoop() throws Exception {
+        port.executor().awaitEventLoopForTest();
     }
 }

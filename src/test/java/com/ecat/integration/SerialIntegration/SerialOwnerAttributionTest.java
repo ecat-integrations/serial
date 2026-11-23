@@ -95,7 +95,7 @@ public class SerialOwnerAttributionTest {
 
     /** 持锁 RX：读线程无任务 MDC，归属=当前持锁 owner（同口判官=事务锁）。 */
     @Test
-    public void heldLockRxAttributesToDeviceOwner() {
+    public void heldLockRxAttributesToDeviceOwner() throws Exception {
         SerialSourcePort port = portWithWritableMock("ATTR-RX-PORT",
                 deviceOwner("entry-1", "dev-rx-1"));
         SerialSource source = port.getConnectedSources().get(0);
@@ -105,6 +105,8 @@ public class SerialOwnerAttributionTest {
         assertNotNull(key);
         byte[] frame = new byte[]{0x01, 0x03, 0x02, 0x12, 0x34};
         port.handleIncomingData(frame, frame.length);
+        // RX 已事件化到口执行线程：屏障确认帧捕获已发生（归属=在飞对话 owner）
+        port.executor().awaitEventLoopForTest();
         source.release(key);
 
         List<CommTraceEvent> events = queryRx("ATTR-RX-PORT", since);
@@ -217,6 +219,8 @@ public class SerialOwnerAttributionTest {
                     assertTrue(source.asyncSendData(new byte[]{(byte) idx}).get(10, TimeUnit.SECONDS));
                     byte[] frame = new byte[]{(byte) idx, 0x03};
                     portObjects[idx].handleIncomingData(frame, frame.length);
+                    // RX 已事件化到口执行线程：屏障确认捕获发生在 HELD 持有窗内（归属=在飞对话 owner）
+                    portObjects[idx].executor().awaitEventLoopForTest();
                     source.release(key);
                 } catch (Throwable e) {
                     unexpected.incrementAndGet();

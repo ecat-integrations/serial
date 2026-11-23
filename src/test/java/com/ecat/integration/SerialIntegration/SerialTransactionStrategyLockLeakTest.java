@@ -1,37 +1,36 @@
 package com.ecat.integration.SerialIntegration;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.timeout;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
 /**
- * B5 串口锁泄漏的 TDD 单测。
+ * B5 串口锁泄漏家族的回归单测（serial IO 最小模型语义：锁已删除，风险本体 =
+ * 「对话 future 必然终结 + 口必然继续下一场」）。
  *
- * <p>问题（B5）：{@link SerialTransactionStrategy#executeWithLambda} 把 {@code release(key)} 绑定在
- * lambda 返回的 future 的 {@code whenCompleteAsync} 上。若该 future 永不 complete（模拟串口后端死亡、
- * 异步读永久挂起），{@code whenComplete} 永不触发 → release 永不执行 → 端口锁
- * （{@code SerialSourcePort.currentKey}）永久泄漏，设备掉线（&gt;1min）再上线后无法自恢复，
- * 必须重启 ecat-core（实证见 bug-record-20260619221536.md B5 节）。
+ * <p>问题（B5，bug-record-20260619221536）：旧实现把 {@code release(key)} 绑定在 lambda
+ * future 的 whenComplete 上——future 永不 complete 时锁永久泄漏，设备掉线再上线无法
+ * 自恢复，必须重启 core。现行防线 = 执行者看门狗：每场对话有 deadline（自授予起算），
+ * 到点由看门狗跨线程强拆 fd 并异常完成 future，排空后开下一场——「口被一场对话永久
+ * 占住」结构性不可能。
  *
- * <p>参考 modbus_rtu：modbus4j {@code master.setTimeout} 保证 I/O 操作必然完成（成功或超时）→
- * {@code ModbusTransactionStrategy} 的 {@code whenComplete} 必触发 → release 必执行。纯 serial 缺此保证，
- * 故在事务层补硬超时：保证 future 必然 complete（成功或 {@link TimeoutException}），从而 release 必执行。
- *
- * <p>超时可由设备配置派生（2 参默认重载，{@link SerialTransactionStrategy#resolveDefaultTransactionTimeoutMs}），
- * 或由设备显式传入（3 参重载，对应各设备已有的 {@code .get(N, TimeUnit.SECONDS)} 事务级超时语义）。
+ * <p>旧用例 → 新用例映射：releaseFires_whenLambdaFutureNeverCompletes →
+ * {@link #conversationCompletesOnDeadline_whenBodyNeverCompletes}；
+ * releaseFires_whenLambdaFutureCompletesNormally / ThrowsSynchronously → 正常/同步抛完成
+ * 两用例 + 逐个加「口接受下一场」断言（无泄漏等价判据）；
+ * returnsFailedFuture_whenAcquireReturnsNull → 等锁预算耗尽失败用例
+ * （SerialPollingNonBlockingTest.executeWithLambdaKeepsBoundedWait_whenPortBusy）。
  *
  * @author coffee
  */
@@ -39,101 +38,115 @@ public class SerialTransactionStrategyLockLeakTest {
 
     /** 测试用短事务超时（生产默认见 resolveDefaultTransactionTimeoutMs / Const.READ_TIMEOUT_MS） */
     private static final long TEST_TX_TIMEOUT_MS = 200L;
+    /** 排空静默上界：看门狗收场 + 重开 + 150ms 静默后口即接受下一场，5s 余量足够 CI 慢机 */
+    private static final long NEXT_CONV_BOUND_MS = 5_000L;
 
     /**
-     * 【RED：复现 B5】lambda 返回的 future 永不 complete 时，release 必须仍被调用。
-     * 修复前：release 绑在 whenCompleteAsync，future 永不 complete → whenComplete 永不触发 →
-     *         release 永不执行 → 锁永久泄漏（该用例 verify 超时失败 = 复现 B5）。
-     * 修复后：3 参重载用 withHardTimeout 强制 future 在 TEST_TX_TIMEOUT_MS 内 complete → release 触发。
+     * 【RED：复现 B5】lambda 返回的 future 永不 complete（等价「后端死亡、异步串口读永久
+     * 挂起」）时，对话 future 必须在 deadline 内异常完成（TimeoutException），且口必须
+     * 随后接受下一场对话（无泄漏等价判据：下一场正常完成即证明口未被永久占住）。
      */
     @Test
-    public void releaseFires_whenLambdaFutureNeverCompletes() throws Exception {
-        SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        String key = "test-key-leak";
-        when(source.acquire()).thenReturn(key);
-
-        // 永不 complete 的 future —— 等价于「后端死亡、异步串口读永久挂起」
-        CompletableFuture<Boolean> neverCompleting = new CompletableFuture<>();
+    public void conversationCompletesOnDeadline_whenBodyNeverCompletes() throws Exception {
+        SerialSourcePort port = newPort();
+        SerialSource source = newSource(port);
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
-                source, src -> neverCompleting, TEST_TX_TIMEOUT_MS);
+                source, src -> new CompletableFuture<>(), TEST_TX_TIMEOUT_MS);
 
-        // release 必须在硬超时 + 余量内被调用（修复前此处超时失败 = 复现 B5）
-        verify(source, timeout(TEST_TX_TIMEOUT_MS + 2000).times(1)).release(key);
-
-        // 返回的 future 必然 complete（异常 TimeoutException），调用方不被永久挂起
         try {
-            result.get(TEST_TX_TIMEOUT_MS + 2000, TimeUnit.MILLISECONDS);
+            result.get(TEST_TX_TIMEOUT_MS + 2_000, TimeUnit.MILLISECONDS);
             fail("期望返回 future 因事务硬超时异常完成");
         } catch (ExecutionException ee) {
             assertTrue("cause 应为 TimeoutException，实际: " + ee.getCause(),
                     ee.getCause() instanceof TimeoutException);
         }
+        assertTrue("deadline 后口必须接受下一场（无泄漏等价判据）",
+                SerialTransactionStrategy.executeWithLambda(
+                        source, src -> CompletableFuture.completedFuture(true))
+                        .get(NEXT_CONV_BOUND_MS, TimeUnit.MILLISECONDS));
     }
 
-    /** 契约：lambda future 正常完成时，release 正常触发、结果透传。 */
+    /** 契约：lambda future 正常完成时，结果透传且口立即接受下一场。 */
     @Test
-    public void releaseFires_whenLambdaFutureCompletesNormally() throws Exception {
-        SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        when(source.acquire()).thenReturn("key-normal");
+    public void completesNormally_thenPortAcceptsNextConversation() throws Exception {
+        SerialSourcePort port = newPort();
+        SerialSource source = newSource(port);
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
                 source, src -> CompletableFuture.completedFuture(true), TEST_TX_TIMEOUT_MS);
 
-        verify(source, timeout(2000)).release("key-normal");
         assertTrue("正常完成应透传 true", result.get(2, TimeUnit.SECONDS));
+        assertTrue("下一场应正常完成",
+                SerialTransactionStrategy.executeWithLambda(
+                        source, src -> CompletableFuture.completedFuture(true))
+                        .get(NEXT_CONV_BOUND_MS, TimeUnit.MILLISECONDS));
     }
 
-    /** 契约：lambda 同步抛异常时，release 在 catch 中执行（既有行为不回归）。 */
+    /** 契约：lambda 同步抛异常时，对话异常完成且口接受下一场（既有行为不回归）。 */
     @Test
-    public void releaseFires_whenLambdaThrowsSynchronously() throws Exception {
-        SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        when(source.acquire()).thenReturn("key-throw");
+    public void completesExceptionally_whenBodyThrowsSynchronously_thenPortContinues() throws Exception {
+        SerialSourcePort port = newPort();
+        SerialSource source = newSource(port);
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
-                source, src -> { throw new RuntimeException("sync boom"); }, TEST_TX_TIMEOUT_MS);
+                source, src -> {
+                    throw new RuntimeException("sync boom");
+                }, TEST_TX_TIMEOUT_MS);
 
-        verify(source, timeout(2000)).release("key-throw");
         try {
             result.get(2, TimeUnit.SECONDS);
             fail("期望异常完成");
         } catch (ExecutionException ee) {
             assertTrue("cause 应含同步异常信息", ee.getCause().getMessage().contains("sync boom"));
         }
+        assertTrue("下一场应正常完成",
+                SerialTransactionStrategy.executeWithLambda(
+                        source, src -> CompletableFuture.completedFuture(true))
+                        .get(NEXT_CONV_BOUND_MS, TimeUnit.MILLISECONDS));
     }
 
-    /** 契约：acquire 失败（返回 null）时，不 release，返回异常 future（既有行为不回归）。 */
+    /**
+     * 契约：串行性保持——两场对话不并发（第二场的开始时间不早于第一场的完成点），
+     * 同口一场一场地来是最小模型的根契约。
+     */
     @Test
-    public void returnsFailedFuture_whenAcquireReturnsNull() throws Exception {
-        SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        when(source.acquire()).thenReturn(null);
+    public void conversationsRunOneAtATime_onSamePort() throws Exception {
+        SerialSourcePort port = newPort();
+        SerialSource source = newSource(port);
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger overlap = new AtomicInteger();
 
-        CompletableFuture<Boolean> result = SerialTransactionStrategy.executeWithLambda(
-                source, src -> new CompletableFuture<>(), TEST_TX_TIMEOUT_MS);
-
-        verify(source, never()).release(any());
-        try {
-            result.get(2, TimeUnit.SECONDS);
-            fail("期望异常完成");
-        } catch (ExecutionException ee) {
-            assertTrue("acquire 失败应抛 IllegalStateException",
-                    ee.getCause() instanceof IllegalStateException);
-        }
+        CompletableFuture<Boolean> first = SerialTransactionStrategy.executeWithLambda(source, src -> {
+            if (inFlight.incrementAndGet() > 1) {
+                overlap.incrementAndGet();
+            }
+            return delay(80L).thenApply(v -> {
+                inFlight.decrementAndGet();
+                return true;
+            });
+        });
+        CompletableFuture<Boolean> second = SerialTransactionStrategy.executeWithLambda(source, src -> {
+            if (inFlight.incrementAndGet() > 1) {
+                overlap.incrementAndGet();
+            }
+            return delay(20L).thenApply(v -> {
+                inFlight.decrementAndGet();
+                return true;
+            });
+        });
+        assertTrue(first.get(5, TimeUnit.SECONDS));
+        assertTrue(second.get(5, TimeUnit.SECONDS));
+        assertFalse("同口对话不得并发（重叠计数必须为 0）", overlap.get() > 0);
     }
 
     /**
      * 契约：默认（2 参重载）事务硬超时由设备配置的串口超时派生（× {@link SerialTransactionStrategy#TRANSACTION_TIMEOUT_FACTOR}），
-     * 与应答策略 {@link com.ecat.integration.SerialIntegration.SendReadStrategy.ByteResponseHandlerStrategy} 的
-     * {@code source.getTimeout() > 0 ? source.getTimeout() : Const.READ_TIMEOUT_MS} 模式一致。
+     * 与应答策略 {@code source.getTimeout() > 0 ? source.getTimeout() : Const.READ_TIMEOUT_MS} 模式一致。
      */
     @Test
     public void defaultTimeout_derivedFromDeviceConfigTimeout() {
         SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.getTimeout()).thenReturn(300);
 
         long resolved = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);
@@ -145,7 +158,6 @@ public class SerialTransactionStrategyLockLeakTest {
     @Test
     public void defaultTimeout_fallsBackToConst_whenDeviceTimeoutInvalid() {
         SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
         when(source.getTimeout()).thenReturn(0);
 
         long resolved = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);
@@ -158,5 +170,24 @@ public class SerialTransactionStrategyLockLeakTest {
     public void defaultTimeout_fallsBackToConst_whenSourceNull() {
         long resolved = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(null);
         assertEquals((long) (Const.READ_TIMEOUT_MS * SerialTransactionStrategy.TRANSACTION_TIMEOUT_FACTOR), resolved);
+    }
+
+    // ==================== helpers ====================
+
+    /** 真实端口对象（容量 3；构造零 jSerialComm 副作用）。 */
+    private SerialSourcePort newPort() {
+        return new SerialSourcePort(new SerialInfo("LOCKLEAK-PORT", 9600, 8, 1, 0), 3, null);
+    }
+
+    /** 真实视图（挂靠注册对假端口名 open 失败无害）。 */
+    private SerialSource newSource(SerialSourcePort port) {
+        return new SerialSource(port, "lock-leak-test");
+    }
+
+    /** 域定时器单发延迟（锁外留隙惯用法；到期正常完成）。 */
+    private CompletableFuture<Void> delay(long ms) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        SerialSdkTimers.fireAfter(() -> future.complete(null), ms);
+        return future;
     }
 }

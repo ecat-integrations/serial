@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
+import com.ecat.integration.SerialIntegration.SerialInfo;
 import com.ecat.integration.SerialIntegration.SerialSource;
 import com.ecat.integration.SerialIntegration.SerialTransactionStrategy;
 
@@ -113,10 +114,9 @@ public class SerialTimeoutSchedulerMergedThreadTest {
      */
     @Test
     public void transactionHardTimeout_firesWithoutDedicatedThread() throws Exception {
-        SerialSource source = mock(SerialSource.class);
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
-        when(source.acquire()).thenReturn("key");
-        when(source.getTimeout()).thenReturn(50);
+        // 真实独立源（standalone 公共构造器）：deadline 执法在执行者内经域定时器承载——
+        // 断言「无专用硬超时线程」测的是真实链路（mock 源不经过执行者）
+        SerialSource source = new SerialSource(new SerialInfo("/dev/ttyTXMERGED", 9600, 8, 1, 0, 0, 50));
         CompletableFuture<Boolean> neverCompleting = new CompletableFuture<>();
 
         CompletableFuture<Boolean> result = SerialTransactionStrategy

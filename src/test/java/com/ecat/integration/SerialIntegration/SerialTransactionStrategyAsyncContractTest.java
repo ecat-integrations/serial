@@ -1,6 +1,8 @@
 package com.ecat.integration.SerialIntegration;
 
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -42,8 +44,11 @@ public class SerialTransactionStrategyAsyncContractTest {
 
     private static SerialSource newMockSource() {
         SerialSource source = mock(SerialSource.class);
-        when(source.acquire()).thenReturn("key");
-        when(source.getIoExecutor()).thenReturn(java.util.concurrent.ForkJoinPool.commonPool());
+        // 新模型提交缝：事务体入队语义由 stub 内联（返回事务体自身的 future）——
+        // 本类只固化「阻塞 vs 异步消费」的调度池契约，与端口仲裁无关
+        when(source.submitTransaction(any(), any(), anyLong(), anyLong()))
+                .thenAnswer(inv -> ((java.util.function.Function<SerialSource, CompletableFuture<Boolean>>) inv
+                        .getArgument(0)).apply(source));
         when(source.getTimeout()).thenReturn(50);
         return source;
     }

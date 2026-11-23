@@ -39,6 +39,7 @@ public class SerialPollingDomainChainTest {
 
     private FakeSerialTimers timers;
     private SerialSource source;
+    private SerialSourcePort port;
     private final AtomicLong nanoClock = new AtomicLong(0L);
     /** 事务硬超时执法的旁路调度器：与周期链共缝（都走 SerialSdkTimers）会混入捕获面，
      *  经其自有 bind 缝引开——本测只断言周期链的拍。 */
@@ -56,8 +57,30 @@ public class SerialPollingDomainChainTest {
             return t;
         });
         SerialTimeoutScheduler.bind(timeoutEnforcer);
-        SerialSourcePort port = new SerialSourcePort(new SerialInfo("DOMAIN-CHAIN-PORT", 9600, 8, 1, 0), 1, null);
+        port = new SerialSourcePort(new SerialInfo("DOMAIN-CHAIN-PORT", 9600, 8, 1, 0), 1, null);
         source = bridgedSource(port);
+    }
+
+    /**
+     * 事务派发已异步化（IO 工作线程执行）：结算→重排在完成线程同步链上、先于 BodyDone
+     * 入队，而 BodyDone 处理点=口回 IDLE——「口回到 IDLE 且队列清空」即「对话已结算」的
+     * 确定性判据（deadline 轮询验证事件已发生，禁 sleep 猜测）。
+     */
+    private void drainAsyncSettles() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        SerialPortExecutor.PortState st = port.executor().state();
+        while ((st == SerialPortExecutor.PortState.AWAIT_WRITE
+                || st == SerialPortExecutor.PortState.AWAIT_RESPONSE
+                || st == SerialPortExecutor.PortState.HELD
+                || st == SerialPortExecutor.PortState.DRAINING
+                || st == SerialPortExecutor.PortState.RECOVERING
+                || port.queuedConversations() > 0) && System.nanoTime() < deadline) {
+            Thread.yield();
+            st = port.executor().state();
+        }
+        if (st != SerialPortExecutor.PortState.IDLE || port.queuedConversations() > 0) {
+            throw new AssertionError("对话未在 5s 内结算（state=" + st + ", queued=" + port.queuedConversations() + "）");
+        }
     }
 
     @After
@@ -85,6 +108,18 @@ public class SerialPollingDomainChainTest {
         when(source.acquirePollingBounded(anyLong())).thenAnswer(inv -> port.acquirePollingBounded(
                 null, inv.getArgument(0, Long.class)));
         when(source.release(anyString())).thenAnswer(inv -> port.release(inv.getArgument(0, String.class)));
+        when(source.submitTransaction(any(), any(), anyLong(), anyLong()))
+                .thenAnswer(inv -> {
+                    // 桥接保留真实视图契约：closed view 拒绝提交（与 SerialSource.assertViewActive 同语义）
+                    SerialSource self = (SerialSource) inv.getMock();
+                    if (self.isViewClosed()) {
+                        throw new SerialSourceClosedException("submitTransaction", port.getPortName(), "bridged");
+                    }
+                    return port.submitTransaction(self, null,
+                            inv.getArgument(1, SerialPortExecutor.Priority.class),
+                            inv.getArgument(2, Long.class), inv.getArgument(3, Long.class),
+                            inv.getArgument(0, java.util.function.Function.class));
+                });
         when(source.getPortName()).thenReturn(port.getPortName());
         when(source.getTimeout()).thenReturn(port.getTimeout());
         return source;
@@ -109,7 +144,7 @@ public class SerialPollingDomainChainTest {
     // ==================== fixedDelay：完成点+period ====================
 
     @Test
-    public void fixedDelayRearmsFromSettlePoint() {
+    public void fixedDelayRearmsFromSettlePoint() throws Exception {
         CompletableFuture<Boolean> pending = new CompletableFuture<>();
         SerialPolling.on(action -> { }, source)
                 .round(src -> pending)
@@ -121,6 +156,7 @@ public class SerialPollingDomainChainTest {
 
         nanoClock.addAndGet(2L * SECOND_NANOS);   // 在飞 2s
         pending.complete(Boolean.TRUE);
+        awaitShots(2);   // 派发异步化：以「重排拍已提交」为确定性事件（禁立即读数）
         assertEquals("结算后重排下一拍", 2, timers.shots.size());
         assertEquals("fixedDelay=完成点+period（名义漂移不回收）", PERIOD_MS, timers.shots.get(1).delayMillis);
     }
@@ -128,7 +164,7 @@ public class SerialPollingDomainChainTest {
     // ==================== fixedRate：名义网格+跨拍跳过 ====================
 
     @Test
-    public void fixedRateAdvancesNominalGridAndSkipsCrossedTicks() {
+    public void fixedRateAdvancesNominalGridAndSkipsCrossedTicks() throws Exception {
         CompletableFuture<Boolean> pending = new CompletableFuture<>();
         SerialPolling.on(action -> { }, source)
                 .round(src -> pending)
@@ -140,6 +176,7 @@ public class SerialPollingDomainChainTest {
 
         nanoClock.addAndGet(3L * SECOND_NANOS);   // 跨过 3 个网格拍
         pending.complete(Boolean.TRUE);
+        awaitShots(2);   // 派发异步化：以「重排拍已提交」为确定性事件
         long rearmDelay = timers.shots.get(1).delayMillis;
         assertEquals("fixedRate 在飞 3s（period 1s）后：锚点推进到首个未来网格点（t0+4s，即 1s 后）",
                 PERIOD_MS, rearmDelay);
@@ -148,13 +185,14 @@ public class SerialPollingDomainChainTest {
     // ==================== 过期即弃：到拍滞后超一个整周期 ====================
 
     @Test
-    public void staleFireDropsRoundAndAdvancesAnchor() {
+    public void staleFireDropsRoundAndAdvancesAnchor() throws Exception {
         ready().start();
         assertEquals(1, timers.shots.size());
 
         // 到拍滞后 2.5 个周期：onFire 判过期（lag=2.5s > period 1s）→ skips=2.5/1+1=3
         nanoClock.addAndGet((5L * SECOND_NANOS) / 2);
         timers.fire(0);
+        drainAsyncSettles();   // 派发异步化：本测试的结算不得泄漏进后续测试的 timers
 
         assertEquals("过期轮不执行、重排下一拍（round 体未跑：无第 3 拍提交前的多余记录）",
                 2, timers.shots.size());
@@ -194,12 +232,14 @@ public class SerialPollingDomainChainTest {
         // 事件已发生才断言（deadline 轮询，无 sleep 猜测）：预算耗尽记账与结算重排都在
         // 旁池/结算链上异步发生，fire(0) 返回后立即读数是竞态
         awaitSkipAccounted(port, 1);
+        port.executor().awaitEventLoopForTest();   // 弃轮结算→重排屏障（结算在口执行线程完成链上）
         awaitShots(2);
         assertEquals("锁忙轮结算后必须重排（网格不变，永不注销）", 2, timers.shots.size());
         assertEquals("锁忙轮按正常结算重排（fixedDelay=结算点+period）", PERIOD_MS,
                 timers.shots.get(1).delayMillis);
         assertTrue("锁忙轮不得注销链", handle.isRunning());
         port.release(held[0]);
+        port.executor().awaitEventLoopForTest();   // 尾部排干：结算不泄漏进后续测试
     }
 
     /** 真弃轮记账事件等待（deadline 轮询：预算耗尽的记账发生在旁池线程，立即读数是竞态）。 */
@@ -225,7 +265,7 @@ public class SerialPollingDomainChainTest {
     }
 
     @Test
-    public void failedRoundSettlesAndRearms() {
+    public void failedRoundSettlesAndRearms() throws Exception {
         SerialPolling.on(action -> { }, source)
                 .round(src -> {
                     throw new IllegalStateException("round begin boom");
@@ -233,7 +273,8 @@ public class SerialPollingDomainChainTest {
                 .every(PERIOD_MS, TimeUnit.MILLISECONDS)
                 .withNanoClock(nanoClock::get)
                 .start();
-        timers.fire(0);   // begin 同步抛=异常轮等价
+        timers.fire(0);   // begin 同步抛移到工作线程：对话体同步抛=对话异常完成
+        awaitShots(2);   // 派发异步化：以「重排拍已提交」为确定性事件
 
         assertEquals("异常轮任何终态都重排（永不注销）", 2, timers.shots.size());
         assertEquals(PERIOD_MS, timers.shots.get(1).delayMillis);
