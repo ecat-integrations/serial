@@ -45,7 +45,11 @@ import com.fazecast.jSerialComm.SerialPort;
  * <pre>
  *   SERIAL_BENCH=1 mvnd test -Dtest=SerialPortTransactionLoadBenchTest
  * </pre>
- * 输出行以 {@code BENCH|} 前缀打印（group/run/tx/thr/p50/p99/max），便于对照汇总。
+ * 可选 {@code SERIAL_BENCH_DELAY_MS=&lt;毫秒&gt;} 注入模拟设备应答延迟（设备侧语义：
+ * 收到命令后处理 N 毫秒才回应答——真实工况形态。注入走 serial 域既有确定性调度缝
+ * {@link SerialSdkTimers#fireAfter}，与生产延迟命令同源；两侧对拍同等注入即对照有效）。
+ * 零延迟形态用于放大观察仲裁层固定开销；带延迟形态用于测执行者开销占端到端时延比例。
+ * 输出行以 {@code BENCH|} 前缀打印（group/run/tx/thr/p50/p99/max/delay），便于对照汇总。
  * 基准前每组先跑预热轮（预热数据弃置不计），对拍按同命令多次运行取中位。
  *
  * <p>同步纪律：全链 future/latch 有界等待，无 Thread.sleep；用例间独立端口名隔离。
@@ -69,6 +73,25 @@ public class SerialPortTransactionLoadBenchTest {
 
     private static final long WRITE_ACK_WAIT_S = 5;
     private static final long DIALOGUE_WAIT_S = 10;
+
+    /**
+     * 模拟设备应答延迟（毫秒，环境变量 SERIAL_BENCH_DELAY_MS，缺省 0=即时回声）。
+     * 设备侧语义：收到命令后「处理」N 毫秒才回应答。严格模式：非法值如实炸出，
+     * 不静默归零——对照实验的负载参数错了比不跑更糟。
+     */
+    private static final long DEVICE_DELAY_MS = resolveDeviceDelayMs();
+
+    private static long resolveDeviceDelayMs() {
+        String v = System.getenv("SERIAL_BENCH_DELAY_MS");
+        if (v == null || v.isEmpty()) {
+            return 0L;
+        }
+        long parsed = Long.parseLong(v);
+        if (parsed < 0) {
+            throw new IllegalArgumentException("SERIAL_BENCH_DELAY_MS 不能为负: " + v);
+        }
+        return parsed;
+    }
 
     /** 一次基准的测量产出：总场数、总耗时、每场时延（纳秒，提交点→事务完成） */
     static final class BenchResult {
@@ -104,8 +127,8 @@ public class SerialPortTransactionLoadBenchTest {
         /** BENCH| 统一行：对照组可 grep 直引，数字由程序产出不经手工换算 */
         String benchLine() {
             return String.format(Locale.ROOT,
-                    "BENCH|group=%s|tx=%d|thr=%.1f|p50=%.3f|p99=%.3f|max=%.3f",
-                    group, dialogues, throughputPerSec(),
+                    "BENCH|group=%s|delay=%dms|tx=%d|thr=%.1f|p50=%.3f|p99=%.3f|max=%.3f",
+                    group, DEVICE_DELAY_MS, dialogues, throughputPerSec(),
                     percentileNanos(0.50) / 1_000_000.0d,
                     percentileNanos(0.99) / 1_000_000.0d,
                     percentileNanos(1.0) / 1_000_000.0d);
@@ -253,15 +276,20 @@ public class SerialPortTransactionLoadBenchTest {
             SerialPort mockPort = mock(SerialPort.class);
             when(mockPort.isOpen()).thenReturn(true);
             when(mockPort.bytesAvailable()).thenReturn(0);
-            // 回声型模拟设备本体：收到命令帧（writeBytes=口执行线程物理写）→ 立即注入
-            // 应答帧。handleIncomingData 只投递事件不等待处理，回调线程（口执行线程）
-            // 无重入风险——OnBytes 与 BodyDone 各自排队串行。
+            // 回声型模拟设备本体：收到命令帧（writeBytes=口执行线程物理写）→ 设备处理
+            // 延迟（SerialSdkTimers 既有确定性调度缝到拍）后注入应答帧。handleIncomingData
+            // 只投递事件不等待处理，回调线程无重入风险——OnBytes 与 BodyDone 各自排队串行。
             when(mockPort.writeBytes(any(byte[].class), anyLong())).thenAnswer(inv -> {
                 byte[] tx = inv.getArgument(0);
                 Integer seq = parseSeq(tx);
                 if (seq != null) {
                     byte[] resp = replyFrame(seq);
-                    port.handleIncomingData(resp, resp.length);
+                    if (DEVICE_DELAY_MS > 0) {
+                        SerialSdkTimers.fireAfter(() -> port.handleIncomingData(resp, resp.length),
+                                DEVICE_DELAY_MS);
+                    } else {
+                        port.handleIncomingData(resp, resp.length);
+                    }
                 }
                 return tx.length;
             });
