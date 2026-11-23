@@ -178,14 +178,14 @@ private void handleIncomingData(byte[] data, int length) {
 
 集成设备代码**不应直接调用 `SerialSource` 的 acquire/acquirePollingBounded 取锁**——那是 SDK 事务入口（及自管收发时序的框架型消费方，如 serial-tcp-server 网关）的专用面。按事务的时效语义选入口，两个事务入口是两种调度纪律而非冗余：
 
-| 事务形态 | 入口 | 锁语义 |
+| 事务形态 | 入口 | 对话语义 |
 |---|---|---|
-| 命令/写事务 | `SerialTransactionStrategy.executeWithLambda(source, lambda)` | 阻塞排队等锁（waitQueue 有限等待）——命令的时效语义是「最终要执行」，等是正确的 |
-| 周期轮询 | `SerialTransactionStrategy.executePolling(source, lambda)` | 经 `acquirePollingBounded` 取锁（2026-09-13 方案 c）：无竞争快路径直达；锁忙时 FIFO 有界等待移交 IO 旁池线程（SDK 按周期 clamp 预算 period÷4 ∈ [200,500]ms，调用线程零 park），预算内等到锁则本轮照常完成——轮询与写命令同队同公平；预算耗尽才弃本轮（「过期即弃」保留在预算边界上），弃轮有记账（`SerialSource.getLockBusySkipCount()` + 限频 warn，等到锁的轮次不计） |
-| round/事务临界体内追加命令 | SDK 注入的 `source` 直接 `asyncSendData(...)` **直发** | 此时锁已持有，**禁再经 executeWithLambda/executePolling 二次取锁** |
+| 命令/写事务 | `SerialTransactionStrategy.executeWithLambda(source, lambda)` | 高优先级对话入队（入队即返回 future，调用线程零 park）；队满同步抛 `PortQueueFullException`；等锁预算内未授予则 future 异常完成——命令的时效语义是「最终要执行」，有限等待是正确的 |
+| 周期轮询 | `SerialTransactionStrategy.executePolling(source, lambda)` | 普通优先级对话入队——与写命令同队同公平；排队等待预算（SDK 按周期 clamp period÷4 ∈ [200,500]ms）耗尽或队满时 future 以 `LockBusySkippedException`（含子类 `PortQueueFullException`）异常完成，SerialPolling 内化为跳过本轮（「过期即弃」保留在预算边界上），弃轮有记账（`SerialSource.getLockBusySkipCount()` + 限频 warn，等到口的轮次不计） |
+| round/事务临界体内追加命令 | SDK 注入的 `source` 直接 `asyncSendData(...)` **直发** | 此时本对话在飞（写请求在口执行线程与其余 IO 串行），**禁再经 executeWithLambda/executePolling 二次入队**——同线程嵌套提交会排队到自身之后，等待自身完成即自死锁 |
 
-- 两入口取锁后共享同一执行链：事务级硬超时（默认由设备配置串口超时 ×10 派生，长事务/标定流程显式传 `transactionTimeoutMs`）+ 完成即 release + 超时强拆端口。返回 future 须异步消费（`whenComplete`），**禁在周期调度任务内 `.get()`/`.join()` 阻塞**——契约细则见 `SerialTransactionStrategy` 类 Javadoc。
-- **同线程嵌套取锁 fail-fast 守卫（2026-08-29 上线）**：round/事务临界体内再经事务入口二次取锁 = 自死锁形态（等待者与持有者是同一线程，`condition.await` 永远等不到自己的 release）。旧形态静默 park 到超时（vaisala 事故 live 实证同线程空转 5h44m，bug-record-20260829-082100）；守卫改为微秒级立即抛 `IllegalStateException`，异常消息含端口/入口/持有者/持锁时长与修复指引（round 内应使用注入 source 直发），锁状态原样不动。20 个 serial 家族仓审计不存在合法的同线程嵌套取锁，无人依赖可重入；设计真相源见 workspace `arch-review-20260815/36-serial-nested-acquire-guard-design.md`。
+- 两入口共享同一执行链：对话授予后事务体在 IO 工作线程执行（口执行线程永不跑设备代码），事务级硬超时（默认由设备配置串口超时 ×10 派生，长事务/标定流程显式传 `transactionTimeoutMs`）由执行者看门狗执法，超时跨线程强拆 fd、重开并排空后开下一场。返回 future 须异步消费（`whenComplete`），**禁在周期调度任务内 `.get()`/`.join()` 阻塞**——契约细则见 `SerialTransactionStrategy` 类 Javadoc。
+- **同线程嵌套提交 = 自死锁形态（结构性提示，无运行时守卫）**：round/事务临界体内再经事务入口二次入队会排到自身之后（等待自身完成）。vaisala 事故 live 实证同线程空转 5h44m（bug-record-20260829-082100）——最小模型以「入队即返回」使命令路径无此形态，round 内直发纪律（上一行）仍是必须遵守的使用契约。
 - **直发样板**（fleet 定稿形态）：gassensor `PM3006SDevice.readDeviceData`（测量未启动先直发启动命令、成功后经节拍再读）；vaisala `WeatherSensor`；davis `WeatherSensor.wakeDevice`。
 
 ## 执行器选择（周期计时与阻塞 IO）
