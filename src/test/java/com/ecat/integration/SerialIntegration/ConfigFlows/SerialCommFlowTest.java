@@ -4,10 +4,13 @@ import com.ecat.core.ConfigFlow.AbstractConfigFlow;
 import com.ecat.core.ConfigFlow.ConfigFlowResult;
 import com.ecat.core.ConfigFlow.ConfigSchema;
 import com.ecat.core.ConfigFlow.ConfigItem.AbstractConfigItem;
+import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
 import com.ecat.core.ConfigFlow.FlowContext;
 import com.ecat.integration.SerialIntegration.ConfigSchemas.BaudRate;
 import com.ecat.integration.SerialIntegration.ConfigSchemas.SerialCommConfigSchema;
 import com.ecat.integration.SerialIntegration.Const;
+import com.ecat.integration.SerialIntegration.SerialTransport;
+import com.ecat.integration.TcpIntegration.ConfigSchemas.TcpClientCommConfigSchema;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -20,9 +23,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.Assert.*;
 
 /**
- * SerialCommFlow（串口通讯子 flow，单步形态）单元测试：
- * 挂载走读（入口即唯一步 → 出口交回宿主尾步）、落盘形状（扁平 7 字段整块）、
- * 校验失败回显、定制形态对照（宿主经 builder 注入定制预填 vs 无参挂载用库标准预填）。
+ * SerialCommFlow（串口通讯子 flow，两步形态）单元测试：
+ * 挂载走读（入口=transport_select → comm_config → 出口交回宿主尾步）、步序与分档表单
+ * （serial 档 7 UART 字段 / tcp 档整块复用 tcp schema）、落盘形状
+ * （comm_settings = {transport, …该档字段…}）、校验失败回显、定制形态对照
+ * （静态 schema / defaults / defaultsTcp 三形态与优先级契约）。
  */
 public class SerialCommFlowTest {
 
@@ -75,23 +80,35 @@ public class SerialCommFlowTest {
         }
     }
 
-    /** 驱动宿主直到子 flow 首屏（入口步 comm_config）显示。 */
+    /** 驱动宿主直到子 flow 首屏（入口步 transport_select）显示。 */
     private static HostFlow enterSubFlow(SerialCommFlow commFlow) {
         HostFlow host = new HostFlow(commFlow);
         host.executeUserStep(null);
         host.handleStep("user", input("k", "v"));
         ConfigFlowResult r = host.handleStep("device_config", input("name", "dev"));
         assertEquals(ConfigFlowResult.ResultType.SHOW_FORM, r.getType());
-        assertEquals("宿主 device_config 提交后应进子 flow 入口屏", "comm_config", r.getStepId());
+        assertEquals("宿主 device_config 提交后应进子 flow 入口屏（transport_select）",
+                "transport_select", r.getStepId());
         return host;
+    }
+
+    /** 提交通道选择并断言步序（transport_select → comm_config）。 */
+    private static ConfigFlowResult selectTransport(HostFlow host, String transport) {
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("transport", transport);
+        ConfigFlowResult r = host.handleStep("transport_select", choice);
+        assertEquals("通道选择提交后应进 comm_config（errors=" + r.getErrors() + "）",
+                "comm_config", r.getStepId());
+        return r;
     }
 
     // ==================== 挂载走读 ====================
 
     @Test
-    public void submitCommConfig_exitsToHostTail_andPersistsFlatShape() {
+    public void submitCommConfig_exitsToHostTail_andPersistsMergedShape() {
         HostFlow host = enterSubFlow(new SerialCommFlow());
 
+        selectTransport(host, "serial");
         Map<String, Object> commInput = commInput();
         ConfigFlowResult exit = host.handleStep("comm_config", commInput);
         assertEquals("子 flow 出口应交回宿主尾步（errors=" + exit.getErrors() + "）",
@@ -100,15 +117,20 @@ public class SerialCommFlowTest {
                 "final_confirm", exit.getStepId());
         assertEquals("final_confirm", host.getCurrentStep());
 
-        // 落盘形状：comm_settings 整块（按提交值透传：COM 档扁平 UART 字段 / TCP 档 transport+host+port）
-        assertEquals(commInput, host.getContext().getEntryData().get("comm_settings"));
-        // 漫游面：子 flow 步数据进宿主 stepInputs（stepId 不变，reconfigure 漫游兼容）
+        // 落盘形状：comm_settings = {transport, …该档字段…}（transport_select 的选择并入前置）
+        Map<String, Object> expected = new LinkedHashMap<>();
+        expected.put("transport", "serial");
+        expected.putAll(commInput);
+        assertEquals(expected, host.getContext().getEntryData().get("comm_settings"));
+        // 漫游面：子 flow 两步数据都进宿主 stepInputs（stepId 不变，reconfigure 漫游兼容）
+        assertTrue(host.getContext().getStepInputs().containsKey("transport_select"));
         assertTrue(host.getContext().getStepInputs().containsKey("comm_config"));
     }
 
     @Test
     public void invalidInput_redisplaysCommConfigWithErrors() {
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "serial");
 
         Map<String, Object> bad = new LinkedHashMap<>();
         bad.put("serial_port", "/dev/ttyUSB0");
@@ -117,62 +139,166 @@ public class SerialCommFlowTest {
         bad.put("stop_bits", "1");
         bad.put("parity", "None");
         ConfigFlowResult r = host.handleStep("comm_config", bad);
-        assertEquals("校验失败应回显子 flow 唯一步", "comm_config", r.getStepId());
+        assertEquals("校验失败应回显 comm_config", "comm_config", r.getStepId());
         assertNotNull("应携带校验错误", r.getErrors().get("baudrate"));
         // 未过校验不得落盘、不得出口
         assertFalse(host.getContext().getEntryData().containsKey("comm_settings"));
     }
 
     @Test
-    public void firstScreen_showsSerialFields() {
+    public void firstScreen_isTransportSelect_withSerialPrefill() {
+        // 入口屏=通道选择：transport 必选、options 与枚举一一对应、新建流程缺省预填 serial
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        ConfigFlowResult form = host.handleStep("transport_select", null);
+        assertEquals("transport_select", form.getStepId());
+        AbstractConfigItem<?> transport = field(form.getSchema(), "transport");
+        assertNotNull("入口屏应含 transport 字段", transport);
+        assertTrue("transport 应必选（两步形态的档位来源）", transport.isRequired());
+        assertEquals("新建流程缺省预填 serial（与 parse 缺省同源）",
+                "serial", transport.getDefaultValue());
+        assertEquals("options 与 SerialTransport 枚举一一对应",
+                SerialTransport.toMap(), ((EnumConfigItem) transport).getOptionLabels());
+        assertNull("入口屏不得混入 comm 字段（两档字段不混一张表单）", field(form.getSchema(), "serial_port"));
+    }
+
+    @Test
+    public void transportSelect_garbageValue_redisplaysWithError() {
+        // 通道选择的成员资格执法在表单期（非法取值不得进 comm_config）
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        Map<String, Object> bogus = new LinkedHashMap<>();
+        bogus.put("transport", "bogus");
+        ConfigFlowResult r = host.handleStep("transport_select", bogus);
+        assertEquals("非法通道取值应回显 transport_select", "transport_select", r.getStepId());
+        assertNotNull("应携带 transport 错误", r.getErrors().get("transport"));
+        assertFalse(host.getContext().getEntryData().containsKey("comm_settings"));
+    }
+
+    @Test
+    public void commConfig_withoutTransportSelect_strictlyRejected() {
+        // 越步直投 comm_config（stepInputs 无通道选择）= 两步形态的结构违约：严格抛出不猜档
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        try {
+            host.handleStep("comm_config", commInput());
+            fail("未提交 transport_select 直投 comm_config 必须严格拒绝");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("transport_select"));
+        }
+        assertFalse(host.getContext().getEntryData().containsKey("comm_settings"));
+    }
+
+    // ==================== serial 档 comm_config 表单（7 UART 字段） ====================
+
+    @Test
+    public void commConfigForm_serialProfile_showsSevenUartFieldsOnly() {
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "serial");
         ConfigFlowResult form = host.handleStep("comm_config", null);
         assertEquals("comm_config", form.getStepId());
         assertNotNull("表单应含 serial_port 字段", field(form.getSchema(), "serial_port"));
+        assertNotNull("表单应含 baudrate 字段", field(form.getSchema(), "baudrate"));
+        assertNotNull("表单应含 data_bits 字段", field(form.getSchema(), "data_bits"));
+        assertNotNull("表单应含 stop_bits 字段", field(form.getSchema(), "stop_bits"));
+        assertNotNull("表单应含 parity 字段", field(form.getSchema(), "parity"));
         assertNotNull("表单应含 flow_control 字段", field(form.getSchema(), "flow_control"));
         assertNotNull("表单应含 timeout 字段", field(form.getSchema(), "timeout"));
-        assertNotNull("表单应含 transport 字段", field(form.getSchema(), "transport"));
-        assertNotNull("表单应含 host 字段（复用 tcp 仓字段定义）", field(form.getSchema(), "host"));
-        assertNotNull("表单应含 port 字段（复用 tcp 仓字段定义）", field(form.getSchema(), "port"));
+        assertEquals("serial 档表单应恰为 7 个 UART 字段", 7, form.getSchema().getFields().size());
+        // 分档表单负断言：host/port 归 tcp 档，transport 归入口步——不得混入
+        assertNull("serial 档表单不得含 host（tcp 档专属）", field(form.getSchema(), "host"));
+        assertNull("serial 档表单不得含 port（tcp 档专属）", field(form.getSchema(), "port"));
+        assertNull("serial 档表单不得含 transport（入口步已收集）", field(form.getSchema(), "transport"));
     }
 
-    // ==================== TCP 档提交（串口服务器形态） ====================
+    @Test
+    public void serialSubmission_withoutTransportKey_stillExitsToHostTail() {
+        // COM 档既有提交形态回归：UART 载荷不带 transport 键（旧表单/脚本形态）→ 原行为过闸，
+        // transport 由 flow 并入落盘
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "serial");
+        Map<String, Object> uartOnly = commInput();
+        assertFalse(uartOnly.containsKey("transport"));
+        ConfigFlowResult exit = host.handleStep("comm_config", uartOnly);
+        assertEquals("final_confirm", exit.getStepId());
+        Map<String, Object> expected = new LinkedHashMap<>();
+        expected.put("transport", "serial");
+        expected.putAll(uartOnly);
+        assertEquals(expected, host.getContext().getEntryData().get("comm_settings"));
+    }
+
+    // ==================== TCP 档（comm_config 整块复用 tcp schema） ====================
+
+    @Test
+    public void commConfigForm_tcpProfile_reusesTcpSchemaWhole() {
+        // tcp 档渲染 TcpClientCommConfigSchema 整块：host/port 必填原生继承、
+        // reconnect 字段保留（B1 重连分工修正后有意义）、不摘字段不设默认端口
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "tcp");
+        ConfigFlowResult form = host.handleStep("comm_config", null);
+        assertEquals("comm_config", form.getStepId());
+
+        ConfigSchema expected = TcpClientCommConfigSchema.builder().build().createSchema();
+        assertEquals("tcp 档表单字段集应与 tcp schema 整块一致",
+                expected.getFields().size(), form.getSchema().getFields().size());
+        AbstractConfigItem<?> hostField = field(form.getSchema(), "host");
+        AbstractConfigItem<?> portField = field(form.getSchema(), "port");
+        assertNotNull("tcp 档应含 host", hostField);
+        assertNotNull("tcp 档应含 port", portField);
+        assertTrue("host 必填（tcp schema 原生 required，不改）", hostField.isRequired());
+        assertTrue("port 必填（tcp schema 原生 required，不改）", portField.isRequired());
+        assertNotNull("reconnect 字段保留（重连参数 B1 后有意义）",
+                field(form.getSchema(), "max_reconnect_attempts"));
+        assertNotNull("reconnect_timeout 字段保留", field(form.getSchema(), "reconnect_timeout"));
+        assertNull("tcp 档不得混入 UART 字段", field(form.getSchema(), "serial_port"));
+        assertNull("tcp 档不得混入 transport", field(form.getSchema(), "transport"));
+    }
 
     @Test
     public void tcpSubmission_withoutLocalSerialPort_exitsToHostTail() {
-        // 无本地串口主机形态：transport/host/port 三字段即可过（UART 字段全缺，
-        // TCP 档豁免集执法）——TCP 设备的核心价值场景
+        // 无本地串口主机形态：tcp 档下 host/port 提交即过（UART 字段全缺也不被执法）
+        // ——TCP 设备的核心价值场景
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "tcp");
 
         Map<String, Object> tcpInput = new LinkedHashMap<>();
-        tcpInput.put("transport", "tcp");
         tcpInput.put("host", "192.168.1.50");
         tcpInput.put("port", "4001");
         ConfigFlowResult exit = host.handleStep("comm_config", tcpInput);
         assertEquals("TCP 档无 UART 字段应过校验（errors=" + exit.getErrors() + "）",
                 "final_confirm", exit.getStepId());
-        assertEquals(tcpInput, host.getContext().getEntryData().get("comm_settings"));
+        Map<String, Object> expected = new LinkedHashMap<>();
+        expected.put("transport", "tcp");
+        expected.putAll(tcpInput);
+        assertEquals(expected, host.getContext().getEntryData().get("comm_settings"));
     }
 
     @Test
     public void tcpSubmission_missingHost_redisplaysWithErrors() {
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "tcp");
 
         Map<String, Object> tcpInput = new LinkedHashMap<>();
-        tcpInput.put("transport", "tcp");
         tcpInput.put("port", "4001");
         ConfigFlowResult r = host.handleStep("comm_config", tcpInput);
-        assertEquals("校验失败应回显子 flow 唯一步", "comm_config", r.getStepId());
-        assertNotNull("TCP 档缺 host 应在表单期报错（tcp 仓字段原生 required）", r.getErrors().get("host"));
+        assertEquals("校验失败应回显 comm_config", "comm_config", r.getStepId());
+        assertNotNull("TCP 档缺 host 应在表单期报错（tcp schema 原生 required）", r.getErrors().get("host"));
         assertFalse(host.getContext().getEntryData().containsKey("comm_settings"));
     }
 
+    // ==================== transport_select 预填（存量 entry 重配形态） ====================
+
     @Test
-    public void serialSubmission_withoutTcpFields_stillExitsToHostTail() {
-        // COM 档既有提交形态回归：transport 键缺省（旧表单/脚本不带）+ UART 字段 → 原行为过闸
+    public void transportSelectPrefill_fromStoredEntrySettings() {
+        // reconfigure 存量 entry：core 启动时预载 entryData → transport_select 预填现有
+        // transport（tcp entry 重配预填 tcp，用户直接下一步即回既有档位）
         HostFlow host = enterSubFlow(new SerialCommFlow());
-        ConfigFlowResult exit = host.handleStep("comm_config", commInput());
-        assertEquals("final_confirm", exit.getStepId());
+        Map<String, Object> stored = new LinkedHashMap<>();
+        stored.put("transport", "tcp");
+        stored.put("host", "192.168.1.50");
+        stored.put("port", "4001");
+        host.getContext().getEntryData().put("comm_settings", stored);
+
+        ConfigFlowResult form = host.handleStep("transport_select", null);
+        assertEquals("存量 entry 的 transport 预填", "tcp",
+                field(form.getSchema(), "transport").getDefaultValue());
     }
 
     // ==================== 定制形态 vs 无参形态（builder 定制预填 vs 库标准预填） ====================
@@ -180,6 +306,7 @@ public class SerialCommFlowTest {
     @Test
     public void noArgMount_prefillsLibraryStandard() {
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "serial");
         ConfigFlowResult form = host.handleStep("comm_config", null);
         assertEquals("无参挂载：timeout 预填 = serial 库标准默认",
                 Const.READ_TIMEOUT_MS.doubleValue(),
@@ -196,6 +323,7 @@ public class SerialCommFlowTest {
                 .build();
 
         HostFlow host = enterSubFlow(customized);
+        selectTransport(host, "serial");
         ConfigFlowResult form = host.handleStep("comm_config", null);
         assertEquals("builder 定制：timeout 预填 = 宿主定制值", 2000.0,
                 ((Number) field(form.getSchema(), "timeout").getDefaultValue()).doubleValue(), 0.001);
@@ -208,13 +336,16 @@ public class SerialCommFlowTest {
         commInput.put("timeout", 2000);
         ConfigFlowResult exit = host.handleStep("comm_config", commInput);
         assertEquals("final_confirm", exit.getStepId());
-        assertEquals(commInput, host.getContext().getEntryData().get("comm_settings"));
+        Map<String, Object> expected = new LinkedHashMap<>();
+        expected.put("transport", "serial");
+        expected.putAll(commInput);
+        assertEquals(expected, host.getContext().getEntryData().get("comm_settings"));
     }
 
-    // ==================== defaults 动态预填（两级默认值 API，契约四条） ====================
+    // ==================== defaults / defaultsTcp 动态预填（两级默认值 API） ====================
 
     @Test
-    public void defaultsMount_hookReceivesEntryData_andPrefillsForm() {
+    public void defaultsMount_hookReceivesEntryData_andPrefillsSerialProfile() {
         // 契约①：hook 收到宿主 entryData 且返回值用于预填；契约②（优先级）：与静态 schema
         // 并设时 defaults 优先（动态预填覆盖静态定制——Builder.defaults javadoc 同文）
         AtomicReference<Map<String, Object>> captured = new AtomicReference<>();
@@ -226,7 +357,8 @@ public class SerialCommFlowTest {
                 })
                 .build();
 
-        HostFlow host = enterSubFlow(flow);   // device_config 提交 name=dev 即触发 hook 首次求值
+        HostFlow host = enterSubFlow(flow);   // device_config 提交 name=dev 即已入子 flow
+        selectTransport(host, "serial");      // comm 步在档位确定后求值 hook
         assertEquals("hook 收到宿主 entryData（含 device_config 落的数据）",
                 "dev", captured.get().get("name"));
 
@@ -236,17 +368,43 @@ public class SerialCommFlowTest {
     }
 
     @Test
+    public void defaultsTcpMount_hookPrefillsTcpProfile() {
+        // tcp 档 hook：defaultsTcp 产物定制 tcp 表单预填（port 定制值可见）
+        SerialCommFlow flow = SerialCommFlow.builder()
+                .defaultsTcp(entryData -> TcpClientCommConfigSchema.builder().port(4196).build())
+                .build();
+        HostFlow host = enterSubFlow(flow);
+        selectTransport(host, "tcp");
+        ConfigFlowResult form = host.handleStep("comm_config", null);
+        assertEquals("defaultsTcp：port 预填 = hook 定制值", 4196.0,
+                ((Number) field(form.getSchema(), "port").getDefaultValue()).doubleValue(), 0.001);
+        // serial 档不受 defaultsTcp 影响（hook 按档派发）
+        SerialCommFlow noSerialHook = SerialCommFlow.builder()
+                .defaultsTcp(entryData -> TcpClientCommConfigSchema.builder().port(4196).build())
+                .build();
+        HostFlow host2 = enterSubFlow(noSerialHook);
+        selectTransport(host2, "serial");
+        ConfigFlowResult serialForm = host2.handleStep("comm_config", null);
+        assertEquals("defaultsTcp 不得影响 serial 档预填", Const.READ_TIMEOUT_MS.doubleValue(),
+                ((Number) field(serialForm.getSchema(), "timeout").getDefaultValue()).doubleValue(), 0.001);
+    }
+
+    @Test
     public void defaultsException_propagatesToFlowLayer_notSwallowed() {
-        // 契约③：hook 抛异常炸到 flow 层（不吞、不转 errors map——严格模式不兜底）
+        // 契约③：hook 抛异常炸到 flow 层（不吞、不转 errors map——严格模式不兜底）。
+        // transport_select 提交链内即进 comm 首屏渲染（handleStep 习语），hook 求值异常
+        // 沿链上抛，调用方拿到的就是原始 IllegalStateException
         SerialCommFlow flow = SerialCommFlow.builder()
                 .defaults(entryData -> { throw new IllegalStateException("hook-boom"); })
                 .build();
         HostFlow host = new HostFlow(flow);
         host.executeUserStep(null);
         host.handleStep("user", input("k", "v"));
+        host.handleStep("device_config", input("name", "dev"));
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("transport", "serial");
         try {
-            // device_config 提交后进 comm 首屏——hook 在表单渲染处求值，异常原样上抛
-            host.handleStep("device_config", input("name", "dev"));
+            host.handleStep("transport_select", choice);
             fail("defaults hook 抛异常必须炸到 flow 层");
         } catch (IllegalStateException expected) {
             assertEquals("hook-boom", expected.getMessage());
@@ -259,12 +417,15 @@ public class SerialCommFlowTest {
         // step_inputs[stepId]（校验失败也不丢）；前端以 step_inputs 盖 schema 预填。
         // 后端承诺：留存完整 + 重显表单仍带默认预填（未填字段保持默认，已填字段由前端盖）
         HostFlow host = enterSubFlow(new SerialCommFlow());
+        selectTransport(host, "serial");
         Map<String, Object> bad = commInput();
         bad.put("baudrate", "99999");
         ConfigFlowResult r = host.handleStep("comm_config", bad);
         assertEquals("comm_config", r.getStepId());
         assertEquals("已填值留存 step_inputs（回显数据源不丢）", bad,
                 host.getContext().getStepInputs().get("comm_config"));
+        assertEquals("通道选择留存 step_inputs", "serial",
+                ((Map<?, ?>) host.getContext().getStepInputs().get("transport_select")).get("transport"));
         ConfigFlowResult reshown = host.handleStep("comm_config", null);
         assertEquals("重显表单未填字段保持默认预填", Const.READ_TIMEOUT_MS.doubleValue(),
                 ((Number) field(reshown.getSchema(), "timeout").getDefaultValue()).doubleValue(), 0.001);

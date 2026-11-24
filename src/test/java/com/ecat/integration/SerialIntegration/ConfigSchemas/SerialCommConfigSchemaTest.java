@@ -22,7 +22,6 @@ import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.SchemaConfigItem;
 import com.ecat.core.I18n.I18nHelper;
 import com.ecat.core.Utils.IntegrationCoordinateHelper;
-import com.ecat.integration.SerialIntegration.SerialTransport;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -75,10 +74,9 @@ public class SerialCommConfigSchemaTest {
 
         assertNotNull("Schema 不应为 null", schema);
         List<AbstractConfigItem<?>> fields = schema.getFields();
-        assertEquals("应该有 10 个字段（transport 档案位 + UART 档 6 字段 + timeout + TCP 档 2 字段）",
-                10, fields.size());
+        assertEquals("应该有 7 个字段（serial 档 UART 整表：6 串口字段 + timeout）",
+                7, fields.size());
 
-        assertFieldExists(fields, "transport");
         assertFieldExists(fields, "serial_port");
         assertFieldExists(fields, "baudrate");
         assertFieldExists(fields, "data_bits");
@@ -86,38 +84,33 @@ public class SerialCommConfigSchemaTest {
         assertFieldExists(fields, "parity");
         assertFieldExists(fields, "flow_control");
         assertFieldExists(fields, "timeout");
-        assertFieldExists(fields, "host");
-        assertFieldExists(fields, "port");
     }
 
-    // ========== transport 档案位与 TCP 字段定义 ==========
+    // ========== §3.2 两步形态：transport/host/port 不进本表 ==========
 
     @Test
-    public void transportField_serialProfileSwitch_optionalWithDefaultSerial() {
+    public void transportField_notInSchema_movedToFlowEntryStep() {
+        // 两步形态（§3.2）：transport 档案位由 SerialCommFlow 的 transport_select 入口步
+        // 收集（预填 entry 现有值/缺省 serial），两档字段不混一张表单——本表不得再有
+        // transport 字段（通道不可在 comm 表单内被改，防与已选档位自相矛盾的提交）
         List<AbstractConfigItem<?>> fields = new SerialCommConfigSchema().createSchema().getFields();
-        EnumConfigItem transport = (EnumConfigItem) findField(fields, "transport");
-        // required=false：本 schema 被 11+ 消费仓共享，存量 COM 提交不带 transport 键——
-        // 缺省=serial 与 parse 同源（additive-only，COM 档零变化）
-        assertFalse("transport 不得必填（存量 COM 提交零变化）", transport.isRequired());
-        assertEquals("缺省档=serial（存量 entry 零迁移）", "serial", transport.getDefaultValue());
-        assertEquals("options 与 SerialTransport 枚举一一对应",
-                SerialTransport.toMap(),
-                transport.getOptionLabels());
+        for (AbstractConfigItem<?> field : fields) {
+            assertNotEquals("transport 档案位不得出现在 comm schema（归 flow 入口步）",
+                    "transport", field.getKey());
+        }
     }
 
     @Test
-    public void tcpFields_reusedFromTcpSchema_optionalAtSchemaLevelProfileEnforced() {
-        // host/port 字段定义复用 TcpClientCommConfigSchema（键名/长度与端口域校验器同源），
-        // 移植时 required=false（共享 schema 的 COM 直调零变化）——TCP 档必需执法收口在
-        // validateForTransport；displayName 标注串口服务器语境
+    public void tcpFields_notInSchema_tcpProfileReusesTcpSchemaWhole() {
+        // §3.2：tcp 档表单整块复用 TcpClientCommConfigSchema（serial 不摘字段、不改
+        // required、不设默认端口），host/port 不再以 required(false) 移植进本表
         List<AbstractConfigItem<?>> fields = new SerialCommConfigSchema().createSchema().getFields();
-        AbstractConfigItem<?> host = findField(fields, "host");
-        AbstractConfigItem<?> port = findField(fields, "port");
-        assertFalse("host schema 层非必填（TCP 档执法在 validateForTransport）", host.isRequired());
-        assertEquals("host 无预填（builder.host(null)）", null, host.getDefaultValue());
-        assertFalse("port schema 层非必填（同上）", port.isRequired());
-        assertEquals("port 预填=串口服务器典型档", SerialCommConfigSchema.DEFAULT_TCP_PORT,
-                ((Number) port.getDefaultValue()).intValue());
+        for (AbstractConfigItem<?> field : fields) {
+            assertNotEquals("host 不得出现在 serial schema（tcp 档整块复用 tcp schema）",
+                    "host", field.getKey());
+            assertNotEquals("port 不得出现在 serial schema（tcp 档整块复用 tcp schema）",
+                    "port", field.getKey());
+        }
     }
 
     // ========== validateForTransport（按档提交校验执法点） ==========
@@ -506,31 +499,6 @@ public class SerialCommConfigSchemaTest {
             "None", findField(fields, "parity").getDefaultValue());
         assertEquals("未设置的数据位应保持默认 8",
             "8", findField(fields, "data_bits").getDefaultValue());
-    }
-
-    @Test
-    public void testBuilder_TransportPrefillOverridden_defaultRemainsSerial() {
-        // Builder.transport 只动 transport 档案位预填（两级默认值 API，§3.3）；缺省=SERIAL
-        // 与 parse 同源（COM 档零变化），且不影响 UART 字段默认值
-        EnumConfigItem tcpPrefill = (EnumConfigItem) findField(
-            SerialCommConfigSchema.builder()
-                .transport(SerialTransport.TCP)
-                .build()
-                .createSchema()
-                .getFields(),
-            "transport");
-        assertEquals("Builder.transport(TCP) 应改 transport 预填档", "tcp", tcpPrefill.getDefaultValue());
-
-        EnumConfigItem standard = (EnumConfigItem) findField(
-            new SerialCommConfigSchema().createSchema().getFields(), "transport");
-        assertEquals("未设置时保持库标准 serial（存量 entry 零迁移）", "serial", standard.getDefaultValue());
-
-        SerialCommConfigSchema mixed = SerialCommConfigSchema.builder()
-            .transport(SerialTransport.TCP)
-            .baudrate(BaudRate.BAUD_115200)
-            .build();
-        assertEquals("transport 定制不影响其他字段默认值",
-            "115200", findField(mixed.createSchema().getFields(), "baudrate").getDefaultValue());
     }
 
     // ========== 枚举 toMap() 一致性测试 ==========
