@@ -5,3 +5,6 @@ dependencies:
   - artifactId: integration-ecat-common
     groupId: com.ecat
     version: ^4.0.0
+  - artifactId: integration-tcp
+    groupId: com.ecat
+    version: ^4.0.0
