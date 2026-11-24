@@ -138,8 +138,12 @@ public class SerialPollingRoundChainTest {
         handle = polling
                 .round(src -> {
                     roundBegan.countDown();
+                    // 留隙 2000ms ≫ 写者预算 300ms：判别余量须 > 预算+调度抖动——写者自
+                    // latch 到提交的线程停摆若吃掉「留隙−预算」窗口，写者会迟到授予使
+                    // 负向断言假红（原 500/300 余量 200ms 被全 reactor 负载击穿实录，
+                    // bugs/bug-record-20261124-211000）
                     return CompletableFuture.completedFuture(true)
-                            .thenCompose(v -> polling.delay(500L, TimeUnit.MILLISECONDS))
+                            .thenCompose(v -> polling.delay(2000L, TimeUnit.MILLISECONDS))
                             .thenCompose(v -> CompletableFuture.completedFuture(true));
                 })
                 .every(PERIOD_MS, TimeUnit.MILLISECONDS)

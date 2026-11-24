@@ -255,7 +255,16 @@ public class SerialSourcePort {
      * 交由调用方照常 release；仍在队则离队返回 null（不泄漏、不挡后续队头）。
      */
     private String abandonHeldUnlessGranted(SerialPortExecutor.Conversation conv, String reason) {
-        String grantedKey = conv.granted.getNow(null);
+        String grantedKey;
+        try {
+            grantedKey = conv.granted.getNow(null);
+        } catch (java.util.concurrent.CancellationException cancelled) {
+            // 取消 = 执行者 WaitExpired/退役收场对 granted.cancel 的设计态（非异常完成）：
+            // JDK getNow 对已取消 CF 抛 CancellationException，须按未授予归一——否则写者
+            // 等待超时路径在与执行者等待超时的竞速窗内违约抛出，违反「acquire 超时返 null」
+            // 契约（bugs/bug-record-20261124-211000，全 reactor 负载实测复现）
+            grantedKey = null;
+        }
         if (grantedKey != null) {
             return grantedKey;
         }
