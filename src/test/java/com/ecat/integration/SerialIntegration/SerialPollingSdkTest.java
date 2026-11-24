@@ -904,7 +904,7 @@ public class SerialPollingSdkTest {
                         throw new SerialSourceClosedException("submitTransaction", port.getPortName(), "bridged");
                     }
                     return port.submitTransaction(self, null,
-                            inv.getArgument(1, SerialPortExecutor.Priority.class),
+                            inv.getArgument(1, SerialPriority.class),
                             inv.getArgument(2, Long.class), inv.getArgument(3, Long.class),
                             inv.getArgument(0, java.util.function.Function.class));
                 });

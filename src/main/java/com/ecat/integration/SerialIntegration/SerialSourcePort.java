@@ -318,14 +318,17 @@ public class SerialSourcePort {
     // ========== 事务提交（executeWithLambda/executePolling 入队化承载） ==========
 
     /**
-     * 提交设备事务对话（SerialTransactionStrategy 两入口的承载）：队列满抛
+     * 提交设备事务对话（SerialTransactionStrategy 两入口与测试缝的承载）：队列满抛
      * {@link PortQueueFullException}（普通优先级由执行者记账后抛），视图已关闭抛
-     * {@link SerialSourceClosedException}。
+     * {@link SerialSourceClosedException}。公开类型 {@link SerialPriority} 在此映射为
+     * 执行者内部对话优先级（映射唯一收口；执行者内部枚举不出包）。
      */
     CompletableFuture<Boolean> submitTransaction(SerialSource session, ResourceOwner owner,
-            SerialPortExecutor.Priority priority, long waitMs, long execTimeoutMs,
+            SerialPriority priority, long waitMs, long execTimeoutMs,
             Function<SerialSource, CompletableFuture<Boolean>> body) {
-        return executor.submitBody(session, owner, priority, waitMs, execTimeoutMs, body).result;
+        SerialPortExecutor.Priority internal = priority == SerialPriority.HIGH
+                ? SerialPortExecutor.Priority.HIGH : SerialPortExecutor.Priority.NORMAL;
+        return executor.submitBody(session, owner, internal, waitMs, execTimeoutMs, body).result;
     }
 
     // ========== I/O operations ==========

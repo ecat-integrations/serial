@@ -86,7 +86,7 @@ public class SerialDrainSilenceTimeoutBindingTest {
         awaitEventLoop();
 
         CompletableFuture<Boolean> next = port.submitTransaction(null, null,
-                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                SerialPriority.HIGH, 1000L, 60_000L,
                 src -> CompletableFuture.completedFuture(Boolean.TRUE));
         awaitEventLoop();
         assertEquals("静默确认前口不得离开 DRAINING",
@@ -162,7 +162,7 @@ public class SerialDrainSilenceTimeoutBindingTest {
     /** 提交一个永不完成的对话体（悬挂事务形态，waitMs/execTimeout 不落在静默识别区）。 */
     private void submitHangingConversation() {
         CompletableFuture<Boolean> conv = port.submitTransaction(null, null,
-                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                SerialPriority.HIGH, 1000L, 60_000L,
                 src -> new CompletableFuture<>());
         assertNotNull(conv);
     }

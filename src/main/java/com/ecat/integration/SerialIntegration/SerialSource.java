@@ -208,9 +208,9 @@ public class SerialSource {
 
     /**
      * 设备事务体入队（SerialTransactionStrategy 两入口承载，<b>亦是消费仓测试打桩缝</b>）：
-     * 作为一场对话提交到本源端口的执行者——高优先级（命令/写）或普通优先级（轮询），
-     * 排队等待预算与事务级硬超时显式传入。队列满抛 {@link PortQueueFullException}；
-     * 视图已关闭抛 {@link SerialSourceClosedException}。
+     * 作为一场对话提交到本源端口的执行者——{@link SerialPriority#HIGH}（命令/写）或
+     * {@link SerialPriority#NORMAL}（轮询），排队等待预算与事务级硬超时显式传入。
+     * 队列满抛 {@link PortQueueFullException}；视图已关闭抛 {@link SerialSourceClosedException}。
      *
      * <p><b>可见性契约</b>：public 仅为消费仓测试的 Mockito 打桩点（模拟端口仲裁面：
      * 事务 inline 执行 / 锁忙跳过等），签名面不作为生产 API——生产代码一律经
@@ -218,7 +218,7 @@ public class SerialSource {
      * 调用，勿直连本方法。
      */
     public CompletableFuture<Boolean> submitTransaction(Function<SerialSource, CompletableFuture<Boolean>> lambda,
-            SerialPortExecutor.Priority priority, long waitMs, long execTimeoutMs) {
+            SerialPriority priority, long waitMs, long execTimeoutMs) {
         assertViewActive("submitTransaction");
         return sourcePort.submitTransaction(this, lockOwner(), priority, waitMs, execTimeoutMs, lambda);
     }

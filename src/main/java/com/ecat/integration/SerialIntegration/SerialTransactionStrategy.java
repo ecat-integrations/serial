@@ -6,7 +6,6 @@ import java.util.function.Function;
 
 import com.ecat.core.Utils.LogFactory;
 import com.ecat.core.Utils.Log;
-import com.ecat.integration.SerialIntegration.SerialPortExecutor.Priority;
 
 /**
  * The {@code SerialTransactionStrategy} class provides the two transaction entries over the
@@ -152,7 +151,7 @@ public class SerialTransactionStrategy {
                     "transactionTimeoutMs must be > 0, got: " + transactionTimeoutMs);
         }
         try {
-            return source.submitTransaction(lambda, Priority.HIGH, waitMs, transactionTimeoutMs);
+            return source.submitTransaction(lambda, SerialPriority.HIGH, waitMs, transactionTimeoutMs);
         } catch (PortQueueFullException full) {
             // §3.5：队满同步抛出——命令入口的背压显式可见，不伪装成 future 失败
             throw full;
@@ -210,7 +209,7 @@ public class SerialTransactionStrategy {
                     "transactionTimeoutMs must be > 0, got: " + transactionTimeoutMs);
         }
         try {
-            return source.submitTransaction(lambda, Priority.NORMAL, lockBudgetMs, transactionTimeoutMs);
+            return source.submitTransaction(lambda, SerialPriority.NORMAL, lockBudgetMs, transactionTimeoutMs);
         } catch (PortQueueFullException full) {
             // 队满=本轮跳过信号（记账已在提交点完成）：专用异常异常完成，
             // 落既有 isLockBusySkip 内化路径（SerialPolling settleRound 跳过本轮不回调）

@@ -117,7 +117,7 @@ public class SerialResidualWriteGuardTest {
     @Test
     public void normalCompletionKeepsWriteAllowedWithoutDrain() throws Exception {
         CompletableFuture<Boolean> conv = port.submitTransaction(null, null,
-                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                SerialPriority.HIGH, 1000L, 60_000L,
                 src -> CompletableFuture.completedFuture(Boolean.TRUE));
         assertNotNull(conv);
         assertEquals(Boolean.TRUE, conv.get(2, TimeUnit.SECONDS));
@@ -133,7 +133,7 @@ public class SerialResidualWriteGuardTest {
     /** 提交一个永不完成的对话体（悬挂事务形态），返回对话 future。 */
     private CompletableFuture<Boolean> submitHangingConversation() {
         CompletableFuture<Boolean> conv = port.submitTransaction(null, null,
-                SerialPortExecutor.Priority.HIGH, 1000L, 60_000L,
+                SerialPriority.HIGH, 1000L, 60_000L,
                 src -> new CompletableFuture<>());
         assertNotNull(conv);
         return conv;
