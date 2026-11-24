@@ -50,10 +50,16 @@ import com.ecat.core.CommTrace.ResourceOwner;
 public class SerialSourcePort {
     private static final Log log = LogFactory.getLogger(SerialSourcePort.class);
 
+    /**
+     * 底层 jSerialComm 口对象（物理段经 {@link #transport} 操作；本字段是存储点与测试
+     * mock 注入点——mock 口直赋后不经 openPortNow 即被写/排空/直读路径使用）。
+     */
     SerialPort serialPort;
     volatile SerialInfo serialInfo;
     private final SerialIntegration integration;
     private final SerialPortExecutor executor;
+    /** 传输缝：物理开/关/写/排空/推模型 RX 全经此（jSerialComm 实现见 JSerialCommTransport）。 */
+    private final PortTransport transport;
 
     // Receive-path fields（RX 缓冲归口执行线程私有：仅口执行线程读写，无锁）
     private final DynamicByteArrayBuffer continuousReceiveBuffer = new DynamicByteArrayBuffer(1024, 2.0f);
@@ -73,7 +79,16 @@ public class SerialSourcePort {
         this.serialInfo = serialInfo;
         this.integration = integration;
         this.executor = new SerialPortExecutor(this, serialInfo.portName, maxWaiters);
+        this.transport = new JSerialCommTransport(this);
+        // 传输死亡（拔 USB/写反压/读异常）→ 执行者强拆收场：与看门狗超时强拆同一条
+        // RECOVERING+排空路径（收场竞速幂等，先到者为准）
+        this.transport.onTransportDead(reason -> executor.submitAbort("transport-dead: " + reason));
         this.isTestMode = detectTestEnvironment();
+    }
+
+    /** 传输缝访问（执行者写路径/排空经此；口执行线程外不触碰物理 IO）。 */
+    PortTransport transport() {
+        return transport;
     }
 
     SerialPortExecutor executor() {
@@ -332,13 +347,13 @@ public class SerialSourcePort {
         return executor.submitBufferRead();
     }
 
-    /** 测试模式直读物理口（测试环境 mock 口在 ioExecutor 上读，与既有行为一致）。 */
+    /** 测试模式直读物理口（测试环境 mock 口在 ioExecutor 上读，与既有行为一致；直读经传输缝）。 */
     private CompletableFuture<byte[]> readSerialPortDirectly() {
         return CompletableFuture.supplyAsync(() -> {
-            if (serialPort.isOpen()) {
+            if (transport.isOpen()) {
                 int numRead;
-                byte[] readBuffer = new byte[serialPort.bytesAvailable()];
-                numRead = serialPort.readBytes(readBuffer, readBuffer.length);
+                byte[] readBuffer = new byte[transport.available()];
+                numRead = transport.read(readBuffer, readBuffer.length);
                 if (numRead > 0 && numRead < readBuffer.length) {
                     byte[] result = new byte[numRead];
                     System.arraycopy(readBuffer, 0, result, 0, numRead);
@@ -366,8 +381,8 @@ public class SerialSourcePort {
     // ========== Port lifecycle（fd 开/关只在口执行线程与看门狗） ==========
 
     /**
-     * 打开端口（口执行线程调用；终态拒绝）：物理参数全量设置 + 非阻塞超时模式 + 打开后
-     * RX 清洗 + 启动读轮询（测试模式不挂轮询）。
+     * 打开端口（口执行线程调用；终态拒绝）：物理参数全量设置 + 半阻塞读超时模式 + 打开后
+     * RX 清洗 + 启动读轮询（测试模式不挂轮询）。物理段经传输缝（{@link JSerialCommTransport}）。
      */
     void openPortNow(String identity) {
         if (executor.state() == SerialPortExecutor.PortState.CLOSED) {
@@ -380,31 +395,7 @@ public class SerialSourcePort {
             log.info("[OPENED] port={}, already opened (requested by identity={})", serialInfo.portName, identity);
             return;
         }
-        try {
-            serialPort = SerialPort.getCommPort(serialInfo.portName);
-            serialPort.setBaudRate(serialInfo.baudrate);
-            serialPort.setNumDataBits(serialInfo.dataBits);
-            serialPort.setNumStopBits(serialInfo.stopBits);
-            serialPort.setParity(serialInfo.parity);
-            serialPort.setFlowControl(serialInfo.flowControl);
-
-            // 非阻塞写（§H.2.2）：jSerialComm 的 read/write 超时模式共享同一 fd 的 O_NONBLOCK 标志，
-            // 是「全有或全无」（§B.2），无法只把 write 设非阻塞而保持 read 阻塞。故整端口改 TIMEOUT_NONBLOCKING。
-            // 读路径是轮询驱动（数据到达 → 执行者帧事件），不依赖阻塞读；write 反压时返回 -1
-            // 并被 jSerialComm 关闭端口（§B.6），由写路径显式处理（写前自动重开）。
-            serialPort.setComPortTimeouts(SerialPort.TIMEOUT_NONBLOCKING, 0, 0);
-
-            if (!serialPort.openPort()) {
-                log.error("[OPEN FAILED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
-                        serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
-                return;
-            }
-        } catch (RuntimeException openRejected) {
-            // 口描述符无效（getCommPort 拒绝假口名/非法路径）：如实记账、端口保持关闭——
-            // 与「口不存在时 openPort 返 false」同一终态；重开由写路径自动重开按需再试
-            serialPort = null;
-            log.error("[OPEN FAILED] port={}, identity={}, 口对象创建被拒（{}）",
-                    serialInfo.portName, identity, openRejected.getMessage());
+        if (!transport.open()) {
             return;
         }
 
@@ -421,20 +412,19 @@ public class SerialSourcePort {
         }
     }
 
-    /** 关闭 fd（口执行线程与看门狗调用；jSerialComm closePort 线程安全）。 */
+    /** 关闭 fd（口执行线程与看门狗调用；jSerialComm closePort 线程安全，经传输缝）。 */
     void closeFd(String reason) {
-        if (serialPort != null && serialPort.isOpen()) {
-            serialPort.closePort();
+        if (transport.close()) {
             log.info("[CLOSED] port={}, fd closed ({})", serialInfo.portName, reason);
         }
     }
 
     boolean isFdOpen() {
-        return serialPort != null && serialPort.isOpen();
+        return transport.isOpen();
     }
 
     boolean isPortOpen() {
-        return serialPort.isOpen();
+        return transport.isOpen();
     }
 
     /**
@@ -608,7 +598,7 @@ public class SerialSourcePort {
 
     // ========== 执行者访问原语（仅口执行线程调用） ==========
 
-    /** 底层 jSerialComm 口对象（写路径用；可能为 null——未开过口）。 */
+    /** 底层 jSerialComm 口对象（getSerialPort 透传与测试断言用；可能为 null——未开过口）。 */
     SerialPort jSerialPort() {
         return serialPort;
     }
@@ -634,37 +624,19 @@ public class SerialSourcePort {
         notifyDataReceived(data, length);
     }
 
-    /** drain 内核 RX 的最大轮数（每轮读空当次 bytesAvailable；超轮仍有数据=异常形态，如实上报）。 */
-    private static final int MAX_RX_DRAIN_ROUNDS = 64;
-
     /**
      * 重开后的 RX 清洗（F-43 清洗②）：drain 内核 tty RX 队列（jSerialComm closePort 不保证
      * TCFLSH，重开前在途的应答尾巴可残留内核层）+ 清应用层接收缓冲。每次成功打开后调用
      * ——覆盖看门狗强拆重开、reconfigure 物理参数重建、写反压自动重开三条路径，保证重开
-     * 后首读零旧字节（旧字节会被误配对给新对话的首条命令）。
+     * 后首读零旧字节（旧字节会被误配对给新对话的首条命令）。内核排空经传输缝。
      *
      * @param reason 触发路径标识（日志定位用：port-open / drain-reopen 等）
      */
     void drainAndClearReceiveBuffer(String reason) {
         clearReceiveBuffer();
-        int drained = 0;
-        int rounds = 0;
-        while (serialPort != null && serialPort.isOpen() && rounds++ < MAX_RX_DRAIN_ROUNDS) {
-            int available = serialPort.bytesAvailable();
-            if (available <= 0) {
-                return;
-            }
-            byte[] sink = new byte[available];
-            serialPort.readBytes(sink, available);
-            drained += available;
-        }
+        int drained = transport.drainRx();
         if (drained > 0) {
             log.info("[RX-DRAIN] port={}, 触发={}, 丢弃重开残留旧字节 {} B", serialInfo.portName, reason, drained);
-        }
-        if (rounds >= MAX_RX_DRAIN_ROUNDS && serialPort != null && serialPort.bytesAvailable() > 0) {
-            // 有界 drain 后内核仍有数据=对端持续回灌（如故障设备刷屏），如实上报不无限循环
-            log.warn("[RX-DRAIN] port={}, 触发={}, {} 轮 drain 后内核仍有 {} B，疑似对端持续回灌",
-                    serialInfo.portName, reason, MAX_RX_DRAIN_ROUNDS, serialPort.bytesAvailable());
         }
     }
 

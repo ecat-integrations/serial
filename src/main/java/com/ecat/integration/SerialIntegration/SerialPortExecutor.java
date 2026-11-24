@@ -1071,14 +1071,12 @@ final class SerialPortExecutor {
             }
         }
         if (port.isTestMode()) {
-            while (port.jSerialPort().bytesAvailable() > 0) {
-                port.jSerialPort().readBytes(new byte[port.jSerialPort().bytesAvailable()],
-                        port.jSerialPort().bytesAvailable());
-            }
+            // 测试模式 mock 口：写前排空内核层残留字节（生产路径清应用层缓冲）
+            port.transport().drainRx();
         } else {
             port.clearReceiveBuffer();
         }
-        int written = port.jSerialPort().writeBytes(bytes, bytes.length);
+        int written = port.transport().write(bytes, bytes.length);
         Conversation conv = current;
         if (written >= 0) {
             if (state == PortState.AWAIT_WRITE) {
