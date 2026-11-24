@@ -239,6 +239,12 @@ final class JSerialCommTransport implements PortTransport {
                     notifyTransportDead("read-exception: " + readCrashed.getMessage());
                     return;
                 }
+                if (stopRequested) {
+                    // 停止请求先于投递：阻塞读返回后先查停，本批字节不再投递（契约 2）
+                    log.info("[RX-STOP] port={}, 读线程自退（stopReading，本批 {} B 未投递）",
+                            port.serialInfo.portName, Math.max(n, 0));
+                    return;
+                }
                 if (n > 0) {
                     sink.onBytes(chunk, n);
                 } else if (n < 0) {

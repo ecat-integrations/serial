@@ -916,7 +916,6 @@ final class SerialPortExecutor {
     private void enterDrain(boolean reopen, Conversation finished) {
         if (reopen) {
             state = PortState.RECOVERING;
-            port.stopPolling();
             try {
                 port.openPortNow("[drain-reopen]");
             } catch (RuntimeException openFailed) {
@@ -1100,7 +1099,6 @@ final class SerialPortExecutor {
                 + "在飞对话跑到自然结束", portName);
         state = PortState.CLOSED;
         cancelAllQueued("port retired");
-        port.stopPolling();
         port.closeFd("[port-retired]");
     }
 
@@ -1176,7 +1174,6 @@ final class SerialPortExecutor {
     private void performRecoveryNow(String reason) {
         log.error("[WEDGE-RECOVERY] port={}, 原因: {}, 强制 close+reopen 拆除挂死 IO", portName, reason);
         state = PortState.RECOVERING;
-        port.stopPolling();
         port.closeFd(reason);
         try {
             port.openPortNow(reason);

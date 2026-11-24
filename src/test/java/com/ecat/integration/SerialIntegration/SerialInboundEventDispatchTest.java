@@ -104,7 +104,7 @@ public class SerialInboundEventDispatchTest {
         BytePooledSerialDataListener listener = new BytePooledSerialDataListener();
         listener.reset(context, responseFuture, source, ALWAYS_FRAME);
 
-        // 在「sweeper 替身」线程上喂完整帧（模拟 SerialPortPollTask 读到字节后的通知路径）
+        // 在「传输读线程替身」线程上喂完整帧（模拟推模型 RX 读到字节后的通知路径）
         Thread sweeper = new Thread(() ->
                 listener.onDataReceived(new byte[]{0x01, 0x02, 0x03}, 3), "serial-io-sweeper-standin");
         sweeper.start();

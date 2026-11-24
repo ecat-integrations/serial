@@ -6,7 +6,6 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -63,10 +62,8 @@ public class SerialSourcePort {
 
     // Receive-path fields（RX 缓冲归口执行线程私有：仅口执行线程读写，无锁）
     private final DynamicByteArrayBuffer continuousReceiveBuffer = new DynamicByteArrayBuffer(1024, 2.0f);
-    /** 轮询任务句柄；null = 无任务（未开/已停/测试模式不注册）。开/停只发生在口执行线程。 */
-    private volatile ScheduledFuture<?> pollTask;
-    /** Modbus 等直持 InputStream 期间置 true：轮询任务跳过读取，数据留给直接流消费（旧事件适配器 pause 语义平移）。 */
-    private volatile boolean pollPaused = false;
+    /** 推模型 RX 投递端：传输读线程到达字节 → 执行者帧事件（既有 submitBytes 入口，单点接线）。 */
+    private final ReadSink readSink = this::handleIncomingData;
     private boolean isTestMode = false;
 
     // Connected SerialSource instances
@@ -382,7 +379,9 @@ public class SerialSourcePort {
 
     /**
      * 打开端口（口执行线程调用；终态拒绝）：物理参数全量设置 + 半阻塞读超时模式 + 打开后
-     * RX 清洗 + 启动读轮询（测试模式不挂轮询）。物理段经传输缝（{@link JSerialCommTransport}）。
+     * RX 清洗 + 启动推模型读线程（数据到达才唤醒，空闲睡在内核 poll）。物理段经传输缝
+     * （{@link JSerialCommTransport}）。读线程生命周期 = fd 生命周期：每次成功打开 respawn
+     * 恰一条读线程，随 closeFd 自退；测试模式不挂（mock 口无真实 fd，数据经测试直接注入）。
      */
     void openPortNow(String identity) {
         if (executor.state() == SerialPortExecutor.PortState.CLOSED) {
@@ -403,7 +402,7 @@ public class SerialSourcePort {
         drainAndClearReceiveBuffer("port-open");
 
         if (!isTestMode) {
-            startPolling();
+            transport.startReading(readSink);
             log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
                     serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
         } else {
@@ -412,8 +411,13 @@ public class SerialSourcePort {
         }
     }
 
-    /** 关闭 fd（口执行线程与看门狗调用；jSerialComm closePort 线程安全，经传输缝）。 */
+    /**
+     * 关闭 fd（口执行线程与看门狗调用；jSerialComm closePort 线程安全，经传输缝）。
+     * 先停投递再关口：读线程在「读返回后先查停」点安静退出；即便停与关竞速，closePort
+     * 也使阻塞读立即返 -1 强制收线（看门狗跨线程强拆依赖，契约 ≤100ms 退出）。
+     */
     void closeFd(String reason) {
+        transport.stopReading();
         if (transport.close()) {
             log.info("[CLOSED] port={}, fd closed ({})", serialInfo.portName, reason);
         }
@@ -459,7 +463,6 @@ public class SerialSourcePort {
             conv = executor.submitAction(null, reconfigureRebuildWaitMs, () -> {
                 log.warn("[RECONFIGURE-REOPEN] port={}, identity={}, 重建命令获得执行权，close+reopen 重建端口",
                         serialInfo.portName, identity);
-                stopPolling();
                 closeFd("[reconfigure-rebuild]");
                 serialInfo = newInfo;
                 openPortNow(identity);
@@ -640,59 +643,12 @@ public class SerialSourcePort {
         }
     }
 
-    // ========== Port read polling（只在口执行线程开/停；pollLock 退役） ==========
+    // ========== 推模型 RX（读线程生命周期 = fd 生命周期） ==========
 
     /**
-     * 轮询周期（毫秒），对齐 IO 线程收敛调研建议（≤50ms，modbus4j InputStreamListener 同量级）。
-     */
-    static final long POLL_PERIOD_MS = 25L;
-
-    /**
-     * 启动端口读轮询（openPort 成功后调用；测试模式不调用，沿用旧 isTestMode 边界）。
-     * 先取消既有任务再挂新任务——重开/并发注册场景下保证单口单任务，不会双任务同口双读
-     * （开/停只发生在口执行线程，单点串行）。
-     */
-    void startPolling() {
-        stopPolling();
-        if (serialPort == null || !serialPort.isOpen()) {
-            log.warn("{} cannot start polling: port not open", getPortName());
-            return;
-        }
-        SerialPortPollTask task = new SerialPortPollTask(this);
-        ScheduledFuture<?> handle = SerialPollScheduler.delegate()
-                .scheduleWithFixedDelay(task, POLL_PERIOD_MS, POLL_PERIOD_MS, TimeUnit.MILLISECONDS);
-        task.bindHandle(handle);
-        pollTask = handle;
-        log.info("[POLL-START] port={}, period={}ms, scheduler={}",
-                getPortName(), POLL_PERIOD_MS, SerialPollScheduler.describe());
-    }
-
-    /**
-     * 停止端口读轮询（退役/rebuild/恢复时调用；幂等）。
-     * 口被写反压/jSerialComm 自动关闭的场景由 {@link SerialPortPollTask} 的 -1 哨兵自取消兜住，
-     * 两条停止路径任一先到即停。
-     */
-    void stopPolling() {
-        ScheduledFuture<?> handle = pollTask;
-        pollTask = null;
-        if (handle != null) {
-            handle.cancel(false);
-        }
-    }
-
-    /** 当前轮询任务句柄（生命周期断言用；无任务为 null）。 */
-    ScheduledFuture<?> getPollTaskHandle() {
-        return pollTask;
-    }
-
-    /** Modbus 直持 InputStream 期间轮询任务是否让路。 */
-    boolean isPollPaused() {
-        return pollPaused;
-    }
-
-    /**
-     * 处理接收到的数据（轮询任务在读到字节后调用）：转发为执行者帧事件——排空窗丢弃、
-     * 终态丢弃、CommTrace 捕获、缓冲追加与监听器通知都在口执行线程单点完成。
+     * 处理接收到的数据（传输读线程经 {@link #readSink} 投递到达字节时调用）：转发为
+     * 执行者帧事件——排空窗丢弃、终态丢弃、CommTrace 捕获、缓冲追加与监听器通知都在
+     * 口执行线程单点完成。sink 实现只投事件不解析不持锁（{@link ReadSink} 契约）。
      *
      * @param data 接收到的数据
      * @param length 数据长度
@@ -712,23 +668,23 @@ public class SerialSourcePort {
     }
 
     /**
-     * 暂停端口读轮询，阻止轮询任务从串口读取数据。
-     * 当 Modbus 等需要直接 InputStream/OutputStream 访问串口时调用，
-     * 避免轮询读取与 direct stream 竞争数据（旧事件适配器 pause 语义的轮询版平移，
-     * 方法名保留——SerialSource 公共 API，Modbus 侧消费方零改动）。
+     * 暂停端口读取，阻止读线程从串口取数：读线程在下一次读返回（读超时档上界）时查停
+     * 自退，此后到达字节滞留内核缓冲留给直接流消费。应用场景：Modbus 直持
+     * InputStream/OutputStream 期间避免读线程与其竞争数据（旧事件适配器 pause 语义的
+     * 推模型平移，方法名保留——SerialSource 公共 API，Modbus 侧消费方零改动）。
      */
     void pauseEventAdapter() {
-        pollPaused = true;
-        log.info("[POLL-PAUSED] port={}", getPortName());
+        transport.stopReading();
+        log.info("[RX-PAUSED] port={}", getPortName());
     }
 
     /**
-     * 恢复端口读轮询。
-     * 当 Modbus 释放直接串口访问后调用。
+     * 恢复端口读取（{@link #pauseEventAdapter()} 的逆操作）：respawn 恰一条读线程
+     * （幂等），pause 期间滞留内核缓冲的字节随后续读取进既有管线。
      */
     void resumeEventAdapter() {
-        pollPaused = false;
-        log.info("[POLL-RESUMED] port={}", getPortName());
+        transport.startReading(readSink);
+        log.info("[RX-RESUMED] port={}", getPortName());
     }
 
     /** 监听器注册时的缓冲回放（既有 addDataListener 语义）：经执行者事件到口执行线程快照投递。 */
