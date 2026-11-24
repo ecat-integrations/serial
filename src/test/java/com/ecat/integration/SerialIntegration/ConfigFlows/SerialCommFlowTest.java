@@ -15,6 +15,7 @@ import org.junit.Test;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
 
@@ -208,6 +209,65 @@ public class SerialCommFlowTest {
         ConfigFlowResult exit = host.handleStep("comm_config", commInput);
         assertEquals("final_confirm", exit.getStepId());
         assertEquals(commInput, host.getContext().getEntryData().get("comm_settings"));
+    }
+
+    // ==================== defaults 动态预填（两级默认值 API，契约四条） ====================
+
+    @Test
+    public void defaultsMount_hookReceivesEntryData_andPrefillsForm() {
+        // 契约①：hook 收到宿主 entryData 且返回值用于预填；契约②（优先级）：与静态 schema
+        // 并设时 defaults 优先（动态预填覆盖静态定制——Builder.defaults javadoc 同文）
+        AtomicReference<Map<String, Object>> captured = new AtomicReference<>();
+        SerialCommFlow flow = SerialCommFlow.builder()
+                .schema(SerialCommConfigSchema.builder().timeout(9999).build())
+                .defaults(entryData -> {
+                    captured.set(entryData);
+                    return SerialCommConfigSchema.builder().timeout(2000).build();
+                })
+                .build();
+
+        HostFlow host = enterSubFlow(flow);   // device_config 提交 name=dev 即触发 hook 首次求值
+        assertEquals("hook 收到宿主 entryData（含 device_config 落的数据）",
+                "dev", captured.get().get("name"));
+
+        ConfigFlowResult form = host.handleStep("comm_config", null);
+        assertEquals("defaults 优先：timeout 预填 = hook 值（非静态 schema 的 9999）", 2000.0,
+                ((Number) field(form.getSchema(), "timeout").getDefaultValue()).doubleValue(), 0.001);
+    }
+
+    @Test
+    public void defaultsException_propagatesToFlowLayer_notSwallowed() {
+        // 契约③：hook 抛异常炸到 flow 层（不吞、不转 errors map——严格模式不兜底）
+        SerialCommFlow flow = SerialCommFlow.builder()
+                .defaults(entryData -> { throw new IllegalStateException("hook-boom"); })
+                .build();
+        HostFlow host = new HostFlow(flow);
+        host.executeUserStep(null);
+        host.handleStep("user", input("k", "v"));
+        try {
+            // device_config 提交后进 comm 首屏——hook 在表单渲染处求值，异常原样上抛
+            host.handleStep("device_config", input("name", "dev"));
+            fail("defaults hook 抛异常必须炸到 flow 层");
+        } catch (IllegalStateException expected) {
+            assertEquals("hook-boom", expected.getMessage());
+        }
+    }
+
+    @Test
+    public void userFilledInputs_retainedInStepInputs_asEchoSource_overDefaults() {
+        // 契约④（用户已填值优先于默认）的后端半面：core 在 handler 调用前把提交存
+        // step_inputs[stepId]（校验失败也不丢）；前端以 step_inputs 盖 schema 预填。
+        // 后端承诺：留存完整 + 重显表单仍带默认预填（未填字段保持默认，已填字段由前端盖）
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        Map<String, Object> bad = commInput();
+        bad.put("baudrate", "99999");
+        ConfigFlowResult r = host.handleStep("comm_config", bad);
+        assertEquals("comm_config", r.getStepId());
+        assertEquals("已填值留存 step_inputs（回显数据源不丢）", bad,
+                host.getContext().getStepInputs().get("comm_config"));
+        ConfigFlowResult reshown = host.handleStep("comm_config", null);
+        assertEquals("重显表单未填字段保持默认预填", Const.READ_TIMEOUT_MS.doubleValue(),
+                ((Number) field(reshown.getSchema(), "timeout").getDefaultValue()).doubleValue(), 0.001);
     }
 
     // ==================== 辅助 ====================

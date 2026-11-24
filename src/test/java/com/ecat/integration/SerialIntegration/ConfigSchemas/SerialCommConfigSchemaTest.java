@@ -508,6 +508,31 @@ public class SerialCommConfigSchemaTest {
             "8", findField(fields, "data_bits").getDefaultValue());
     }
 
+    @Test
+    public void testBuilder_TransportPrefillOverridden_defaultRemainsSerial() {
+        // Builder.transport 只动 transport 档案位预填（两级默认值 API，§3.3）；缺省=SERIAL
+        // 与 parse 同源（COM 档零变化），且不影响 UART 字段默认值
+        EnumConfigItem tcpPrefill = (EnumConfigItem) findField(
+            SerialCommConfigSchema.builder()
+                .transport(SerialTransport.TCP)
+                .build()
+                .createSchema()
+                .getFields(),
+            "transport");
+        assertEquals("Builder.transport(TCP) 应改 transport 预填档", "tcp", tcpPrefill.getDefaultValue());
+
+        EnumConfigItem standard = (EnumConfigItem) findField(
+            new SerialCommConfigSchema().createSchema().getFields(), "transport");
+        assertEquals("未设置时保持库标准 serial（存量 entry 零迁移）", "serial", standard.getDefaultValue());
+
+        SerialCommConfigSchema mixed = SerialCommConfigSchema.builder()
+            .transport(SerialTransport.TCP)
+            .baudrate(BaudRate.BAUD_115200)
+            .build();
+        assertEquals("transport 定制不影响其他字段默认值",
+            "115200", findField(mixed.createSchema().getFields(), "baudrate").getDefaultValue());
+    }
+
     // ========== 枚举 toMap() 一致性测试 ==========
 
     @Test

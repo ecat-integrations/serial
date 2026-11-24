@@ -74,6 +74,7 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
     private final Parity defaultParity;
     private final FlowControl defaultFlowControl;
     private final int defaultTimeout;
+    private final SerialTransport defaultTransport;
 
     // ========== 测试用端口注入 ==========
 
@@ -140,6 +141,7 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         this.defaultParity = Parity.NONE;
         this.defaultFlowControl = FlowControl.NONE;
         this.defaultTimeout = Const.READ_TIMEOUT_MS;
+        this.defaultTransport = SerialTransport.SERIAL;
     }
 
     /**
@@ -152,6 +154,7 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         this.defaultParity = builder.parity;
         this.defaultFlowControl = builder.flowControl;
         this.defaultTimeout = builder.timeout;
+        this.defaultTransport = builder.transport;
     }
 
     // ========== ConfigSchemaProvider ==========
@@ -166,8 +169,9 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         ConfigSchema schema = new TransportProfileEnforcingSchema()
             // 传输通道（档案位：serial=本地 COM / tcp=串口服务器 RTU over TCP）。required=false：
             // 本 schema 被 11+ 消费仓共享，存量 COM 表单直调 schema.validate 的提交不带本键
-            // ——缺省=serial 与 parse 同源（additive-only，COM 档零变化）
-            .addField(new EnumConfigItem("transport", false, "serial")
+            // ——缺省=serial 与 parse 同源（additive-only，COM 档零变化）；预填档位可经
+            // Builder.transport 定制（defaults hook 场景：宿主按 entryData 动态决定预填档）
+            .addField(new EnumConfigItem("transport", false, defaultTransport.getValue())
                 .displayName("传输通道")
                 .addOptions(SerialTransport.toMap())
                 .buildValidator())
@@ -326,6 +330,7 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         private Parity parity = Parity.NONE;
         private FlowControl flowControl = FlowControl.NONE;
         private int timeout = Const.READ_TIMEOUT_MS;
+        private SerialTransport transport = SerialTransport.SERIAL;
 
         public Builder baudrate(BaudRate baudRate) { this.baudRate = baudRate; return this; }
         public Builder dataBits(DataBits dataBits) { this.dataBits = dataBits; return this; }
@@ -333,6 +338,9 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         public Builder parity(Parity parity) { this.parity = parity; return this; }
         public Builder flowControl(FlowControl flowControl) { this.flowControl = flowControl; return this; }
         public Builder timeout(int timeout) { this.timeout = timeout; return this; }
+
+        /** transport 档案位预填（serial/tcp，缺省 SERIAL 与 parse 同源）；只影响预填不影响校验规则。 */
+        public Builder transport(SerialTransport transport) { this.transport = transport; return this; }
 
         public SerialCommConfigSchema build() {
             return new SerialCommConfigSchema(this);
