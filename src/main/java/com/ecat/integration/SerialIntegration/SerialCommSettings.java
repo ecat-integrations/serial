@@ -16,6 +16,8 @@
 
 package com.ecat.integration.SerialIntegration;
 
+import com.ecat.integration.TcpIntegration.TcpCommSettings;
+import com.ecat.integration.TcpIntegration.config.TcpConfig;
 import com.fazecast.jSerialComm.SerialPort;
 
 import java.util.Map;
@@ -35,14 +37,33 @@ public final class SerialCommSettings {
     }
 
     /**
-     * @param entryData ConfigEntry.data（含 comm_settings 整块=扁平 7 字段）
-     * @return 7 参构造的 SerialInfo——timeout/flow_control 真实传入（不再被设备侧解析丢弃）
+     * @param entryData ConfigEntry.data（含 comm_settings 整块：SERIAL 档扁平 7 字段，
+     *                  TCP 档 transport/host/port + 可选 timeout）
+     * @return SERIAL 档=7 参构造的 SerialInfo——timeout/flow_control 真实传入（不再被设备侧
+     *         解析丢弃）；TCP 档=transport/tcpHost/tcpPort 三字段的 SerialInfo，portName 填
+     *         host:port（注册表键复用），UART 参数不读（串口服务器硬件侧持有）
      */
     public static SerialInfo parse(Map<String, Object> entryData) {
         Map<String, Object> comm = map(entryData, "comm_settings");
         // timeout/flow_control 是 not-required 字段（表单可不提交），缺省与 schema 预填同源
         int timeout = comm.containsKey("timeout")
                 ? toInt(comm, "timeout") : Const.READ_TIMEOUT_MS;
+        // transport 缺省=SERIAL（schema 默认同源；存量 entry 零迁移）
+        SerialTransport transport = comm.containsKey("transport")
+                ? SerialTransport.fromValue(String.valueOf(comm.get("transport")))
+                : SerialTransport.SERIAL;
+        if (transport == SerialTransport.TCP) {
+            // host/port 读取复用 tcp 仓 TcpCommSettings（同键名同严格语义，浮点容忍与
+            // 端口域校验随 TcpConfig.build 原生继承）；其 TcpConfig 产品的重连/超时族不
+            // 消费——TcpTransport 在缝内按 §4.4 硬编码抑制后台重连，另行构造连接参数
+            TcpConfig tcpConnection = TcpCommSettings.parse(entryData);
+            SerialInfo info = new SerialInfo(tcpConnection.getHost() + ":" + tcpConnection.getPort(),
+                    null, null, null, null, 0, timeout);
+            info.transport = SerialTransport.TCP;
+            info.tcpHost = tcpConnection.getHost();
+            info.tcpPort = tcpConnection.getPort();
+            return info;
+        }
         return new SerialInfo(
                 str(comm, "serial_port"),
                 toInt(comm, "baudrate"),

@@ -189,6 +189,88 @@ public class SerialCommSettingsTest {
         }
     }
 
+    // ==================== TCP 档（transport=tcp：host/port 三字段，UART 忽略） ====================
+
+    @Test
+    public void tcpTransport_parsesHostPortAndSkipsUartFields() {
+        // TCP 档不提交任何 UART 字段：无本地串口的主机形态（串口服务器硬件侧持有 UART 参数）
+        Map<String, Object> comm = new LinkedHashMap<>();
+        comm.put("transport", "tcp");
+        comm.put("host", "192.168.1.50");
+        comm.put("port", 4001);
+        comm.put("timeout", 800);
+        SerialInfo info = SerialCommSettings.parse(wrap(comm));
+
+        assertEquals("portName 填 host:port（注册表键复用）", "192.168.1.50:4001", info.portName);
+        assertEquals(SerialTransport.TCP, info.transport);
+        assertEquals("192.168.1.50", info.tcpHost);
+        assertEquals(4001, info.tcpPort.intValue());
+        assertEquals("timeout 两档通用", 800, info.timeout);
+        assertEquals("UART 参数本机不持有", null, info.baudrate);
+    }
+
+    @Test
+    public void tcpTransport_toleratesStaleUartFields_byIgnoring() {
+        // TCP 档 UI 全显形态下存量/误填的 UART 值一律忽略（严格=不读，非静默乱用）
+        Map<String, Object> comm = new LinkedHashMap<>();
+        comm.put("transport", "tcp");
+        comm.put("host", "gw.local");
+        comm.put("port", "8899");
+        comm.put("baudrate", 9600);
+        comm.put("parity", "Odd");
+        SerialInfo info = SerialCommSettings.parse(wrap(comm));
+        assertEquals("gw.local:8899", info.portName);
+        assertEquals(8899, info.tcpPort.intValue());
+        assertEquals(null, info.baudrate);
+    }
+
+    @Test
+    public void missingTransport_defaultsToSerial() {
+        assertEquals("transport 键缺失=SERIAL（schema 默认同源，存量 entry 零迁移）",
+                SerialTransport.SERIAL, SerialCommSettings.parse(entryWith("stop_bits", "1")).transport);
+    }
+
+    @Test
+    public void tcpTransport_missingHost_throwsWithFieldName() {
+        Map<String, Object> comm = new LinkedHashMap<>();
+        comm.put("transport", "tcp");
+        comm.put("port", 4001);
+        try {
+            SerialCommSettings.parse(wrap(comm));
+            fail("TCP 档缺 host 应抛（TcpCommSettings 严格读缺字段带名抛）");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage().contains("host"));
+        }
+    }
+
+    @Test
+    public void tcpTransport_outOfRangePort_throws() {
+        Map<String, Object> comm = new LinkedHashMap<>();
+        comm.put("transport", "tcp");
+        comm.put("host", "gw.local");
+        comm.put("port", 70000);
+        try {
+            SerialCommSettings.parse(wrap(comm));
+            fail("port 越界应抛（TcpConfig.build 端口域校验随复用继承）");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage().contains("65535"));
+        }
+    }
+
+    @Test
+    public void unknownTransportValue_throwsStrictly() {
+        Map<String, Object> comm = new LinkedHashMap<>();
+        comm.put("transport", "bogus");
+        comm.put("host", "gw.local");
+        comm.put("port", 4001);
+        try {
+            SerialCommSettings.parse(wrap(comm));
+            fail("未知 transport 取值应严格抛（不静默回退 SERIAL）");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage().contains("transport"));
+        }
+    }
+
     // ==================== 辅助 ====================
 
     /** 构造最小合法 comm_settings（可选字段不填），可注入单个覆盖字段。 */

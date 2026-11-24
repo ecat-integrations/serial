@@ -18,7 +18,6 @@ package com.ecat.integration.SerialIntegration.ConfigFlows;
 
 import com.ecat.core.ConfigFlow.AbstractSubConfigFlow;
 import com.ecat.core.ConfigFlow.ConfigFlowResult;
-import com.ecat.core.ConfigFlow.ConfigSchema;
 import com.ecat.integration.SerialIntegration.ConfigSchemas.SerialCommConfigSchema;
 
 import java.util.HashMap;
@@ -65,10 +64,11 @@ public class SerialCommFlow extends AbstractSubConfigFlow {
         if (userInput == null || userInput.isEmpty()) {
             return showForm("comm_config", serialSchema.createSchema(), new HashMap<>());
         }
-        ConfigSchema schema = serialSchema.createSchema();
-        Map<String, Object> errors = schema.validate(userInput);
+        // 按提交的 transport 档案校验（COM 档执法与既有逐字一致；TCP 档豁免 UART 字段、
+        // host/port 由复用的 tcp 仓字段原生 required 执法——豁免集单点在 SerialCommConfigSchema）
+        Map<String, Object> errors = serialSchema.validateForTransport(userInput);
         if (!errors.isEmpty()) {
-            return showForm("comm_config", schema, errors);
+            return showForm("comm_config", serialSchema.createSchema(), errors);
         }
         context.getEntryData().put("comm_settings", userInput);
         return subFlowComplete();   // 出口：交回宿主尾步（挂载时由宿主指定）

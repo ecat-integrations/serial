@@ -21,6 +21,7 @@ import com.ecat.core.ConfigFlow.ConfigItem.AbstractConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
 import com.ecat.core.I18n.I18nHelper;
 import com.ecat.core.Utils.IntegrationCoordinateHelper;
+import com.ecat.integration.SerialIntegration.SerialTransport;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -73,8 +74,10 @@ public class SerialCommConfigSchemaTest {
 
         assertNotNull("Schema 不应为 null", schema);
         List<AbstractConfigItem<?>> fields = schema.getFields();
-        assertEquals("应该有 7 个字段", 7, fields.size());
+        assertEquals("应该有 10 个字段（transport 档案位 + UART 档 6 字段 + timeout + TCP 档 2 字段）",
+                10, fields.size());
 
+        assertFieldExists(fields, "transport");
         assertFieldExists(fields, "serial_port");
         assertFieldExists(fields, "baudrate");
         assertFieldExists(fields, "data_bits");
@@ -82,6 +85,110 @@ public class SerialCommConfigSchemaTest {
         assertFieldExists(fields, "parity");
         assertFieldExists(fields, "flow_control");
         assertFieldExists(fields, "timeout");
+        assertFieldExists(fields, "host");
+        assertFieldExists(fields, "port");
+    }
+
+    // ========== transport 档案位与 TCP 字段定义 ==========
+
+    @Test
+    public void transportField_serialProfileSwitch_optionalWithDefaultSerial() {
+        List<AbstractConfigItem<?>> fields = new SerialCommConfigSchema().createSchema().getFields();
+        EnumConfigItem transport = (EnumConfigItem) findField(fields, "transport");
+        // required=false：本 schema 被 11+ 消费仓共享，存量 COM 提交不带 transport 键——
+        // 缺省=serial 与 parse 同源（additive-only，COM 档零变化）
+        assertFalse("transport 不得必填（存量 COM 提交零变化）", transport.isRequired());
+        assertEquals("缺省档=serial（存量 entry 零迁移）", "serial", transport.getDefaultValue());
+        assertEquals("options 与 SerialTransport 枚举一一对应",
+                SerialTransport.toMap(),
+                transport.getOptionLabels());
+    }
+
+    @Test
+    public void tcpFields_reusedFromTcpSchema_optionalAtSchemaLevelProfileEnforced() {
+        // host/port 字段定义复用 TcpClientCommConfigSchema（键名/长度与端口域校验器同源），
+        // 移植时 required=false（共享 schema 的 COM 直调零变化）——TCP 档必需执法收口在
+        // validateForTransport；displayName 标注串口服务器语境
+        List<AbstractConfigItem<?>> fields = new SerialCommConfigSchema().createSchema().getFields();
+        AbstractConfigItem<?> host = findField(fields, "host");
+        AbstractConfigItem<?> port = findField(fields, "port");
+        assertFalse("host schema 层非必填（TCP 档执法在 validateForTransport）", host.isRequired());
+        assertEquals("host 无预填（builder.host(null)）", null, host.getDefaultValue());
+        assertFalse("port schema 层非必填（同上）", port.isRequired());
+        assertEquals("port 预填=串口服务器典型档", SerialCommConfigSchema.DEFAULT_TCP_PORT,
+                ((Number) port.getDefaultValue()).intValue());
+    }
+
+    // ========== validateForTransport（按档提交校验执法点） ==========
+
+    @Test
+    public void validateForTransport_serialProfile_enforcesUartIgnoresTcp() {
+        SerialCommConfigSchema provider = new SerialCommConfigSchema();
+        Map<String, Object> serialInput = new java.util.HashMap<>();
+        serialInput.put("transport", "serial");
+        serialInput.put("serial_port", "ttyUSB0");
+        serialInput.put("baudrate", "9600");
+        serialInput.put("data_bits", "8");
+        serialInput.put("stop_bits", "1");
+        serialInput.put("parity", "None");
+        // serial 档不提交 tcp 字段（COM 档既有提交形态）→ 零错误
+        assertTrue("serial 档合法提交应零错误", provider.validateForTransport(serialInput).isEmpty());
+
+        // serial 档缺 UART 字段 → 照常执法（COM 档零变化）
+        serialInput.remove("baudrate");
+        Map<String, Object> errors = provider.validateForTransport(serialInput);
+        assertTrue("serial 档缺波特率必须报错", errors.containsKey("baudrate"));
+    }
+
+    @Test
+    public void validateForTransport_tcpProfile_exemptUartRequireTcp() {
+        SerialCommConfigSchema provider = new SerialCommConfigSchema();
+        // 无本地串口主机形态：只有 transport/host/port（UART 字段全缺）
+        Map<String, Object> tcpInput = new java.util.HashMap<>();
+        tcpInput.put("transport", "tcp");
+        tcpInput.put("host", "192.168.1.50");
+        tcpInput.put("port", "4001");
+        assertTrue("TCP 档无 UART 字段应零错误（豁免集执法）",
+                provider.validateForTransport(tcpInput).isEmpty());
+
+        // TCP 档缺 host → 表单期暴露（tcp 仓字段原生 required 校验）
+        tcpInput.remove("host");
+        Map<String, Object> errors = provider.validateForTransport(tcpInput);
+        assertTrue("TCP 档缺 host 必须报错", errors.containsKey("host"));
+
+        // TCP 档缺 port → 同上
+        tcpInput.put("host", "192.168.1.50");
+        tcpInput.remove("port");
+        assertTrue("TCP 档缺 port 必须报错",
+                provider.validateForTransport(tcpInput).containsKey("port"));
+    }
+
+    @Test
+    public void validateForTransport_tcpProfile_withGarbageUartValues_stillClean() {
+        // TCP 档 UI 全显形态：误填/存量 UART 值不阻断提交（parse 档不读，忽略语义）
+        SerialCommConfigSchema provider = new SerialCommConfigSchema();
+        Map<String, Object> tcpInput = new java.util.HashMap<>();
+        tcpInput.put("transport", "tcp");
+        tcpInput.put("host", "192.168.1.50");
+        tcpInput.put("port", "4001");
+        tcpInput.put("baudrate", "99999");   // 非法枚举值，TCP 档下豁免
+        tcpInput.put("serial_port", "not-a-real-port"); // 动态枚举校验不通过，TCP 档下豁免
+        assertTrue("TCP 档 UART 误填值不阻断提交", provider.validateForTransport(tcpInput).isEmpty());
+    }
+
+    @Test
+    public void validateForTransport_unknownTransportValue_reportedNotSuppressed() {
+        // transport 本身取值非法：不属任何豁免集，错误照常呈现（不静默当 serial 档）
+        SerialCommConfigSchema provider = new SerialCommConfigSchema();
+        Map<String, Object> bogus = new java.util.HashMap<>();
+        bogus.put("transport", "bogus");
+        bogus.put("serial_port", "ttyUSB0");
+        bogus.put("baudrate", "9600");
+        bogus.put("data_bits", "8");
+        bogus.put("stop_bits", "1");
+        bogus.put("parity", "None");
+        Map<String, Object> errors = provider.validateForTransport(bogus);
+        assertTrue("非法 transport 取值必须报错", errors.containsKey("transport"));
     }
 
     // ========== Schema 验证测试 ==========

@@ -99,7 +99,7 @@ public class SerialCommFlowTest {
                 "final_confirm", exit.getStepId());
         assertEquals("final_confirm", host.getCurrentStep());
 
-        // 落盘形状：comm_settings 整块（扁平 7 字段，与 11 仓现行主流一致，存量 entry 零迁移）
+        // 落盘形状：comm_settings 整块（按提交值透传：COM 档扁平 UART 字段 / TCP 档 transport+host+port）
         assertEquals(commInput, host.getContext().getEntryData().get("comm_settings"));
         // 漫游面：子 flow 步数据进宿主 stepInputs（stepId 不变，reconfigure 漫游兼容）
         assertTrue(host.getContext().getStepInputs().containsKey("comm_config"));
@@ -130,6 +130,48 @@ public class SerialCommFlowTest {
         assertNotNull("表单应含 serial_port 字段", field(form.getSchema(), "serial_port"));
         assertNotNull("表单应含 flow_control 字段", field(form.getSchema(), "flow_control"));
         assertNotNull("表单应含 timeout 字段", field(form.getSchema(), "timeout"));
+        assertNotNull("表单应含 transport 字段", field(form.getSchema(), "transport"));
+        assertNotNull("表单应含 host 字段（复用 tcp 仓字段定义）", field(form.getSchema(), "host"));
+        assertNotNull("表单应含 port 字段（复用 tcp 仓字段定义）", field(form.getSchema(), "port"));
+    }
+
+    // ==================== TCP 档提交（串口服务器形态） ====================
+
+    @Test
+    public void tcpSubmission_withoutLocalSerialPort_exitsToHostTail() {
+        // 无本地串口主机形态：transport/host/port 三字段即可过（UART 字段全缺，
+        // TCP 档豁免集执法）——TCP 设备的核心价值场景
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+
+        Map<String, Object> tcpInput = new LinkedHashMap<>();
+        tcpInput.put("transport", "tcp");
+        tcpInput.put("host", "192.168.1.50");
+        tcpInput.put("port", "4001");
+        ConfigFlowResult exit = host.handleStep("comm_config", tcpInput);
+        assertEquals("TCP 档无 UART 字段应过校验（errors=" + exit.getErrors() + "）",
+                "final_confirm", exit.getStepId());
+        assertEquals(tcpInput, host.getContext().getEntryData().get("comm_settings"));
+    }
+
+    @Test
+    public void tcpSubmission_missingHost_redisplaysWithErrors() {
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+
+        Map<String, Object> tcpInput = new LinkedHashMap<>();
+        tcpInput.put("transport", "tcp");
+        tcpInput.put("port", "4001");
+        ConfigFlowResult r = host.handleStep("comm_config", tcpInput);
+        assertEquals("校验失败应回显子 flow 唯一步", "comm_config", r.getStepId());
+        assertNotNull("TCP 档缺 host 应在表单期报错（tcp 仓字段原生 required）", r.getErrors().get("host"));
+        assertFalse(host.getContext().getEntryData().containsKey("comm_settings"));
+    }
+
+    @Test
+    public void serialSubmission_withoutTcpFields_stillExitsToHostTail() {
+        // COM 档既有提交形态回归：transport 键缺省（旧表单/脚本不带）+ UART 字段 → 原行为过闸
+        HostFlow host = enterSubFlow(new SerialCommFlow());
+        ConfigFlowResult exit = host.handleStep("comm_config", commInput());
+        assertEquals("final_confirm", exit.getStepId());
     }
 
     // ==================== 定制形态 vs 无参形态（builder 定制预填 vs 库标准预填） ====================

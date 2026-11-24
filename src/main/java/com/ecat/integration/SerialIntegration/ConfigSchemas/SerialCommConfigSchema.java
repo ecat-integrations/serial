@@ -18,17 +18,24 @@ package com.ecat.integration.SerialIntegration.ConfigSchemas;
 
 import com.ecat.core.ConfigFlow.ConfigSchema;
 import com.ecat.core.ConfigFlow.ConfigSchemaProvider;
+import com.ecat.core.ConfigFlow.ConfigItem.AbstractConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.DynamicEnumConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.NumericConfigItem;
 import com.ecat.core.Utils.platform.PlatformInfo;
 import com.ecat.integration.SerialIntegration.Const;
+import com.ecat.integration.SerialIntegration.SerialTransport;
+import com.ecat.integration.TcpIntegration.ConfigSchemas.TcpClientCommConfigSchema;
 import com.fazecast.jSerialComm.SerialPort;
 
 import java.io.File;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -38,13 +45,15 @@ import java.util.function.Supplier;
  * <p>
  * 定义了串口通讯的通用配置字段：
  * <ul>
- *   <li>serial_port - 串口设备路径</li>
- *   <li>baudrate - 波特率</li>
- *   <li>data_bits - 数据位</li>
- *   <li>stop_bits - 停止位</li>
- *   <li>parity - 校验位</li>
- *   <li>flow_control - 流控</li>
- *   <li>timeout - 超时时间</li>
+ *   <li>transport - 传输通道（serial=本地 COM / tcp=串口服务器，档案位）</li>
+ *   <li>serial_port - 串口设备路径（SERIAL 档）</li>
+ *   <li>baudrate - 波特率（SERIAL 档）</li>
+ *   <li>data_bits - 数据位（SERIAL 档）</li>
+ *   <li>stop_bits - 停止位（SERIAL 档）</li>
+ *   <li>parity - 校验位（SERIAL 档）</li>
+ *   <li>flow_control - 流控（SERIAL 档）</li>
+ *   <li>timeout - 超时时间（两档通用）</li>
+ *   <li>host / port - 串口服务器地址/端口（TCP 档；字段定义复用 TcpClientCommConfigSchema）</li>
  * </ul>
  * <p>
  * 使用方式：
@@ -155,6 +164,13 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
     @Override
     public ConfigSchema createSchema() {
         ConfigSchema schema = new ConfigSchema()
+            // 传输通道（档案位：serial=本地 COM / tcp=串口服务器 RTU over TCP）。required=false：
+            // 本 schema 被 11+ 消费仓共享，存量 COM 表单直调 schema.validate 的提交不带本键
+            // ——缺省=serial 与 parse 同源（additive-only，COM 档零变化）
+            .addField(new EnumConfigItem("transport", false, "serial")
+                .displayName("传输通道")
+                .addOptions(SerialTransport.toMap())
+                .buildValidator())
             // 串口选择
             .addField(new DynamicEnumConfigItem("serial_port", true, "/dev/ttyUSB0",
                     SerialCommConfigSchema::getAvailablePorts)
@@ -189,8 +205,88 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
                 .displayName("超时时间(ms)")
                 .range(100.0, 60000.0));
 
+        // TCP 档两字段复用 tcp 仓 TcpClientCommConfigSchema 的字段定义（键名、长度与端口域
+        // 校验器同源；builder 只定制预填——host 无预填、port 预填串口服务器典型档）。移植时
+        // 两处边界调整并在此记账：required(false)（本 schema 被共享，COM 档直调
+        // schema.validate 不得被 TCP 字段打红——必需执法收口到 validateForTransport 的 TCP
+        // 档）与 displayName（串口服务器语境标注）。reconnect/超时族不在移植集：TcpTransport
+        // 的重连在缝内被抑制（执行者 RECOVERING 统一驱动），表单收集即与运行时行为相悖
+        ConfigSchema tcpCommFields = TcpClientCommConfigSchema.builder()
+                .host(null)
+                .port(DEFAULT_TCP_PORT)
+                .build()
+                .createSchema();
+        schema.addField(findTcpField(tcpCommFields, "host").required(false).displayName("串口服务器地址"));
+        schema.addField(findTcpField(tcpCommFields, "port").required(false).displayName("串口服务器端口"));
+
         schema.initI18n(this);
         return schema;
+    }
+
+    /** tcp 复用字段按键摘取（TcpClientCommConfigSchema 每次构建全新字段实例，无共享态）。 */
+    private static AbstractConfigItem<?> findTcpField(ConfigSchema tcpCommFields, String key) {
+        for (AbstractConfigItem<?> field : tcpCommFields.getFields()) {
+            if (field.getKey().equals(key)) {
+                return field;
+            }
+        }
+        throw new IllegalStateException("TcpClientCommConfigSchema 缺少预期字段: " + key);
+    }
+
+    // ========== 按档提交校验（transport 档案的执法点） ==========
+
+    /** TCP 档端口预填（典型串口服务器端口，仅预填语义——运行时以提交值为准）。 */
+    public static final int DEFAULT_TCP_PORT = 4001;
+
+    /** UART 档专属字段键集：transport=tcp 提交时校验豁免（parse TCP 档不读同一集，两处同源）。 */
+    public static final Set<String> UART_ONLY_FIELDS = Collections.unmodifiableSet(new LinkedHashSet<>(
+            Arrays.asList("serial_port", "baudrate", "data_bits", "stop_bits", "parity", "flow_control")));
+
+    /** TCP 档专属字段键集：transport=serial 提交时校验豁免（tcp 仓键名，schema 复用同源）。 */
+    public static final Set<String> TCP_ONLY_FIELDS = Collections.unmodifiableSet(
+            new LinkedHashSet<>(Arrays.asList("host", "port")));
+
+    /**
+     * 按提交的 transport 档案校验（ConfigFlow 写端唯一执法入口）：字段全集常显（顶层表单
+     * 条件显隐尚无经实证的前端消费面，见 modbus-generic-device 表行 showWhen 先例与
+     * top-level 消费面缺口），执法按档收敛——
+     * <ul>
+     *   <li>tcp 档：UART 专属字段错误豁免（无本地串口的主机也须能建 TCP 设备，UART 值由
+     *       parse 忽略）；host/port 缺失按必需执法（schema 层 required=false 是共享面零变化
+     *       的边界，TCP 档必需语义收口在此，缺失在表单期暴露不等 parse）；</li>
+     *   <li>serial 档（transport 缺省同）：UART 字段执法与既有行为逐字一致（COM 档零变化），
+     *       host/port 错误豁免（值被 parse 忽略）。</li>
+     * </ul>
+     * transport 本身取值非法时不属任何豁免集，错误照常呈现。
+     */
+    public Map<String, Object> validateForTransport(Map<String, Object> userInput) {
+        ConfigSchema schema = createSchema();
+        Map<String, Object> errors = schema.validate(userInput);
+        boolean tcp = isTcpTransport(userInput);
+        for (AbstractConfigItem<?> field : schema.getFields()) {
+            String key = field.getKey();
+            if (tcp && UART_ONLY_FIELDS.contains(key)) {
+                errors.remove(key);
+            } else if (TCP_ONLY_FIELDS.contains(key)) {
+                if (!tcp) {
+                    errors.remove(key);
+                } else if (isMissing(userInput == null ? null : userInput.get(key))) {
+                    errors.put(key, field.getDisplayName() + " 是必需的");
+                }
+            }
+        }
+        return errors;
+    }
+
+    /** transport 提交值是否 TCP 档（缺省=serial，与 parse 缺省同源）。 */
+    private static boolean isTcpTransport(Map<String, Object> userInput) {
+        return userInput != null
+                && SerialTransport.TCP.getValue().equals(String.valueOf(userInput.get("transport")));
+    }
+
+    /** 提交值缺失判定（与 AbstractConfigItem.validate 缺失语义同形：null 或空白串）。 */
+    private static boolean isMissing(Object value) {
+        return value == null || (value instanceof String && ((String) value).trim().isEmpty());
     }
 
     // ========== Builder ==========

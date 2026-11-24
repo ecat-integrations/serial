@@ -76,11 +76,22 @@ public class SerialSourcePort {
         this.serialInfo = serialInfo;
         this.integration = integration;
         this.executor = new SerialPortExecutor(this, serialInfo.portName, maxWaiters);
-        this.transport = new JSerialCommTransport(this);
-        // 传输死亡（拔 USB/写反压/读异常）→ 执行者强拆收场：与看门狗超时强拆同一条
-        // RECOVERING+排空路径（收场竞速幂等，先到者为准）
+        this.transport = createTransport(serialInfo);
+        // 传输死亡（拔 USB/写反压/读异常/TCP 断线）→ 执行者强拆收场：与看门狗超时强拆
+        // 同一条 RECOVERING+排空路径（收场竞速幂等，先到者为准）
         this.transport.onTransportDead(reason -> executor.submitAbort("transport-dead: " + reason));
         this.isTestMode = detectTestEnvironment();
+    }
+
+    /**
+     * 传输工厂（按 comm_settings.transport 档案选物理通道）：SERIAL=jSerialComm 本地 COM；
+     * TCP=串口服务器（RTU over TCP）——TcpTransport 只需 host/port/诊断名，不持口对象。
+     */
+    private PortTransport createTransport(SerialInfo info) {
+        if (info.transport == SerialTransport.TCP) {
+            return new TcpTransport(info.tcpHost, info.tcpPort, info.portName);
+        }
+        return new JSerialCommTransport(this);
     }
 
     /** 传输缝访问（执行者写路径/排空经此；口执行线程外不触碰物理 IO）。 */
@@ -372,7 +383,7 @@ public class SerialSourcePort {
     }
 
     boolean isClosed() {
-        return serialPort == null || !serialPort.isOpen();
+        return !transport.isOpen();
     }
 
     // ========== Port lifecycle（fd 开/关只在口执行线程与看门狗） ==========
@@ -403,11 +414,10 @@ public class SerialSourcePort {
 
         if (!isTestMode) {
             transport.startReading(readSink);
-            log.info("[OPENED] port={}, identity={}, baudrate={}, dataBits={}, stopBits={}, parity={}",
-                    serialInfo.portName, identity, serialInfo.baudrate, serialInfo.dataBits, serialInfo.stopBits, serialInfo.parity);
+            log.info("[OPENED] port={}, identity={}, {}",
+                    serialInfo.portName, identity, serialInfo.settingsDescription());
         } else {
-            log.info("[OPENED] port={}, identity={}, test mode, baudrate={}",
-                    serialInfo.portName, identity, serialInfo.baudrate);
+            log.info("[OPENED] port={}, identity={}, test mode", serialInfo.portName, identity);
         }
     }
 
@@ -512,11 +522,22 @@ public class SerialSourcePort {
         this.reconfigureRebuildWaitMs = waitMs;
     }
 
+    /**
+     * 底层 jSerialComm 口对象（仅 SERIAL 档存在；唯一消费方 modbus RTU 直持 InputStream，
+     * 不经 TCP 档）。TCP 档显式拒绝：串口服务器传输无本机串口句柄可透出。
+     */
     public SerialPort getSerialPort() {
+        if (serialInfo.transport == SerialTransport.TCP) {
+            throw new UnsupportedOperationException("TCP transport does not expose a serial port handle");
+        }
         return serialPort;
     }
 
+    /** jSerialComm 系统口名（SERIAL 档诊断面；TCP 档无本机串口句柄，同 {@link #getSerialPort()} 拒绝）。 */
     String getSystemPortName() {
+        if (serialInfo.transport == SerialTransport.TCP) {
+            throw new UnsupportedOperationException("TCP transport does not expose a serial port handle");
+        }
         return serialPort.getSystemPortName();
     }
 

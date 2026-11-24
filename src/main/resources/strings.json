@@ -57,6 +57,22 @@
       "timeout": {
         "display_name": "Timeout (ms)",
         "description": "Read timeout in milliseconds"
+      },
+      "transport": {
+        "display_name": "Transport",
+        "description": "Physical channel: local COM port or serial server (RTU over TCP)",
+        "options": {
+          "serial": "Serial (local COM)",
+          "tcp": "TCP (serial server)"
+        }
+      },
+      "host": {
+        "display_name": "Serial Server Host",
+        "description": "Host or IP of the hardware serial server (TCP mode)"
+      },
+      "port": {
+        "display_name": "Serial Server Port",
+        "description": "TCP listen port of the serial server (TCP mode)"
       }
     }
   }
