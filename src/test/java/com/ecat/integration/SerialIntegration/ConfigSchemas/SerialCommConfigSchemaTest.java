@@ -19,6 +19,7 @@ package com.ecat.integration.SerialIntegration.ConfigSchemas;
 import com.ecat.core.ConfigFlow.ConfigSchema;
 import com.ecat.core.ConfigFlow.ConfigItem.AbstractConfigItem;
 import com.ecat.core.ConfigFlow.ConfigItem.EnumConfigItem;
+import com.ecat.core.ConfigFlow.ConfigItem.SchemaConfigItem;
 import com.ecat.core.I18n.I18nHelper;
 import com.ecat.core.Utils.IntegrationCoordinateHelper;
 import com.ecat.integration.SerialIntegration.SerialTransport;
@@ -174,6 +175,56 @@ public class SerialCommConfigSchemaTest {
         tcpInput.put("baudrate", "99999");   // 非法枚举值，TCP 档下豁免
         tcpInput.put("serial_port", "not-a-real-port"); // 动态枚举校验不通过，TCP 档下豁免
         assertTrue("TCP 档 UART 误填值不阻断提交", provider.validateForTransport(tcpInput).isEmpty());
+    }
+
+    // ========== §3.1 校验下沉契约：递归路径与提交路径同一规则 ==========
+
+    @Test
+    public void transportRule_sinkedToSchema_recursivePathMatchesFlowSubmitPath() {
+        // 校验下沉（§3.1）：加载/reconfigure 路径（DeviceConfigSchema 嵌套 SchemaConfigItem
+        // 递归调 createSchema().validate）与提交路径（SerialCommFlow 调 validateForTransport）
+        // 必须同一规则——下沉前递归路径用 COM 规则打回 TCP entry（「TCP entry 建得出、
+        // 加载不了」缺陷本体），两路同 payload 同结果是硬门
+        SerialCommConfigSchema provider = new SerialCommConfigSchema();
+        SchemaConfigItem item = new SchemaConfigItem("comm_settings", true, SerialCommConfigSchema.class);
+
+        Map<String, Object> tcpInput = new java.util.HashMap<>();
+        tcpInput.put("transport", "tcp");
+        tcpInput.put("host", "192.168.1.50");
+        tcpInput.put("port", "4001");
+        assertNull("同一 TCP payload 经递归路径必须放行（与提交路径一致）",
+                item.validate(tcpInput));
+        assertTrue("同一 TCP payload 经提交路径应零错误",
+                provider.validateForTransport(tcpInput).isEmpty());
+
+        // COM 档两路一致（零变化硬门）
+        Map<String, Object> comInput = new java.util.HashMap<>();
+        comInput.put("serial_port", "ttyUSB0");
+        comInput.put("baudrate", "9600");
+        comInput.put("data_bits", "8");
+        comInput.put("stop_bits", "1");
+        comInput.put("parity", "None");
+        assertNull("同一 COM payload 经递归路径必须放行",
+                item.validate(comInput));
+        assertTrue("同一 COM payload 经提交路径应零错误",
+                provider.validateForTransport(comInput).isEmpty());
+    }
+
+    @Test
+    public void invalidSerialPort_rejectedInComProfileBothPaths() {
+        // COM 档执法不放宽：serial_port 无效选项（动态枚举成员资格）两路均打回
+        SchemaConfigItem item = new SchemaConfigItem("comm_settings", true, SerialCommConfigSchema.class);
+        Map<String, Object> badPort = new java.util.HashMap<>();
+        badPort.put("serial_port", "not-a-real-port");
+        badPort.put("baudrate", "9600");
+        badPort.put("data_bits", "8");
+        badPort.put("stop_bits", "1");
+        badPort.put("parity", "None");
+        Object recursive = item.validate(badPort);
+        assertTrue("COM 档无效 serial_port 递归路径必须打回（嵌套 Map 契约）",
+                recursive instanceof Map && ((Map<?, ?>) recursive).containsKey("serial_port"));
+        assertTrue("COM 档无效 serial_port 提交路径必须打回",
+                new SerialCommConfigSchema().validateForTransport(badPort).containsKey("serial_port"));
     }
 
     @Test

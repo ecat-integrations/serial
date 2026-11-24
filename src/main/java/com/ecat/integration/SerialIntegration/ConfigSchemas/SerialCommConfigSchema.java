@@ -163,7 +163,7 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
 
     @Override
     public ConfigSchema createSchema() {
-        ConfigSchema schema = new ConfigSchema()
+        ConfigSchema schema = new TransportProfileEnforcingSchema()
             // 传输通道（档案位：serial=本地 COM / tcp=串口服务器 RTU over TCP）。required=false：
             // 本 schema 被 11+ 消费仓共享，存量 COM 表单直调 schema.validate 的提交不带本键
             // ——缺省=serial 与 parse 同源（additive-only，COM 档零变化）
@@ -208,9 +208,10 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
         // TCP 档两字段复用 tcp 仓 TcpClientCommConfigSchema 的字段定义（键名、长度与端口域
         // 校验器同源；builder 只定制预填——host 无预填、port 预填串口服务器典型档）。移植时
         // 两处边界调整并在此记账：required(false)（本 schema 被共享，COM 档直调
-        // schema.validate 不得被 TCP 字段打红——必需执法收口到 validateForTransport 的 TCP
-        // 档）与 displayName（串口服务器语境标注）。reconnect/超时族不在移植集：TcpTransport
-        // 的重连在缝内被抑制（执行者 RECOVERING 统一驱动），表单收集即与运行时行为相悖
+        // schema.validate 不得被 TCP 字段打红——TCP 档必需执法收口到 validate 本体按档
+        // 豁免/补执法，见 TransportProfileEnforcingSchema）与 displayName（串口服务器语境标注）。
+        // reconnect/超时族不在移植集：表单收集面只到 host/port（重连参数由 tcp schema 默认
+        // 同源兜底），收集面与运行时消费面同界
         ConfigSchema tcpCommFields = TcpClientCommConfigSchema.builder()
                 .host(null)
                 .port(DEFAULT_TCP_PORT)
@@ -247,9 +248,16 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
             new LinkedHashSet<>(Arrays.asList("host", "port")));
 
     /**
-     * 按提交的 transport 档案校验（ConfigFlow 写端唯一执法入口）：字段全集常显（顶层表单
-     * 条件显隐尚无经实证的前端消费面，见 modbus-generic-device 表行 showWhen 先例与
-     * top-level 消费面缺口），执法按档收敛——
+     * 按 transport 档执法的 schema 本体（校验下沉，§3.1）：覆写 {@link #validate} 使
+     * <b>全部校验路径收敛到同一执法点</b>——
+     * <ul>
+     *   <li>加载/reconfigure：DeviceConfigSchema 嵌套 {@code SchemaConfigItem} 递归调
+     *       {@code createSchema().validate()}（core 反射无参构造，覆写自动生效）；</li>
+     *   <li>提交：ConfigFlow 经 {@link SerialCommConfigSchema#validateForTransport}（委托
+     *       本 validate，防口径漂移）；</li>
+     *   <li>自管表单仓直调 {@code createSchema().validate()}（ecotech 形态）。</li>
+     * </ul>
+     * 执法规则：字段全集常显（顶层表单条件显隐尚无经实证的前端消费面），执法按档收敛——
      * <ul>
      *   <li>tcp 档：UART 专属字段错误豁免（无本地串口的主机也须能建 TCP 设备，UART 值由
      *       parse 忽略）；host/port 缺失按必需执法（schema 层 required=false 是共享面零变化
@@ -259,23 +267,39 @@ public class SerialCommConfigSchema implements ConfigSchemaProvider {
      * </ul>
      * transport 本身取值非法时不属任何豁免集，错误照常呈现。
      */
-    public Map<String, Object> validateForTransport(Map<String, Object> userInput) {
-        ConfigSchema schema = createSchema();
-        Map<String, Object> errors = schema.validate(userInput);
-        boolean tcp = isTcpTransport(userInput);
-        for (AbstractConfigItem<?> field : schema.getFields()) {
-            String key = field.getKey();
-            if (tcp && UART_ONLY_FIELDS.contains(key)) {
-                errors.remove(key);
-            } else if (TCP_ONLY_FIELDS.contains(key)) {
-                if (!tcp) {
+    private static final class TransportProfileEnforcingSchema extends ConfigSchema {
+
+        /**
+         * 基础校验（字段全集逐项，含 UART 必填）后按档豁免/补执法。返回 map 为
+         * {@code super.validate} 的新建 HashMap，原位调整无副作用面。
+         */
+        @Override
+        public Map<String, Object> validate(Map<String, Object> input) {
+            Map<String, Object> errors = super.validate(input);
+            boolean tcp = isTcpTransport(input);
+            for (AbstractConfigItem<?> field : getFields()) {
+                String key = field.getKey();
+                if (tcp && UART_ONLY_FIELDS.contains(key)) {
                     errors.remove(key);
-                } else if (isMissing(userInput == null ? null : userInput.get(key))) {
-                    errors.put(key, field.getDisplayName() + " 是必需的");
+                } else if (TCP_ONLY_FIELDS.contains(key)) {
+                    if (!tcp) {
+                        errors.remove(key);
+                    } else if (isMissing(input == null ? null : input.get(key))) {
+                        errors.put(key, field.getDisplayName() + " 是必需的");
+                    }
                 }
             }
+            return errors;
         }
-        return errors;
+    }
+
+    /**
+     * 按提交的 transport 档案校验（ConfigFlow 写端执法入口）：委托 {@link #createSchema()}
+     * 的按档 validate（校验下沉后与递归/直调路径同一入口，防口径漂移；委托层仅为兼容
+     * 既有调用面保留——SerialCommFlow 与单测的既有消费点不改签名）。
+     */
+    public Map<String, Object> validateForTransport(Map<String, Object> userInput) {
+        return createSchema().validate(userInput);
     }
 
     /** transport 提交值是否 TCP 档（缺省=serial，与 parse 缺省同源）。 */
