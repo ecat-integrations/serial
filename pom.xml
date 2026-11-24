@@ -22,6 +22,15 @@
       <version>4.0.0</version>
       <scope>provided</scope>
     </dependency>
+    <!-- TcpTransport（RTU over TCP）：tcp 连接层（TcpConnection 原始字节通道）。tcp 仓现版
+         4.0.0（serial 4.1.0 引 4.0.0——ecat-core 传递同版，enforcer provided 收敛绿）；
+         scope 与仓内对 ecat-core 的惯例一致：集成 jar 运行期由宿主装载，不进 fatjar lib/ -->
+    <dependency>
+      <groupId>com.ecat</groupId>
+      <artifactId>integration-tcp</artifactId>
+      <version>4.0.0</version>
+      <scope>provided</scope>
+    </dependency>
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
