@@ -47,9 +47,11 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
  * 排序结构的另一端（取队头开始下一场）只在口执行线程。
  *
  * <p><b>超时与排空</b>（§3.3，S5）：每场对话一个 deadline；异常结束（超时、强拆）后
- * 进入 DRAINING——丢弃全部到达字节直到线路静默 ≥ 静默间隔（默认 150ms，系统属性
- * {@value #DRAIN_SILENCE_PROPERTY} 可配置），排空总时长上限 = 该对话的事务超时（防流式
- * 设备无限排空）；静默确认后开下一场。正常结束不排空。硬超时看门狗在定时线程上
+ * 进入 DRAINING——丢弃全部到达字节直到线路静默 ≥ 设备超时（本口 SerialInfo.timeout，
+ * Const.READ_TIMEOUT_MS 同源缺省；依据：应答慢过设备超时才判超时收场，其迟到尾巴最迟
+ * 在下一个设备超时窗内到达，静默窗取设备超时必覆盖），排空总时长上限 = 该对话的事务
+ * 超时（默认 10× 设备超时，恒高于静默窗——防流式设备无限排空的安全网保持）；静默确认后
+ * 开下一场。正常结束不排空。硬超时看门狗在定时线程上
  * <b>直接跨线程 closePort</b> 强拆挂死 fd（口执行线程可能阻塞在挂死写上收不到事件），
  * 使阻塞写立即失败返回，随后事件驱动 RECOVERING 重开 → DRAINING → 队列续跑。
  *
@@ -66,25 +68,6 @@ import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutSche
 final class SerialPortExecutor {
 
     private static final Log log = LogFactory.getLogger(SerialPortExecutor.class);
-
-    /** 排空静默间隔系统属性键（S5：默认 150ms，可配置；非正值属配置错误，显式失败）。 */
-    static final String DRAIN_SILENCE_PROPERTY = "ecat.serial.drainSilenceMs";
-    /** 排空静默间隔默认值（毫秒）：真实设备应答尾巴的实测校准可在 P1 验收后调整。 */
-    static final long DEFAULT_DRAIN_SILENCE_MS = 150L;
-
-    private static final long drainSilenceMs = resolveDrainSilenceMs();
-
-    private static long resolveDrainSilenceMs() {
-        String raw = System.getProperty(DRAIN_SILENCE_PROPERTY);
-        if (raw == null || raw.trim().isEmpty()) {
-            return DEFAULT_DRAIN_SILENCE_MS;
-        }
-        long parsed = Long.parseLong(raw.trim());
-        if (parsed <= 0) {
-            throw new IllegalStateException(DRAIN_SILENCE_PROPERTY + " 必须为正整数（排空静默间隔毫秒），实际: " + raw);
-        }
-        return parsed;
-    }
 
     /** 端口状态机（§3.1）。CLOSED 为终态：退役后的一切开/写请求被拒。 */
     enum PortState { IDLE, AWAIT_WRITE, AWAIT_RESPONSE, DRAINING, HELD, RECOVERING, CLOSED }
@@ -637,19 +620,17 @@ final class SerialPortExecutor {
         }
     }
 
-    /** 红测注入口：缩短排空静默间隔（仅同包测试使用；生产用系统属性/默认 150ms）。 */
-    void setDrainSilenceMsForTest(long silenceMs) {
-        if (silenceMs <= 0) {
-            throw new IllegalArgumentException("drainSilenceMs must be > 0, got: " + silenceMs);
-        }
-        drainSilenceMsOverride = silenceMs;
-    }
-
-    /** 排空静默间隔生效值（实例覆盖优先于静态配置）。 */
-    private long drainSilenceMsOverride;
-
-    private long silenceMs() {
-        return drainSilenceMsOverride > 0 ? drainSilenceMsOverride : drainSilenceMs;
+    /**
+     * 排空静默窗（毫秒）= 本口设备超时生效值：SerialInfo.timeout（&gt;0），否则
+     * Const.READ_TIMEOUT_MS 同源缺省（生效口径同 JSerialCommTransport/事务超时派生）。
+     * 常数依据（修正原 150ms 无依据常数）：对话因慢过设备超时才异常收场，其迟到应答
+     * 最迟在下一个设备超时窗内到达——静默窗取设备超时必覆盖全部迟到尾巴；线路上此后
+     * 仍不断的字节属流式回灌，由排空总时长上限（该对话事务超时）兜底强制开下一场。
+     * 测试控窗 = 注入 SerialInfo.timeout（同包构造即定），无独立覆盖缝。
+     */
+    private long drainSilenceMs() {
+        int deviceTimeout = port.getTimeout();
+        return deviceTimeout > 0 ? deviceTimeout : Const.READ_TIMEOUT_MS;
     }
 
     // ==================== 口执行线程（事件循环） ====================
@@ -909,8 +890,9 @@ final class SerialPortExecutor {
     // ==================== 排空（§3.3 S5） ====================
 
     /**
-     * 进入排空：丢弃全部到达字节直到线路静默 ≥ 静默间隔（新到达字节重置静默计时）；
-     * 排空总时长上限 = 该对话的事务超时（防流式设备无限排空）。body 对话先经 RECOVERING
+     * 进入排空：丢弃全部到达字节直到线路静默 ≥ 设备超时（{@link #drainSilenceMs()}，
+     * 新到达字节重置静默计时）；排空总时长上限 = 该对话的事务超时（防流式设备无限排空）。
+     * body 对话先经 RECOVERING
      * 重开（fd 已被看门狗强拆，重开含 RX 清洗）——重开面按传输档位（§3.4）：COM 档断线=
      * fd 终死保持既有立即重开；TCP 档断线期间 tcp 层自动重连在途，执行者重开会 release
      * 掉带重连链的连接（两套重连互毁）不重开，看门狗显式强拆后的重建由写前自动重开承接。
@@ -932,12 +914,12 @@ final class SerialPortExecutor {
         state = PortState.DRAINING;
         droppedDuringDrain = 0;
         port.clearReceiveBuffer();
-        long capMs = finished != null ? finished.execTimeoutMs : silenceMs();
+        long capMs = finished != null ? finished.execTimeoutMs : drainSilenceMs();
         log.debug("[CONV] port={}, seq={}, 进入排空（静默 {}ms，上限 {}ms）",
-                portName, finished != null ? finished.seq : -1, silenceMs(), capMs);
+                portName, finished != null ? finished.seq : -1, drainSilenceMs(), capMs);
         try {
             drainSilenceTimer = SerialTimeoutScheduler.schedule(
-                    () -> events.add(new DrainSilenceElapsed()), silenceMs(), TimeUnit.MILLISECONDS);
+                    () -> events.add(new DrainSilenceElapsed()), drainSilenceMs(), TimeUnit.MILLISECONDS);
             drainCapTimer = SerialTimeoutScheduler.schedule(
                     () -> events.add(new DrainCapElapsed()), capMs, TimeUnit.MILLISECONDS);
         } catch (RuntimeException scheduleEx) {
@@ -980,7 +962,7 @@ final class SerialPortExecutor {
         cancel(drainSilenceTimer);
         try {
             drainSilenceTimer = SerialTimeoutScheduler.schedule(
-                    () -> events.add(new DrainSilenceElapsed()), silenceMs(), TimeUnit.MILLISECONDS);
+                    () -> events.add(new DrainSilenceElapsed()), drainSilenceMs(), TimeUnit.MILLISECONDS);
         } catch (RuntimeException scheduleEx) {
             log.warn("[CONV] port={}, 排空静默重挂失败（上限计时器兜底）: {}", portName, scheduleEx.getMessage());
         }

@@ -40,8 +40,11 @@ import com.fazecast.jSerialComm.SerialPort;
 public class SerialResidualWriteGuardTest {
 
     private static final String PORT = "/dev/ttyRESIDUAL";
-    /** 排空静默测试值（毫秒）：同时是静默计时器在 FakeSerialTimers 里的识别延迟。 */
-    private static final long TEST_DRAIN_SILENCE_MS = 50L;
+    /**
+     * 注入的设备超时（毫秒）：排空静默窗 = 设备超时生效值，本值同时是静默计时器在
+     * FakeSerialTimers 里的识别延迟（SerialInfo 构造即注入，无独立覆盖缝）。
+     */
+    private static final int TEST_DRAIN_SILENCE_MS = 50;
 
     private SerialSourcePort port;
     private SerialPort serialPort;
@@ -58,9 +61,8 @@ public class SerialResidualWriteGuardTest {
             writeCount.incrementAndGet();
             return inv.<byte[]>getArgument(0).length;
         });
-        port = new SerialSourcePort(new SerialInfo(PORT, 9600, 8, 1, 0, 0, 500), 3, null);
+        port = new SerialSourcePort(new SerialInfo(PORT, 9600, 8, 1, 0, 0, TEST_DRAIN_SILENCE_MS), 3, null);
         port.serialPort = serialPort;
-        port.executor().setDrainSilenceMsForTest(TEST_DRAIN_SILENCE_MS);
     }
 
     @After
