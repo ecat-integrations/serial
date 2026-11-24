@@ -110,25 +110,34 @@ public class SerialSourceViewLifecycleTest {
 
     @Test
     public void closedViewRejectsQueuedWriteBeforePhysicalIo() throws Exception {
-        CountDownLatch queueHeadStarted = new CountDownLatch(1);
-        CountDownLatch releaseQueueHead = new CountDownLatch(1);
-        port.ioExecutor().submit(() -> {
-            queueHeadStarted.countDown();
-            releaseQueueHead.await();
-            return null;
+        // 受控前置：sourceB 头写阻塞在物理写内（latch 缝），钉死口执行线程——asyncSendData
+        // 的 WriteReq 由口执行线程消费（不经过 ioExecutor 车道），只有钉住该线程才能保证
+        // 被测写提交后必然仍在事件队列未执行；close 后 handleWrite 复查 isViewClosed 的
+        // zombie 防线必须在触碰端口前拒绝它（§3.4 未开始取消语义）
+        CountDownLatch headWriteEntered = new CountDownLatch(1);
+        CountDownLatch releaseHeadWrite = new CountDownLatch(1);
+        when(physicalPort.writeBytes(new byte[] {1}, 1)).thenAnswer(inv -> {
+            headWriteEntered.countDown();
+            releaseHeadWrite.await(1, TimeUnit.SECONDS);
+            return 1;
         });
-        assertTrue(queueHeadStarted.await(1, TimeUnit.SECONDS));
+
+        CompletableFuture<Boolean> headSend = sourceB.asyncSendData(new byte[] {1});
+        assertTrue("头写必须先进入物理写（口执行线程已在其内被占住）",
+                headWriteEntered.await(1, TimeUnit.SECONDS));
 
         CompletableFuture<Boolean> queuedSend = sourceA.asyncSendData(new byte[] {9});
         sourceA.closePort();
-        releaseQueueHead.countDown();
+        releaseHeadWrite.countDown();
         try {
             queuedSend.get(1, TimeUnit.SECONDS);
             fail("close 前已入队、task 未执行的写必须被拒绝");
         } catch (Exception expected) {
             assertTrue(SerialSourceClosedException.isSourceClosed(expected.getCause()));
         }
-        verify(physicalPort, never()).writeBytes(any(byte[].class), anyInt());
+        verify(physicalPort, never()).writeBytes(new byte[] {9}, 1);
+        assertTrue("占口的头写（活跃 view）照常完成", headSend.get(1, TimeUnit.SECONDS));
+        verify(physicalPort).writeBytes(new byte[] {1}, 1);
     }
 
     @Test
