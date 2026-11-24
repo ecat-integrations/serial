@@ -7,6 +7,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,7 +28,8 @@ import org.junit.Test;
  *   <li>{@link #blockingGetOnNeverCompletingFuture_starvesSharedScheduler()}：阻塞式 {@code .get()}
  *       会独占调度线程至超时 → 标记任务被推迟（复现饥饿机制，即被禁用的反模式）。</li>
  *   <li>{@link #asyncConsumption_doesNotStarveSharedScheduler()}：异步 {@code whenComplete} 不占用调度线程
- *       → 标记任务即时执行（即各设备 {@code start()} 应遵循的正确范式，对齐 modbus / sailhero XH*、PM3000E）。</li>
+ *       → 调用即时返回（任务内计时判别：占用时长须小于阻塞预算，队列等待/线程换手噪声不进判别；
+ *       即各设备 {@code start()} 应遵循的正确范式，对齐 modbus / sailhero XH*、PM3000E）。</li>
  * </ul>
  *
  * <p>注：方向①的生产行为变更在<b>设备层</b>（9 个设备 {@code start()} 去 {@code .get()} 改 {@code whenComplete}），
@@ -113,9 +115,12 @@ public class SerialTransactionStrategyAsyncContractTest {
 
     /**
      * 【正确范式 GREEN】异步消费（{@code whenComplete}，不 {@code .get()}）一个永不 complete 的 future 时，
-     * 调度线程立即返回（硬超时计时经 SerialTimeoutScheduler 委托给本测试池之外的调度器）→ 同池标记任务<b>即时执行，不饥饿</b>。
+     * 调度线程立即返回（硬超时计时经 SerialTimeoutScheduler 委托给本测试池之外的调度器）→ 不独占单线程池。
      *
-     * <p>这是各设备 {@code start()} 必须遵循的契约（对齐 modbus 与 sailhero XH*、PM3000E 等既有设备）。
+     * <p>判别口径（确定性化）：测「任务内调用时长」而非「后续标记任务的墙上钟延迟」——后者混入
+     * 队列等待/线程换手噪声（standalone 全 reactor 负载下可漂过原 200ms 窗）；判别基线 = 阻塞用例的
+     * {@code .get()} 预算 {@link #BLOCKING_GET_MS}（独占即饥饿，占用时长必逼近/超过它）。
+     * 这是各设备 {@code start()} 必须遵循的契约（对齐 modbus 与 sailhero XH*、PM3000E 等既有设备）。
      */
     @Test
     public void asyncConsumption_doesNotStarveSharedScheduler() throws Exception {
@@ -123,20 +128,26 @@ public class SerialTransactionStrategyAsyncContractTest {
         CompletableFuture<Boolean> neverCompleting = new CompletableFuture<>();
         ScheduledExecutorService pool = newSingleThreadScheduler();
         try {
-            long t0 = System.nanoTime();
-            // 任务1：正确范式 —— 异步消费，调度线程不在此阻塞
-            pool.submit(() ->
-                SerialTransactionStrategy
-                        .executeWithLambda(source, src -> neverCompleting, TX_TIMEOUT_MS)
-                        .whenComplete((r, e) -> { /* 异步处理结果/异常；release 由策略内部 whenCompleteAsync 负责 */ }));
-            AtomicLong markerRunAt = new AtomicLong(0);
-            pool.submit(() -> markerRunAt.set(System.nanoTime()));
+            AtomicLong occupancyNanos = new AtomicLong(-1);
+            CountDownLatch taskDone = new CountDownLatch(1);
+            // 任务1：正确范式 —— 异步消费，调度线程不在此阻塞；finally 记录任务占用时长
+            pool.submit(() -> {
+                long begin = System.nanoTime();
+                try {
+                    SerialTransactionStrategy
+                            .executeWithLambda(source, src -> neverCompleting, TX_TIMEOUT_MS)
+                            .whenComplete((r, e) -> { /* 异步处理结果/异常；release 由策略内部 whenCompleteAsync 负责 */ });
+                } finally {
+                    occupancyNanos.set(System.nanoTime() - begin);
+                    taskDone.countDown();
+                }
+            });
 
-            long markerDelayMs = awaitMarkerDelayMs(markerRunAt, t0, 3);
-            assertTrue("标记任务应被执行", markerDelayMs >= 0);
-            // 异步消费不占用调度线程：标记任务应在 200ms 内执行（与阻塞用例的 ~250ms 形成鲜明对比）
-            assertTrue("异步消费不应饿死调度池：标记任务应在 200ms 内执行，实际 " + markerDelayMs + "ms",
-                    markerDelayMs < 200);
+            assertTrue("异步消费任务必须被执行", taskDone.await(3, TimeUnit.SECONDS));
+            long occupancyMs = TimeUnit.NANOSECONDS.toMillis(occupancyNanos.get());
+            // 异步消费不占用调度线程：调用时长须小于阻塞预算（阻塞式 .get() 独占线程整整 BLOCKING_GET_MS）
+            assertTrue("异步消费不应饿死调度池：调用须在阻塞预算 " + BLOCKING_GET_MS + "ms 内返回，实际占用 "
+                    + occupancyMs + "ms", occupancyMs < BLOCKING_GET_MS);
         } finally {
             pool.shutdownNow();
         }

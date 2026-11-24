@@ -14,13 +14,16 @@ import static org.mockito.Mockito.when;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.After;
@@ -33,6 +36,7 @@ import com.ecat.core.Device.DeviceBase;
 import com.ecat.core.Device.RemovalHost;
 import com.ecat.core.Task.NamedThreadFactory;
 import com.ecat.core.Utils.Mdc.MdcContext;
+import com.ecat.integration.SerialIntegration.SendReadStrategy.SerialTimeoutScheduler;
 
 /**
  * {@link SerialPolling} SDK 五维生命周期契约（17 号 v2.1 §2.1 + 16 号 §4.4）：
@@ -47,6 +51,8 @@ import com.ecat.core.Utils.Mdc.MdcContext;
  * 定时」链路同源（29 号 v2 S1：SdkSchedulerResolver 引擎路径退役）。宿主用 lambda
  * RemovalHost（宿主绑定契约由 startRegistersCancelAsRemovalAction_onHost 专项覆盖）。
  * 确定性同步 = CountDownLatch（负向断言用有界 await 返回值），无 Thread.sleep。
+ * 网格相位判别（fixedRate 完成点重排）例外：注入假钟钉完成相位、记录缝断言重排决策值，
+ * 事务硬超时执法经 SerialTimeoutScheduler.bind 引开出记录面（物理池不变）。
  *
  * <p>回调时序前提（构造性无竞态）：SDK 的 onRound 在事务 CF 的 handle 结算内同步执行，
  * 周期链以结算后的 CF 为重排依据——第 N 轮回调严格先于第 N+1 轮 round 体。
@@ -130,35 +136,63 @@ public class SerialPollingSdkTest {
     /**
      * fixedRate()：名义网格语义——在飞轮占住的拍跳过（不堆叠不重入），事务完成后的
      * 下一个网格拍（网格点量级，&lt; 1 个周期）即发射下一轮，而非 fixedDelay 的
-     * 完成点 + period。区分窗：完成后 100ms 内必须发射（fixedDelay 语义下须 ≥150ms）。
+     * 完成点 + period。
+     *
+     * <p>相位受控（确定性化）：真实墙钟下完成时刻相对网格的相位随首发/唤醒延迟漂移，
+     * 重排延迟 ∈ (0, period]——「完成后 100ms 内发射」窗小于合法上界（一整周期），
+     * 完成相位漂入「网格点后 0~50ms」时必然超时（standalone 全 reactor 负载红形态）。
+     * 改为注入假钟把完成点钉在「第 2 网格拍前 1ms」：重排决策值判别 = 1ms（fixedRate，
+     * 下一网格拍）vs 150ms（fixedDelay，= 整周期）——判别本质保留在重排决策值上，
+     * 墙钟窗退出断言；在飞负向窗换瞬时结构断言（重排只发生在结算点，单飞由结构保证）。
+     * 发射本身仍在真 STPE 上端到端验证（latch「事件已发生」式断言）。
      */
     @Test
     public void fixedRateFiresNextRoundOnGridTickAfterCompletion() throws Exception {
+        AtomicLong nanoNow = new AtomicLong(0L);
+        List<Long> armedDelaysMillis = new CopyOnWriteArrayList<>();
         CompletableFuture<Boolean> firstRound = new CompletableFuture<>();
         CountDownLatch roundOneBegan = new CountDownLatch(1);
         CountDownLatch laterRound = new CountDownLatch(1);
         AtomicInteger rounds = new AtomicInteger();
 
-        handle = SerialPolling.on(device, source)
-                .round(src -> {
-                    if (rounds.incrementAndGet() == 1) {
-                        roundOneBegan.countDown();
-                        return firstRound;   // 首轮事务 CF 测试持有（跨多个拍在飞）
-                    }
-                    laterRound.countDown();
-                    return CompletableFuture.completedFuture(true);
-                })
-                .every(PERIOD_MS, TimeUnit.MILLISECONDS)
-                .fixedRate()
-                .start();
+        // 事务硬超时执法引开出记录面（与周期链共走 SerialSdkTimers 缝会混入超时单发；
+        // 绑同类 STPE——物理执行池与生产行为一致，仅绕开记录）。用毕恢复防跨用例泄漏。
+        SerialTimeoutScheduler.bind(timers);
+        // 记录缝：捕获每次重排决策的延迟值后转发真 STPE——「重排延迟」是网格语义的
+        // 决策点产物，对它断言即对调度语义断言，无墙钟参与
+        SerialSdkTimers.bindForTest((command, delayMillis) -> {
+            armedDelaysMillis.add(delayMillis);
+            return timers.schedule(command, delayMillis, TimeUnit.MILLISECONDS);
+        });
+        try {
+            handle = SerialPolling.on(device, source)
+                    .round(src -> {
+                        if (rounds.incrementAndGet() == 1) {
+                            roundOneBegan.countDown();
+                            return firstRound;   // 首轮事务 CF 测试持有（跨多个拍在飞）
+                        }
+                        laterRound.countDown();
+                        return CompletableFuture.completedFuture(true);
+                    })
+                    .every(PERIOD_MS, TimeUnit.MILLISECONDS)
+                    .fixedRate()
+                    .withNanoClock(nanoNow::get)   // 假钟冻结=网格锚点受控（t0=起链时刻）
+                    .start();
 
-        assertTrue("首轮必须执行", roundOneBegan.await(AWAIT_MS, TimeUnit.MILLISECONDS));
-        assertFalse("在飞轮占住的拍必须跳过（不堆叠重入）",
-                laterRound.await(NEGATIVE_WINDOW_MS, TimeUnit.MILLISECONDS));
+            assertTrue("首轮必须执行", roundOneBegan.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+            assertEquals("在飞轮占住的拍必须跳过（不堆叠不重入）：在飞期间链上只有首发一拍"
+                    + "（重排只发生在结算点，单飞由结构保证）", 1, armedDelaysMillis.size());
 
-        firstRound.complete(true);
-        assertTrue("fixedRate 完成后下一拍即发射（网格拍 < 1 周期；fixedDelay 语义须 ≥ 1 周期）",
-                laterRound.await(100L, TimeUnit.MILLISECONDS));
+            nanoNow.set(TimeUnit.MILLISECONDS.toNanos(2 * PERIOD_MS - 1));   // 第 2 网格拍（300ms）前 1ms
+            firstRound.complete(true);
+            assertTrue("fixedRate 完成后下一拍必须发射（重排 1ms 到期，发射在真 STPE 上）",
+                    laterRound.await(AWAIT_MS, TimeUnit.MILLISECONDS));
+            assertEquals("完成点重排 = 下一网格拍（1ms，< 1 周期；fixedDelay 语义须 = 整周期 150ms）"
+                            + "——判别本质在重排决策值",
+                    1L, armedDelaysMillis.get(1).longValue());
+        } finally {
+            SerialTimeoutScheduler.unbind();
+        }
     }
 
     // ==================== 设备归属注入（工单 G：通讯追踪设备列） ====================
