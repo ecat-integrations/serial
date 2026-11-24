@@ -54,14 +54,16 @@ public final class SerialCommSettings {
                 : SerialTransport.SERIAL;
         if (transport == SerialTransport.TCP) {
             // host/port 读取复用 tcp 仓 TcpCommSettings（同键名同严格语义，浮点容忍与
-            // 端口域校验随 TcpConfig.build 原生继承）；其 TcpConfig 产品的重连/超时族不
-            // 消费——TcpTransport 在缝内按 §4.4 硬编码抑制后台重连，另行构造连接参数
+            // 端口域校验随 TcpConfig.build 原生继承）；TcpConfig 整块随 info 携带——
+            // TcpTransport 构造连接的唯一参数源，重连参数（maxReconnectAttempts/
+            // reconnectTimeout）来自 tcp schema 缺省同源（§3.4 重连分工：连接重连归 tcp 层）
             TcpConfig tcpConnection = TcpCommSettings.parse(entryData);
             SerialInfo info = new SerialInfo(tcpConnection.getHost() + ":" + tcpConnection.getPort(),
                     null, null, null, null, 0, timeout);
             info.transport = SerialTransport.TCP;
             info.tcpHost = tcpConnection.getHost();
             info.tcpPort = tcpConnection.getPort();
+            info.tcpConfig = tcpConnection;
             return info;
         }
         return new SerialInfo(

@@ -23,6 +23,8 @@ import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.ecat.integration.TcpIntegration.config.TcpConfig;
+
 /**
  * 双传输回声契约（P4 验收 6：同一份问答式契约在 COM 与 TCP 下逐字同绿）：
  * 同一 contract 函数驱动两条物理通道——COM=socat PTY 对（ECAT 开 A 端，对端读写 B 端）、
@@ -117,7 +119,14 @@ public class DualTransportEchoContractTest {
 
         // ---------- TCP 腿（loopback ServerSocket，同一契约同一断言） ----------
         try (ServerSocket server = new ServerSocket(0)) {
-            TcpTransport tcpTransport = new TcpTransport("127.0.0.1", server.getLocalPort(), "dual-echo-tcp");
+            TcpTransport tcpTransport = new TcpTransport("127.0.0.1", server.getLocalPort(), "dual-echo-tcp",
+                    // 显式全参（无隐默认）：回声契约不断线，重连参数仅按构造契约必填面给值
+                    TcpConfig.builder()
+                            .host("127.0.0.1").port(server.getLocalPort())
+                            .maxReconnectAttempts(3)
+                            .reconnectTimeout(java.time.Duration.ofMillis(300))
+                            .connectionTimeout(java.time.Duration.ofSeconds(2))
+                            .build());
             assertTrue("TCP 腿打开必须成功", tcpTransport.open());
             Socket peerSocket = server.accept();
             byte[] tcpReceived;

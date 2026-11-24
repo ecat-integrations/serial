@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -21,22 +22,26 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.ecat.integration.TcpIntegration.config.TcpConfig;
+
 /**
  * {@link TcpTransport} 契约测试（本地 loopback ServerSocket 充当串口服务器；真实 TCP 栈，
  * 零 mock）。确定性纪律：事件断言全部经队列计数/latch 与 FIFO 因果序；静默断言用有界
  * 安静窗（轮询步进 5ms，非 sleep 猜测）。
  *
- * <p>钉住的契约：
+ * <p>钉住的契约（§3.4 重连分工：连接重连归 tcp 层，对话层排空归执行者）：
  * <ol>
  *   <li>开连接即收：open 后注入字节 → sink 收到逐字一致内容；</li>
  *   <li>投递门：stopReading 后注入 → 零投递（FIFO 因果锚：复开后新块先于被丢块出现即证
  *       丢弃已发生，非滞留）；startReading 幂等、未 start 时 stop 是 no-op；</li>
- *   <li>写真完成：write 返回时字节已写出 socket（服务端逐字读获）；断连写 -1 快速失败
- *       且不触 send 的内联重连（重连分工归执行者）；</li>
- *   <li>断线 → onTransportDead 恰一次（"disconnected"）；</li>
- *   <li>close 幂等（第二次 false），close 后可重开新连接；</li>
- *   <li>重连抑制（§4.4）：断线/首连失败后无后台重连连接出现（Acceptor 线程计数安静窗）；
- *       执行者式显式 reopen 建全新连接且恢复收发；</li>
+ *   <li>写真完成：write 返回时字节已写出 socket（服务端逐字读获）；断线在飞写得释返 -1
+ *       且不触 send 的内联重连（重连分工归 tcp 层自动重连）；</li>
+ *   <li>断线 → 链路断开通知恰一次；管理面仍 open（tcp 层自动重连中）；断连写 -1 不追加
+ *       通知；重连成功自动恢复收发（下一对话正常，恢复后首块=恢复后注入字节——迟到字节
+ *       不进新对话）；再次断线 → 再次通知恰一次（每场断线一次，非终死语义）；</li>
+ *   <li>重连参数来自 cfg（非硬编码）：maxReconnectAttempts=0 ⇒ 断线后无自动重连（参数
+ *       可表达性）；reconnectTimeout 决定重连节拍（到达时刻下界）；</li>
+ *   <li>close 幂等（第二次 false）、close 后可重开新连接、close 收场不发断开通知；</li>
  *   <li>首连失败如实返 false 且不留重试链泄漏；</li>
  *   <li>onData 回调管线零固有阻塞（百块突发按计数+间隔界达 sink）。</li>
  * </ol>
@@ -54,7 +59,8 @@ public class TcpTransportContractTest {
     public void setUp() throws IOException {
         server = new ServerSocket(0);
         acceptor = new Acceptor(server);
-        transport = new TcpTransport("127.0.0.1", server.getLocalPort(), "tcp-contract-test");
+        transport = new TcpTransport("127.0.0.1", server.getLocalPort(), "tcp-contract-test",
+                reconnectConfig(3, 300));
     }
 
     @After
@@ -70,6 +76,16 @@ public class TcpTransportContractTest {
             }
         }
         acceptor.stop();
+    }
+
+    /** 测试档 TcpConfig（显式全参，无隐默认）：短重连节拍使断线恢复用例秒级收敛。 */
+    private static TcpConfig reconnectConfig(int maxAttempts, int reconnectTimeoutMs) {
+        return TcpConfig.builder()
+                .host("127.0.0.1")
+                .maxReconnectAttempts(maxAttempts)
+                .reconnectTimeout(Duration.ofMillis(reconnectTimeoutMs))
+                .connectionTimeout(Duration.ofSeconds(2))
+                .build();
     }
 
     private ReadSink collectingSink(LinkedBlockingQueue<byte[]> queue) {
@@ -228,7 +244,7 @@ public class TcpTransportContractTest {
         assertDeliveredEquals(delivered, payload, "重复 startReading 后投递正常");
     }
 
-    // ==================== ③写真完成 + 断连写快速失败 ====================
+    // ==================== ③写真完成 + 断线在飞写得释 ====================
 
     @Test
     public void writeCompletesOnSocketAndEchoReturnsThroughSink() throws Exception {
@@ -253,42 +269,170 @@ public class TcpTransportContractTest {
         assertDeliveredEquals(delivered, reply, "回程经 onData→sink");
     }
 
-    @Test
-    public void writeToDisconnectedReturnsMinusOneFastWithoutInlineReconnect() throws Exception {
-        LinkedBlockingQueue<String> deathReasons = new LinkedBlockingQueue<>();
-        transport.onTransportDead(deathReasons::add);
+    @Test(timeout = 10_000)
+    public void inFlightWriteIsReleasedMinusOneOnDisconnectWithoutInlineReconnect() throws Exception {
+        LinkedBlockingQueue<String> linkDowns = new LinkedBlockingQueue<>();
+        transport.onTransportDead(linkDowns::add);
         assertTrue(transport.open());
         Socket peer = acceptConnection("initial connect");
         LinkedBlockingQueue<byte[]> delivered = new LinkedBlockingQueue<>();
         transport.startReading(collectingSink(delivered));
 
-        // 服务端断线 → 死亡通知恰一次（"disconnected"）
-        peer.close();
-        awaitTrue("transport death notified", () -> !deathReasons.isEmpty(), 2000);
-        assertEquals("断线死亡通知恰一次", 1, deathReasons.size());
-        assertEquals("断线原因=disconnected", "disconnected", deathReasons.peek());
-        assertFalse(transport.isOpen());
+        // 在飞写挂死构造：16MB payload（大于内核发送缓冲自动调优上限）+ 服务端不读 →
+        // selector 不可写，send 挂在真完成等待上（模拟执行者对话 AWAIT_WRITE 卡写）；对端
+        // 断线 → tcp 连接层 failPendingWrites 异常完成 → write 得释返 -1（对话失败收场，
+        // 非阻塞泄漏）
+        byte[] bigPayload = new byte[16 * 1024 * 1024];
+        Arrays.fill(bigPayload, (byte) 0x5A);
+        AtomicInteger writeResult = new AtomicInteger(Integer.MIN_VALUE);
+        Thread writer = new Thread(() -> writeResult.set(transport.write(bigPayload, bigPayload.length)),
+                "tcp-contract-inflight-writer");
+        writer.start();
+        awaitTrue("write is blocked in flight", () -> writer.getState() == Thread.State.WAITING, 5000);
 
-        // 断连写：-1 快速失败；服务端仍在监听——若 write 触发 send 的内联重连即会建连
-        // 成功并返正数（§4.4 分工被破坏，此断言抓之）
+        peer.close();
+        writer.join(5000);
+        assertFalse("在飞写须随断线得释（join 超时即挂死）", writer.isAlive());
+        assertEquals("断线在飞写必须 -1（对话失败收场）", -1, writeResult.get());
+
+        // 链路断开通知恰一次（断线事件承载，写失败路径不追加）
+        awaitTrue("link-down notified", () -> !linkDowns.isEmpty(), 2000);
+        assertEquals("断线通知恰一次", 1, linkDowns.size());
+
+        // 断连写：-1 快速失败；不追加通知；不触 send 内联重连（重连分工归 tcp 层自动重连）
         byte[] stale = "STALE".getBytes("UTF-8");
         assertEquals("断连写必须 -1（不内联重连）", -1, transport.write(stale, stale.length));
-        assertEquals("断连写不再追加死亡通知（恰一次）", 1, deathReasons.size());
-
-        // 重连抑制：断线后安静窗内无后台重连连接出现（Acceptor 计数静止；tcp 重连节拍 1s，窗 1.4s 覆盖）
-        awaitQuiet("background auto-reconnect must stay suppressed",
-                () -> acceptor.count() > 1, 1400);
-
-        // 执行者式显式 reopen（RECOVERING 分工的落点）：全新连接恢复收发
-        assertTrue("显式 reopen 成功", transport.open());
-        Socket reconnect = acceptConnection("executor-driven reopen");
-        transport.startReading(collectingSink(delivered));
-        byte[] fresh = "FRESH".getBytes("UTF-8");
-        assertEquals(fresh.length, transport.write(fresh, fresh.length));
-        assertTrue(Arrays.equals(fresh, readExactly(reconnect, fresh.length)));
+        assertEquals("断连写不再追加断开通知（每场断线恰一次）", 1, linkDowns.size());
     }
 
-    // ==================== ④close 幂等 + 重开 ====================
+    // ==================== ④断线自动重连 + 恢复语义（§3.4） ====================
+
+    @Test
+    public void linkDownNotifiesOnce_thenTcpLayerAutoReconnectsAndResumesDelivery() throws Exception {
+        LinkedBlockingQueue<String> linkDowns = new LinkedBlockingQueue<>();
+        transport.onTransportDead(linkDowns::add);
+        assertTrue(transport.open());
+        Socket firstPeer = acceptConnection("initial connect");
+        LinkedBlockingQueue<byte[]> delivered = new LinkedBlockingQueue<>();
+        transport.startReading(collectingSink(delivered));
+        OutputStream firstOut = firstPeer.getOutputStream();
+
+        // 断线前字节全部消费完（因果锚前提：sink 流中不存在「断线前未消费」残留——
+        // 到达即消费断言，队列清零后才开始断线）
+        byte[] beforeDown = "PRE".getBytes("UTF-8");
+        firstOut.write(beforeDown);
+        firstOut.flush();
+        awaitTrue("pre-down bytes arrived", () -> totalQueued(delivered) >= beforeDown.length, 2000);
+        assertDeliveredEquals(delivered, beforeDown, "断线前注入逐字到达");
+
+        // 断线：链路断开通知恰一次；管理面仍 open（tcp 层自动重连中——isOpen 不随数据面抖动）
+        long downAtNanos = System.nanoTime();
+        firstPeer.close();
+        awaitTrue("link-down notified once", () -> linkDowns.size() >= 1, 2000);
+        assertEquals("断线通知恰一次", 1, linkDowns.size());
+        assertEquals("断线原因=disconnected", "disconnected", linkDowns.peek());
+        assertTrue("断线后管理面仍 open（重连归 tcp 层，非终死）", transport.isOpen());
+
+        // tcp 层自动重连自动到达（无需显式 reopen；reconnectTimeout=300ms 节拍）
+        Socket reconnected = acceptConnection("tcp-layer auto reconnect");
+
+        // 恢复确认探针（确定性时序锚）：write→服务端读获→回写 ACK→sink 收到 ACK。accept
+        // 返回早于客户端 connectInternal 完成注册（内核握手先于应用层 connected 置位），
+        // 探针 write 以有界轮询等数据面就绪（write -1 无副作用，安全重试）——就绪后必成功。
+        // ACK 投递成功即证链路门已复开（linkUp=true 在车道序上先于 ACK），此后注入的 POST
+        // 必然落在门开窗内——消除「accept 早于 RECONNECT_SUCCEEDED 车道处理」的注入竞态
+        byte[] probe = "PROBE".getBytes("UTF-8");
+        awaitTrue("probe write succeeds after data-plane ready",
+                () -> transport.write(probe, probe.length) == probe.length, 2000);
+        assertTrue(Arrays.equals(probe, readExactly(reconnected, probe.length)));
+        byte[] ack = "ACK".getBytes("UTF-8");
+        OutputStream reOut = reconnected.getOutputStream();
+        reOut.write(ack);
+        reOut.flush();
+        awaitTrue("recovery probe ACK arrives", () -> totalQueued(delivered) >= ack.length, 2000);
+        assertDeliveredEquals(delivered, ack, "恢复探针 ACK 逐字到达（链路门已复开）");
+
+        // 恢复后注入（迟到字节因果锚）：恢复后流中无任何断线窗字节——断线窗口字节被链路门
+        // 丢弃、断线前残留已消费完毕，POST 之前不可能出现旧连接字节
+        byte[] afterReconnect = "POST".getBytes("UTF-8");
+        reOut.write(afterReconnect);
+        reOut.flush();
+        awaitTrue("post-reconnect chunk arrives", () -> totalQueued(delivered) >= afterReconnect.length, 2000);
+        assertDeliveredEquals(delivered, afterReconnect, "恢复后流恰为恢复后注入（迟到字节不进新对话）");
+        long reconnectArrivalMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - downAtNanos);
+        assertTrue("重连到达过快（节拍未走 reconnectTimeout，elapsed=" + reconnectArrivalMs + "ms）",
+                reconnectArrivalMs >= 250);
+
+        // 恢复后下一对话正常（写读双向全通）
+        byte[] fresh = "FRESH".getBytes("UTF-8");
+        assertEquals("恢复后写出字节数", fresh.length, transport.write(fresh, fresh.length));
+        assertTrue(Arrays.equals(fresh, readExactly(reconnected, fresh.length)));
+    }
+
+    @Test
+    public void secondLinkDownNotifiesAgain_perDownCycleOnceNotLifetimeOnce() throws Exception {
+        LinkedBlockingQueue<String> linkDowns = new LinkedBlockingQueue<>();
+        transport.onTransportDead(linkDowns::add);
+        assertTrue(transport.open());
+        Socket firstPeer = acceptConnection("initial connect");
+
+        // 第一场断线：通知恰一次；tcp 层自动重连恢复
+        firstPeer.close();
+        awaitTrue("first link-down", () -> linkDowns.size() >= 1, 2000);
+        Socket reconnected = acceptConnection("first auto reconnect");
+
+        // 第二场断线：再次通知（每场断线恰一次，非终身一次）——终死语义已退役（§3.4）
+        reconnected.close();
+        awaitTrue("second link-down", () -> linkDowns.size() >= 2, 2000);
+        assertEquals("两场断线各通知恰一次", 2, linkDowns.size());
+        acceptConnection("second auto reconnect");
+    }
+
+    // ==================== ⑤重连参数来自 cfg（非硬编码） ====================
+
+    @Test
+    public void reconnectParamsComeFromConfig_zeroAttemptsSuppressesAutoReconnect() throws Exception {
+        TcpTransport suppressed = new TcpTransport("127.0.0.1", server.getLocalPort(),
+                "tcp-suppressed-test", reconnectConfig(0, 300));
+        final LinkedBlockingQueue<String> suppressedDowns = new LinkedBlockingQueue<>();
+        suppressed.onTransportDead(suppressedDowns::add);
+        try {
+            assertTrue(suppressed.open());
+            Socket peer = acceptConnection("suppressed initial connect");
+            peer.close();
+            awaitTrue("link-down notified", () -> !suppressedDowns.isEmpty(), 2000);
+
+            // maxReconnectAttempts=0 ⇒ 无自动重连（参数可表达性 = P4 抑制语义的 cfg 面）：
+            // 安静窗覆盖原节拍（300ms）+ 余量，Acceptor 计数静止即证参数生效
+            awaitQuiet("zero attempts must suppress auto-reconnect",
+                    () -> acceptor.count() > 1, 1400);
+        } finally {
+            suppressed.close();
+        }
+    }
+
+    @Test
+    public void reconnectParamsComeFromConfig_reconnectTimeoutGovernsRetryBeat() throws Exception {
+        // 1s 节拍档：断线后重连不得在节拍窗内提前到达（schedule 单向误差——只会更晚不会更早）
+        TcpTransport slowBeat = new TcpTransport("127.0.0.1", server.getLocalPort(),
+                "tcp-slow-beat-test", reconnectConfig(3, 1000));
+        try {
+            assertTrue(slowBeat.open());
+            Socket peer = acceptConnection("slow-beat initial connect");
+            long downAtNanos = System.nanoTime();
+            peer.close();
+
+            awaitQuiet("reconnect must not arrive before reconnectTimeout elapses",
+                    () -> acceptor.count() > 1, 700);
+            acceptor.take(3000);
+            long arrivalMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - downAtNanos);
+            assertTrue("1s 节拍档重连到达过晚（elapsed=" + arrivalMs + "ms）", arrivalMs < 3500);
+        } finally {
+            slowBeat.close();
+        }
+    }
+
+    // ==================== ⑥close 幂等 + 重开 + close 不发断开通知 ====================
 
     @Test
     public void closeIsIdempotentAndReopenStartsFreshCycle() {
@@ -303,7 +447,23 @@ public class TcpTransportContractTest {
         assertTrue(transport.isOpen());
     }
 
-    // ==================== ⑤首连失败如实返 false + 重试链不泄漏 ====================
+    @Test
+    public void closeAfterLinkDownDoesNotFireLinkDownNotification() throws Exception {
+        LinkedBlockingQueue<String> linkDowns = new LinkedBlockingQueue<>();
+        transport.onTransportDead(linkDowns::add);
+        assertTrue(transport.open());
+        Socket peer = acceptConnection("initial connect");
+
+        // 断线通知一次 → close 收场（release 幂等且不发 DISCONNECTED）：无追加通知
+        peer.close();
+        awaitTrue("link-down notified", () -> !linkDowns.isEmpty(), 2000);
+        transport.close();
+        awaitQuiet("close must not fire link-down notification",
+                () -> linkDowns.size() > 1, 400);
+        assertEquals("close 收场零追加断开通知", 1, linkDowns.size());
+    }
+
+    // ==================== ⑦首连失败如实返 false + 重试链不泄漏 ====================
 
     @Test
     public void openToRefusedPortFailsCleanlyWithoutBackgroundRetryLeak() throws Exception {
@@ -312,16 +472,17 @@ public class TcpTransportContractTest {
         int refusedPort = probe.getLocalPort();
         probe.close();
 
-        TcpTransport failing = new TcpTransport("127.0.0.1", refusedPort, "tcp-refused-test");
-        final LinkedBlockingQueue<String> failingDeaths = new LinkedBlockingQueue<>();
-        failing.onTransportDead(failingDeaths::add);
+        TcpTransport failing = new TcpTransport("127.0.0.1", refusedPort, "tcp-refused-test",
+                reconnectConfig(3, 300));
+        final LinkedBlockingQueue<String> failingDowns = new LinkedBlockingQueue<>();
+        failing.onTransportDead(failingDowns::add);
         try {
             long start = System.nanoTime();
             assertFalse("拒绝端口 open 必须如实返 false", failing.open());
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
             assertTrue("拒绝路径应快速判负（elapsed=" + elapsedMs + "ms）", elapsedMs < 4500);
             assertFalse(failing.isOpen());
-            assertEquals("首连失败不产生死亡通知（未达过已连接态）", 0, failingDeaths.size());
+            assertEquals("首连失败不产生断开通知（未达过已连接态）", 0, failingDowns.size());
 
             // 重试链不泄漏：目标端口恢复监听后，安静窗（覆盖 TcpConnection 首连重试节拍 1s）
             // 内无任何后台连接出现
@@ -350,7 +511,7 @@ public class TcpTransportContractTest {
         }
     }
 
-    // ==================== ⑥onData 回调管线零固有阻塞 ====================
+    // ==================== ⑧onData 回调管线零固有阻塞 ====================
 
     @Test
     public void onDataPipelineBurstThroughputWithoutInherentBlocking() throws Exception {
@@ -396,7 +557,7 @@ public class TcpTransportContractTest {
     }
 
     /**
-     * 服务端 accept 承载线程：连接到达即入队计数——「有无新连接」的观测点（后台重连连接
+     * 服务端 accept 承载线程：连接到达即入队计数——「有无新连接」的观测点（自动重连连接
      * 没人 accept 不可见，主线程 accept 会破坏监听器状态；本线程专职承载，quiet 断言按计数）。
      */
     private static final class Acceptor {

@@ -1,5 +1,7 @@
 package com.ecat.integration.SerialIntegration;
 
+import com.ecat.integration.TcpIntegration.config.TcpConfig;
+
 import java.util.Objects;
 
 /**
@@ -30,6 +32,12 @@ public class SerialInfo {
     String tcpHost;
     // 串口服务器端口（TCP 档）
     Integer tcpPort;
+    // TCP 档连接参数整块（TcpCommSettings.parse 产出：重连 maxReconnectAttempts/reconnectTimeout
+    // 与 connectionTimeout 等）——TcpTransport 构造连接的唯一参数源（tcp 层自愈重连的参数
+    // 面，§3.4 重连分工：连接重连归 tcp 层）。TCP 档唯一产出口=SerialCommSettings.parse，
+    // 恒非 null；settingsMatch 不比较本块（TCP 档物理身份只由 host/port 构成，重连参数
+    // 变更经 reconfigure 不触发端口重建——与 timeout-only 既有口径一致）
+    TcpConfig tcpConfig;
 
     public SerialInfo(String portName, Integer baudrate, Integer dataBits, Integer stopBits, Integer parity) {
         this(portName, baudrate, dataBits, stopBits, parity, 0);

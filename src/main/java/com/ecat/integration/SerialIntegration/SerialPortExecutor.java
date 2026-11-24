@@ -911,9 +911,12 @@ final class SerialPortExecutor {
     /**
      * 进入排空：丢弃全部到达字节直到线路静默 ≥ 静默间隔（新到达字节重置静默计时）；
      * 排空总时长上限 = 该对话的事务超时（防流式设备无限排空）。body 对话先经 RECOVERING
-     * 重开（fd 已被看门狗强拆，重开含 RX 清洗）。
+     * 重开（fd 已被看门狗强拆，重开含 RX 清洗）——重开面按传输档位（§3.4）：COM 档断线=
+     * fd 终死保持既有立即重开；TCP 档断线期间 tcp 层自动重连在途，执行者重开会 release
+     * 掉带重连链的连接（两套重连互毁）不重开，看门狗显式强拆后的重建由写前自动重开承接。
      */
-    private void enterDrain(boolean reopen, Conversation finished) {
+    private void enterDrain(boolean reopenRequested, Conversation finished) {
+        boolean reopen = reopenRequested && port.reopensFdOnAbnormalDrain();
         if (reopen) {
             state = PortState.RECOVERING;
             try {

@@ -16,9 +16,12 @@ import java.util.function.Consumer;
  *       排空；TCP 实现下在回调层直接丢弃）。</li>
  *   <li>{@code close()} <b>任意线程安全</b>（看门狗跨线程强拆依赖），且使阻塞中的读
  *       立即返回（COM 实现经 closePort 唤醒内核 poll，读返 -1）。</li>
- *   <li>{@code write} 返回 -1 ⇒ 传输已死 ⇒ 死亡通知必至且恰一次（允许 -1 与通知竞速，
- *       接收方以先到者为准、幂等处理）。死亡通知回调可能在写调用线程上同步触发，
- *       回调体必须非阻塞。</li>
+ *   <li>{@code write} 返回 -1 ⇒ 本次未写出（对话失败收场）。链路断开经死亡通知通道
+ *       上报、接收方幂等处理；通知语义按实现分档——COM：断线即 fd 终死，每场 open 生命
+ *       周期恰一次，且 {@code write} 返 -1 时通知必至（允许 -1 与通知竞速，接收方以先到
+ *       者为准）；TCP：断线非终死（tcp 层自动重连，恢复后收发自愈），每次断线经断开事件
+ *       恰一次通知，重连期间 {@code write} 返 -1 不追加通知。死亡通知回调可能在写调用
+ *       线程上同步触发，回调体必须非阻塞。</li>
  *   <li>{@code startReading} 幂等（重复调用无副作用）；{@code stopReading} 对未 start
  *       的调用是 no-op。</li>
  * </ol>
@@ -44,13 +47,13 @@ interface PortTransport {
      */
     boolean close();
 
-    /** 传输通道是否处于打开状态（任意线程可读）。 */
+    /** 传输通道是否处于打开状态（任意线程可读；TCP 实现为管理面语义——断线重连期间仍 open）。 */
     boolean isOpen();
 
     /**
      * 同步写（口执行线程调用）：把 buffer 前 length 字节写入物理通道。
      *
-     * @return 已写出字节数；-1 = 本次未写出且传输已死（死亡通知必至，契约 4）
+     * @return 已写出字节数；-1 = 本次未写出（对话失败收场；断开通知面见契约 4）
      */
     int write(byte[] buffer, int length);
 
@@ -89,11 +92,12 @@ interface PortTransport {
     int drainRx();
 
     /**
-     * 注册传输死亡通知接收端（契约 4 的通知通道）：拔 USB / 写反压 / 读异常 / 断线
-     * 终态等「通道已死」时刻，传输以 reason 回调一次。须在 {@link #open()} 前注册；
-     * 回调可能在任意线程触发，回调体必须非阻塞（如投递执行者事件即返）。
+     * 注册链路断开通知接收端（契约 4 的通知通道）：链路断开时刻传输以 reason 回调
+     * （语义按实现分档，见契约 4——COM 恰一次终死 / TCP 每次断线恰一次）。须在
+     * {@link #open()} 前注册；回调可能在任意线程触发，回调体必须非阻塞（如投递执行者
+     * 事件即返）。
      *
-     * @param handler 死亡通知接收端（reason 文本用于日志定位）
+     * @param handler 断开通知接收端（reason 文本用于日志定位）
      */
     void onTransportDead(Consumer<String> handler);
 

@@ -77,21 +77,33 @@ public class SerialSourcePort {
         this.integration = integration;
         this.executor = new SerialPortExecutor(this, serialInfo.portName, maxWaiters);
         this.transport = createTransport(serialInfo);
-        // 传输死亡（拔 USB/写反压/读异常/TCP 断线）→ 执行者强拆收场：与看门狗超时强拆
-        // 同一条 RECOVERING+排空路径（收场竞速幂等，先到者为准）
+        // 传输链路断开（COM=拔 USB 终死 / TCP=断线 tcp 层自动重连中）→ 执行者强拆在飞对话
+        // 并排空：与看门狗超时强拆同一条收场路径（收场竞速幂等，先到者为准）。TCP 档重连
+        // 成功后收发自动恢复（§3.4 重连分工：连接重连归 tcp 层，执行者只做对话层排空）
         this.transport.onTransportDead(reason -> executor.submitAbort("transport-dead: " + reason));
         this.isTestMode = detectTestEnvironment();
     }
 
     /**
      * 传输工厂（按 comm_settings.transport 档案选物理通道）：SERIAL=jSerialComm 本地 COM；
-     * TCP=串口服务器（RTU over TCP）——TcpTransport 只需 host/port/诊断名，不持口对象。
+     * TCP=串口服务器（RTU over TCP）——TcpTransport 持 host/port/诊断名与连接参数整块
+     * （重连参数随 TcpConfig 进入 tcp 层，本端口不复制重连逻辑）。
      */
     private PortTransport createTransport(SerialInfo info) {
         if (info.transport == SerialTransport.TCP) {
-            return new TcpTransport(info.tcpHost, info.tcpPort, info.portName);
+            return new TcpTransport(info.tcpHost, info.tcpPort, info.portName, info.tcpConfig);
         }
         return new JSerialCommTransport(this);
+    }
+
+    /**
+     * 异常收场排空时是否由执行者重建 fd（enterDrain 的 reopen 面）：COM 档 true（既有
+     * 语义——断线即 fd 终死，排空前立即重开）；TCP 档 false——断线期间 tcp 层自动重连
+     * 在途，执行者再 open 会 release 掉带重连链的连接对象，两套重连状态机互毁；重连成功
+     * 后收发自动恢复，仅看门狗显式 closeFd 后（管理面已关）由写前自动重开重建。
+     */
+    boolean reopensFdOnAbnormalDrain() {
+        return serialInfo.transport != SerialTransport.TCP;
     }
 
     /** 传输缝访问（执行者写路径/排空经此；口执行线程外不触碰物理 IO）。 */
