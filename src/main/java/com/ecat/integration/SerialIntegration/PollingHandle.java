@@ -29,4 +29,12 @@ public interface PollingHandle {
      * @return true = 已 start 且未 cancel；cancel 后恒 false
      */
     boolean isRunning();
+
+    /**
+     * 启动序列是否已耗尽全部尝试失败（终端态）：true = {@link SerialPolling#startup}
+     * 声明的启动序列全部尝试失败，轮询永不启动（{@link #isRunning()} 恒 false）。
+     * 未声明 startup 的句柄恒 false；cancel 是主动停机，不置本态（失败观测走
+     * {@code onStartupFailure} 回调或本方法）。
+     */
+    boolean isStartupFailed();
 }

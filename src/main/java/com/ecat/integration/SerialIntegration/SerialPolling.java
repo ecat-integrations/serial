@@ -4,8 +4,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
@@ -60,6 +63,12 @@ import com.ecat.core.Utils.Mdc.DeviceMdcContext;
  * CF 以正常完成结算（周期网格不变，下周期再试）。消费方零感知，调研 01 §4.2 C1 的 35 处
  * {@code isLockBusySkip} exceptionally 样板随之消亡。
  *
+ * <p><b>启动序列 startup（可选）</b>：上电默认写等一次性初始化用 {@link #startup(Function)}
+ * 声明——首轮读之前在对话队列写入口（HIGH 优先级）顺序执行一次，成功后周期链才起
+ * （先初始化再周期读，同队列无竞态）；SDK 统一承载 attempts×retryDelay 重试，全部尝试
+ * 失败 ⇒ 轮询不启动 + 句柄失败态 + {@link #onStartupFailure} 回调；startup 链随句柄
+ * cancel（宿主移除 sweep）收口。详见 {@link #startup(Function)}。
+ *
  * <p><b>生命周期</b>：{@link #start()} 内部是 serial 仓唯一周期注册点（L2 收口处：
  * 域定时器上的完成点重排周期链）；轮询句柄经 {@code host.onRemove(handle::cancel)}
  * 绑定宿主移除生命周期（cancel 纯标记天然满足 RemovalHost 非阻塞契约），设备 stop 的
@@ -79,6 +88,12 @@ public final class SerialPolling {
 
     private static final Log log = LogFactory.getLogger(SerialPolling.class);
 
+    /** startup 默认总尝试次数（含首发）：校准自首个消费方 tianhong 既有消费面（3 次/2s）。 */
+    static final int DEFAULT_STARTUP_ATTEMPTS = 3;
+
+    /** startup 默认重试间隔（毫秒）：同 tianhong 既有量级——错开共享口上的读轮节拍。 */
+    static final long DEFAULT_STARTUP_RETRY_DELAY_MS = 2000L;
+
     private final SerialSource source;
     /** 宿主移除生命周期（start() 尾部绑定 handle::cancel；18 号设计 §3.3）。 */
     private final RemovalHost host;
@@ -86,6 +101,18 @@ public final class SerialPolling {
     private final String portName;
 
     private Function<SerialSource, ? extends CompletableFuture<?>> round;
+    /**
+     * 启动序列（可选，声明一次）：首轮读之前在对话队列写入口（executeWithLambda，HIGH
+     * 优先级）顺序执行一次的一次性初始化体。周期链在 startup 成功前不起——上电默认写
+     * 与轮询的半双工竞态由结构消除（bug-record-20261124-214200 定谳的 SDK 侧修复）。
+     */
+    private Function<SerialSource, ? extends CompletableFuture<?>> startup;
+    /** startup 总尝试次数（含首发；默认档校准自首个消费方 tianhong 的 3 次）。 */
+    private int startupAttempts = DEFAULT_STARTUP_ATTEMPTS;
+    /** startup 重试间隔毫秒（默认档同 tianhong 既有 2s——错开共享口上的读轮节拍）。 */
+    private long startupRetryDelayMs = DEFAULT_STARTUP_RETRY_DELAY_MS;
+    /** startup 全部尝试失败的观测回调（可选）：设备用于标记属性故障态。 */
+    private Consumer<Throwable> startupFailureCallback;
     /**
      * 多段轮声明（{@link #roundChain()} 链上逐段登记；null = 未声明，单段 round() 形态）。
      * 声明期单线程构建、运行期只读，无需并发容器。
@@ -314,6 +341,78 @@ public final class SerialPolling {
     }
 
     /**
+     * 声明启动序列（可选）：首轮读之前在对话队列写入口顺序执行一次的一次性初始化体
+     * （上电默认写、一次性配置下发等形态）。默认档 {@link #DEFAULT_STARTUP_ATTEMPTS} 次 /
+     * {@link #DEFAULT_STARTUP_RETRY_DELAY_MS}ms（校准自 tianhong 既有消费面）；需要显式
+     * 配档用 {@link #startup(Function, int, long)}。声明后 {@link #start()} 的语义变为
+     * 「startup 先行、成功后周期链才起」：
+     * <pre>{@code
+     * SerialPolling.on(this, serialSource)
+     *         .startup(src -> writeDefaults(src))             // 首轮读之前在口上顺序执行一次
+     *         .onStartupFailure(ex -> markAttrsFaulty(ex))    // 可选：全部尝试失败时标属性故障
+     *         .round(this::readAndUpdate)
+     *         .every(5, TimeUnit.SECONDS)
+     *         .start();
+     * }</pre>
+     *
+     * <p><b>无竞态原理</b>：startup 走 {@code executeWithLambda}（写命令同一条对话队列、
+     * HIGH 优先级），且周期链在 startup 成功前不起——不存在「写与读抢口」的并发窗，
+     * 不需要设备侧重试循环。重试由 SDK 统一承载：单次尝试显式 FALSE（round 契约同义）或
+     * 异常完成（队满/取口失败/传输错误，含提交面同步抛的
+     * {@link PortQueueFullException}）均折算为可重试失败，间隔 retryDelayMs 再试；全部
+     * 尝试耗尽 ⇒ 轮询不启动、句柄置失败态（{@link PollingHandle#isStartupFailed()}）、
+     * {@link #onStartupFailure} 回调（严格模式：不吞异常、不静默起轮）。startup 链随
+     * {@link PollingHandle#cancel()}（宿主移除 sweep 内绑）一起取消——entry 移除时在飞
+     * startup/待发重试全部收口，无孤儿链。
+     *
+     * <p>startup 体契约与 round 一致（段体结果语义同：显式 FALSE=失败，其余=成功；
+     * 异常=失败）；单个体内是完整的一场高优先级对话，体内不留 delay（多步写用
+     * thenCompose 串联，同 round 单对话形态）。
+     */
+    public SerialPolling startup(Function<SerialSource, ? extends CompletableFuture<?>> startup) {
+        return startup(startup, DEFAULT_STARTUP_ATTEMPTS, DEFAULT_STARTUP_RETRY_DELAY_MS);
+    }
+
+    /**
+     * 声明启动序列（显式配档）：{@code attempts} 为总尝试次数（含首发，须 &gt;= 1），
+     * {@code retryDelayMs} 为相邻尝试间隔毫秒（须 &gt;= 0）。语义见
+     * {@link #startup(Function)}。
+     */
+    public SerialPolling startup(Function<SerialSource, ? extends CompletableFuture<?>> startup,
+            int attempts, long retryDelayMs) {
+        if (startup == null) {
+            throw new IllegalArgumentException("startup 不能为 null");
+        }
+        if (this.startup != null) {
+            throw new IllegalStateException("startup 已声明过（一次性启动序列只能有一个定义）");
+        }
+        if (attempts < 1) {
+            throw new IllegalArgumentException("startup attempts 须 >= 1（至少首发一次）: " + attempts);
+        }
+        if (retryDelayMs < 0) {
+            throw new IllegalArgumentException("startup retryDelayMs 须 >= 0: " + retryDelayMs);
+        }
+        this.startup = startup;
+        this.startupAttempts = attempts;
+        this.startupRetryDelayMs = retryDelayMs;
+        return this;
+    }
+
+    /**
+     * startup 全部尝试失败回调（可选）：收到末次失败根因（业务 FALSE 收尾时为描述性
+     * {@link IllegalStateException}，消息含尝试次数）。设备用于标记属性故障态。
+     * cancel 不触发本回调（主动停机非故障）。观测与主链正交：回调抛异常只记 warn，
+     * 不影响失败终态记账（同 onRound 回调隔离语义）。
+     */
+    public SerialPolling onStartupFailure(Consumer<Throwable> callback) {
+        if (callback == null) {
+            throw new IllegalArgumentException("onStartupFailure callback 不能为 null");
+        }
+        this.startupFailureCallback = callback;
+        return this;
+    }
+
+    /**
      * 纳米钟注入（默认系统单调钟；单测确定性驱动网格/过期判定用，非消费方 API）。
      */
     SerialPolling withNanoClock(LongSupplier clock) {
@@ -379,9 +478,10 @@ public final class SerialPolling {
         }
         // 事务级硬超时统一由设备配置派生（串口读超时 × 10；SDK 级覆盖词汇已按剃刀删除——零消费）
         long transactionTimeoutMs = SerialTransactionStrategy.resolveDefaultTransactionTimeoutMs(source);
-        RoundSchedule schedule = fixedRate
-                ? SerialPollSchedule.fixedRate(periodMs, initialDelayMs, nanoClock, portName)
-                : SerialPollSchedule.fixedDelay(periodMs, initialDelayMs, nanoClock, portName);
+        if (startup != null) {
+            return startWithStartupSequence(transactionTimeoutMs);
+        }
+        RoundSchedule schedule = buildSchedule();
         PeriodicRunner runner = SerialSdkTimers.runner();
         PeriodicChain chain = runner.periodic(portName, () -> beginRound(transactionTimeoutMs), schedule);
         this.handle = new ManagedHandle(chain);
@@ -401,6 +501,137 @@ public final class SerialPolling {
             chain.start();
         }
         return this.handle;
+    }
+
+    /**
+     * startup 路径的 start 分体：startup 序列先行（成功后周期链才起），句柄先绑宿主
+     * 生命周期——startup 在飞/重试待发期间 entry 移除的 sweep 即刻收口（无孤儿链）。
+     * 首发拍经域定时器单发（延迟 0 立即发起）：提交与等待全异步（对话在端口执行者排队），
+     * 不占 start() 调用线程；MDC 在提交线程捕获（scope 注入设备三键，startup 体与
+     * round 体同源归属）。
+     */
+    private PollingHandle startWithStartupSequence(long transactionTimeoutMs) {
+        ManagedHandle handle = new ManagedHandle();
+        this.handle = handle;
+        host.onRemove(handle::cancel);
+        ResourceOwner owner = tryDeriveOwner(host);
+        try (DeviceMdcContext.Scope deviceScope = owner != null
+                ? DeviceMdcContext.scopeOf(owner) : DeviceMdcContext.scopeOf(host)) {
+            handle.trackPending(SerialSdkTimers.fireAfter(
+                    () -> beginStartupAttempt(handle, 1, transactionTimeoutMs), 0L));
+        }
+        log.info("[{}] polling startup sequence armed: attempts={}, retryDelay={}ms, period={}ms",
+                portName, startupAttempts, startupRetryDelayMs, periodMs);
+        return handle;
+    }
+
+    /** 网格策略构建（fixedDelay 完成点重排 / fixedRate 名义网格）：存量与 startup 两条路径共用。 */
+    private RoundSchedule buildSchedule() {
+        return fixedRate
+                ? SerialPollSchedule.fixedRate(periodMs, initialDelayMs, nanoClock, portName)
+                : SerialPollSchedule.fixedDelay(periodMs, initialDelayMs, nanoClock, portName);
+    }
+
+    /**
+     * startup 单次尝试 + 结算（域定时线程/IO 工作线程执行）：经
+     * {@link SerialTransactionStrategy#executeWithLambda} 走对话队列写入口（HIGH 优先级
+     * ——与轮询轮体的 executePolling 同源串行，无竞态窗）；周期链在成功前不起。提交面
+     * 同步异常（队满 {@link PortQueueFullException} 形态）折算可重试失败（与 CF 异常
+     * 同格——折算后必达「重试」或「终态失败」两路之一，不静默吞）。
+     *
+     * <p>结算分路：成功 → 周期链接体入网（首轮拍 immediate）；可重试失败（业务显式
+     * FALSE / 异常完成同格折算——round 契约语义）→ retryDelayMs 后重试（attempts 上限
+     * 内）；耗尽 → {@link #finishStartupFailure} 终态失败（轮询永不启动）。cancel 先行
+     * 的在飞尝试：结果被丢弃（无重试拍、无入网、无失败回调——主动停机非故障）。
+     */
+    private void beginStartupAttempt(ManagedHandle handle, int attempt, long transactionTimeoutMs) {
+        if (handle.isCancelled()) {
+            return;
+        }
+        CompletableFuture<Boolean> attemptFuture;
+        try {
+            attemptFuture = SerialTransactionStrategy.executeWithLambda(
+                    source, asBooleanRound(startup));
+        } catch (RuntimeException submissionFailure) {
+            CompletableFuture<Boolean> failed = new CompletableFuture<>();
+            failed.completeExceptionally(submissionFailure);
+            attemptFuture = failed;
+        }
+        attemptFuture.handle((ok, error) -> {
+            if (handle.isCancelled()) {
+                return null;
+            }
+            if (error == null && Boolean.TRUE.equals(ok)) {
+                log.info("[{}] startup sequence completed on attempt {}/{}", portName, attempt,
+                        startupAttempts);
+                handle.attachChain(newPeriodicChain(transactionTimeoutMs));
+                return null;
+            }
+            Throwable root = unwrapStartupCause(error);
+            // 业务显式 FALSE 收尾（error==null）时 root 为 null——日志与终态走「业务返回 false」
+            // 形态（无异常可携带），不得 NPE（handle 链内异常会被静默吞掉，重试拍永不落账）
+            log.warn("[{}] startup attempt {}/{} failed: {}", portName, attempt, startupAttempts,
+                    root != null ? root.getMessage() : "business false");
+            if (attempt >= startupAttempts) {
+                finishStartupFailure(handle, root);
+                return null;
+            }
+            // 重试拍经域定时器单发：完成线程 MDC 不确定（对话完成在 IO 工作线程），
+            // scope 显式注入设备三键——重试体与首发体同源归属
+            ResourceOwner owner = tryDeriveOwner(host);
+            try (DeviceMdcContext.Scope deviceScope = owner != null
+                    ? DeviceMdcContext.scopeOf(owner) : DeviceMdcContext.scopeOf(host)) {
+                handle.trackPending(SerialSdkTimers.fireAfter(
+                        () -> beginStartupAttempt(handle, attempt + 1, transactionTimeoutMs),
+                        startupRetryDelayMs));
+            }
+            return null;
+        });
+    }
+
+    /**
+     * startup 耗尽终态：句柄置失败态（轮询永不启动）、失败回调通知（严格模式：不吞异常、
+     * 不静默起轮）。业务 FALSE 收尾时根因为描述性 {@link IllegalStateException}（无异常
+     * 可携带，消息含尝试次数与收尾形态）。回调观测面隔离同 onRound：抛异常只记 warn，
+     * 不影响失败终态记账。
+     */
+    private void finishStartupFailure(ManagedHandle handle, Throwable lastRoot) {
+        Throwable cause = lastRoot != null ? lastRoot
+                : new IllegalStateException("startup 全部 " + startupAttempts
+                        + " 次尝试失败（末次业务返回 false）");
+        handle.markStartupFailed();
+        log.error("[{}] startup sequence exhausted after {} attempts, polling not started",
+                portName, startupAttempts, cause);
+        Consumer<Throwable> observer = this.startupFailureCallback;
+        if (observer != null) {
+            try {
+                observer.accept(cause);
+            } catch (RuntimeException observerFailure) {
+                log.warn("[{}] onStartupFailure observer threw (isolated, terminal state kept)",
+                        portName, observerFailure);
+            }
+        }
+    }
+
+    /** startup 失败根因解包（CompletionException 壳剥到业务/传输异常本体——日志与回调用根因）。 */
+    private static Throwable unwrapStartupCause(Throwable error) {
+        Throwable cur = error;
+        while (cur instanceof CompletionException && cur.getCause() != null) {
+            cur = cur.getCause();
+        }
+        return cur;
+    }
+
+    /** startup 成功后的周期链接体（网格策略 + MDC scope 起链——归属注入语义与存量路径一致）。 */
+    private PeriodicChain newPeriodicChain(long transactionTimeoutMs) {
+        PeriodicChain chain = SerialSdkTimers.runner().periodic(
+                portName, () -> beginRound(transactionTimeoutMs), buildSchedule());
+        ResourceOwner owner = tryDeriveOwner(host);
+        try (DeviceMdcContext.Scope deviceScope = owner != null
+                ? DeviceMdcContext.scopeOf(owner) : DeviceMdcContext.scopeOf(host)) {
+            chain.start();
+        }
+        return chain;
     }
 
     /**
@@ -585,23 +816,88 @@ public final class SerialPolling {
         throw new CompletionException(t);
     }
 
-    /** {@link PollingHandle} 托管实现：委托周期链句柄（cancel 不打断在飞轮，见接口 Javadoc）。 */
+    /** {@link PollingHandle} 托管实现：委托周期链句柄（cancel 不打断在飞轮）+ startup
+     * 阶段状态机（STARTUP 在飞 → RUNNING 入网 / FAILED 耗尽终态；cancel 为第四终态，非失败）。 */
     private static final class ManagedHandle implements PollingHandle {
 
-        private final PeriodicChain chain;
+        /** 周期链句柄：startup 成功入网前为 null（存量路径构造即在网）。 */
+        private volatile PeriodicChain chain;
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private volatile boolean startupFailed;
+        /** startup 阶段待发拍（首发/重试）；入网后不再使用（cancel 走链收口）。 */
+        private volatile ScheduledFuture<?> pendingStartupShot;
 
+        /** 存量路径：无 startup，构造即在网。 */
         ManagedHandle(PeriodicChain chain) {
             this.chain = chain;
         }
 
+        /** startup 路径：startup 序列先行，成功后入网。 */
+        ManagedHandle() {
+        }
+
+        /**
+         * 登记 startup 阶段待发拍（首发/重试）：先登记后查标志收口 cancel 竞态
+         * （cancel 先行则当场撤销——与 core PeriodicChain.trackPending 同型）。
+         */
+        synchronized void trackPending(ScheduledFuture<?> shot) {
+            this.pendingStartupShot = shot;
+            if (cancelled.get()) {
+                shot.cancel(false);
+            }
+        }
+
+        /**
+         * startup 成功入网（与 cancel 互斥收口竞态：cancel 先行则链当场撤销——不留
+         * 「已取消句柄下的活链」孤儿）。
+         */
+        synchronized void attachChain(PeriodicChain attached) {
+            this.chain = attached;
+            this.pendingStartupShot = null;
+            if (cancelled.get()) {
+                attached.cancel();
+            }
+        }
+
+        synchronized void markStartupFailed() {
+            this.startupFailed = true;
+        }
+
+        synchronized boolean isCancelled() {
+            return cancelled.get();
+        }
+
         @Override
-        public void cancel() {
-            chain.cancel();
+        public synchronized void cancel() {
+            // 不打断在飞轮次（PollingHandle 契约）：startup 阶段撤待发拍（在飞尝试的结果
+            // 由结算侧 cancelled 检查丢弃），入网后走链收口（撤下一拍，幂等）
+            if (!cancelled.compareAndSet(false, true)) {
+                return;
+            }
+            PeriodicChain current = chain;
+            if (current != null) {
+                current.cancel();
+            } else {
+                ScheduledFuture<?> pending = pendingStartupShot;
+                if (pending != null) {
+                    pending.cancel(false);
+                }
+            }
         }
 
         @Override
         public boolean isRunning() {
-            return chain.isRunning();
+            if (cancelled.get() || startupFailed) {
+                return false;
+            }
+            PeriodicChain current = chain;
+            // startup 在飞（chain==null）：生命周期已激活、待入网——按存活口径
+            return current == null || current.isRunning();
+        }
+
+        @Override
+        public boolean isStartupFailed() {
+            return startupFailed;
         }
     }
 }
